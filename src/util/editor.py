@@ -1,0 +1,155 @@
+"""调用外部编辑器打开文件到指定行
+
+优先级：用户配置的 editor_cmd > VS Code (code) > IDEA (idea64.exe) > 系统默认
+"""
+from __future__ import annotations
+
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+from PySide6.QtCore import QUrl
+from PySide6.QtGui import QDesktopServices
+
+_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
+_POPEN_KW = {"creationflags": _NO_WINDOW} if _NO_WINDOW else {}
+
+
+def open_in_editor(path: str, line: int = 0, column: int = 0,
+                   editor_cmd: str = "", project_root: str = "") -> bool:
+    """打开文件到指定行。
+
+    优先级：
+    1. 用户配置的 editor_cmd（config.json 里 editor_cmd）
+    2. 自动探测：VS Code → IDEA → WebStorm → PyCharm → Notepad++ → Sublime
+    3. 系统默认关联程序（一般是记事本）
+
+    都失败返回 False（调用方可回落到内置预览窗口）。
+    """
+    p = Path(path)
+    if not p.is_absolute() and project_root:
+        candidate = search_in_project(Path(project_root), p.name)
+        if candidate:
+            p = candidate
+    if not p.exists():
+        return False
+
+    target = str(p)
+
+    if editor_cmd.strip():
+        if _run_editor(editor_cmd, target, line, column):
+            return True
+        # 用户指定的命令失败时继续往下 fallback，不直接返回
+
+    # 自动探测常见编辑器
+    candidates: list[tuple[str, str]] = [
+        ("code", "code -g"),            # VS Code
+        ("code.cmd", "code.cmd -g"),
+        ("idea64.exe", "idea64 --line"),
+        ("idea.exe", "idea --line"),
+        ("idea", "idea --line"),
+        ("webstorm64.exe", "webstorm64 --line"),
+        ("webstorm", "webstorm --line"),
+        ("pycharm64.exe", "pycharm64 --line"),
+        ("pycharm", "pycharm --line"),
+        ("notepad++.exe", "notepad++"),
+        ("subl.exe", "subl"),
+        ("subl", "subl"),
+    ]
+    for probe, cmd in candidates:
+        if shutil.which(probe):
+            if _run_editor(cmd, target, line, column):
+                return True
+
+    # 兜底：系统默认关联
+    return QDesktopServices.openUrl(QUrl.fromLocalFile(target))
+
+
+def has_any_editor() -> bool:
+    """是否至少有一个已知外部编辑器可用"""
+    for probe in ("code", "code.cmd", "idea64.exe", "idea", "webstorm", "pycharm",
+                  "notepad++.exe", "subl"):
+        if shutil.which(probe):
+            return True
+    return False
+
+
+def open_folder(path: str) -> None:
+    QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+
+
+def reveal_in_explorer(path: str) -> None:
+    """在资源管理器中选中文件"""
+    p = Path(path)
+    if not p.exists():
+        return
+    if os.name == "nt":
+        subprocess.Popen(["explorer", "/select,", str(p)], **_POPEN_KW)
+    else:
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(p.parent)))
+
+
+# ---- 内部 ----
+
+def _run_editor(cmd: str, target: str, line: int, column: int) -> bool:
+    """解析 editor_cmd，追加 target 并根据编辑器格式带上行号"""
+    parts = shlex.split(cmd, posix=False)
+    if not parts:
+        return False
+    prog = parts[0].lower()
+    extra = parts[1:]
+
+    if "code" in prog:  # VS Code: code -g file:line:col
+        goto = target if line <= 0 else (f"{target}:{line}" + (f":{column}" if column else ""))
+        if "-g" not in extra:
+            extra = ["-g"] + extra
+        args = [parts[0], *extra, goto]
+    elif "idea" in prog or "webstorm" in prog or "pycharm" in prog or "rustrover" in prog or "clion" in prog:
+        # JetBrains 系：xxx --line 42 --column 10 file
+        args = [parts[0]]
+        if line > 0:
+            args += ["--line", str(line)]
+        if column > 0:
+            args += ["--column", str(column)]
+        args += extra + [target]
+    elif "notepad++" in prog:
+        # Notepad++: notepad++ -n42 file
+        args = [parts[0], *extra]
+        if line > 0:
+            args.append(f"-n{line}")
+        args.append(target)
+    elif "subl" in prog:
+        # Sublime: subl file:line:col
+        goto = target if line <= 0 else (f"{target}:{line}" + (f":{column}" if column else ""))
+        args = [parts[0], *extra, goto]
+    elif prog in ("notepad", "notepad.exe"):
+        # 记事本：不支持跳行，直接打开
+        args = [parts[0], target]
+    else:
+        args = [parts[0], *extra, target]
+
+    try:
+        subprocess.Popen(args, close_fds=True, **_POPEN_KW)
+        return True
+    except OSError:
+        return False
+
+
+def search_in_project(root: Path, filename: str) -> Path | None:
+    """在项目目录里按文件名查找（忽略 build/.gradle/node_modules 等），只取第一个匹配。
+
+    公开函数，外部模块（如 ProjectTab）可直接调用。
+    """
+    skip = {"build", ".gradle", "target", "node_modules", "dist", ".idea", "__pycache__",
+            ".next", ".nuxt", "out", ".venv", "venv"}
+    try:
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d not in skip and not d.startswith(".")]
+            if filename in filenames:
+                return Path(dirpath) / filename
+    except OSError:
+        pass
+    return None

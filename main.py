@@ -1,0 +1,125 @@
+"""mini-ide 入口"""
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).parent
+sys.path.insert(0, str(ROOT))
+
+from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QIcon
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
+
+from src.util import app_log
+from src.ui.main_window import MainWindow
+from src.ui.styles import apply_dark_theme
+from src.core.config import AppConfig
+
+
+SERVER_NAME = "mini-ide-single-instance"
+
+
+def _forward_to_existing(path: str | None) -> bool:
+    """尝试把 path 发给已运行的 mini-ide。连上了返回 True，本进程应退出。"""
+    sock = QLocalSocket()
+    sock.connectToServer(SERVER_NAME)
+    if not sock.waitForConnected(500):
+        return False
+    payload = (path or "").encode("utf-8")
+    sock.write(payload)
+    sock.flush()
+    sock.waitForBytesWritten(1000)
+    sock.disconnectFromServer()
+    return True
+
+
+def _start_local_server(window: MainWindow) -> QLocalServer | None:
+    """在本实例启动 IPC server 监听后续右键请求。"""
+    # Unix 残留 socket 文件清理（Windows named pipe 自动回收，无副作用）
+    QLocalServer.removeServer(SERVER_NAME)
+    server = QLocalServer(window)
+    if not server.listen(SERVER_NAME):
+        app_log.get_logger("main").warning(
+            "QLocalServer 监听失败: %s", server.errorString()
+        )
+        return None
+
+    def _on_new_connection():
+        sock = server.nextPendingConnection()
+        if sock is None:
+            return
+        if sock.waitForReadyRead(1000):
+            data = bytes(sock.readAll()).decode("utf-8", errors="replace").strip()
+        else:
+            data = ""
+        window.activate_and_open(data or None)
+        sock.disconnectFromServer()
+
+    server.newConnection.connect(_on_new_connection)
+    return server
+
+
+def _set_windows_app_id():
+    """让 Windows 任务栏按 mini-ide 自己的 AppUserModelID 分组并显示我们的图标，
+    而不是 pythonw.exe 的默认蓝色 logo。必须在任何 window 显示前调用。"""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("whaty.mini-ide")
+    except Exception:
+        pass
+
+
+def main():
+    logger = app_log.init()
+    try:
+        _set_windows_app_id()
+        QApplication.setHighDpiScaleFactorRoundingPolicy(
+            Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
+        )
+        app = QApplication(sys.argv)
+        app.setApplicationName("mini-ide")
+        app.setOrganizationName("whaty")
+
+        initial_project = sys.argv[1] if len(sys.argv) > 1 else None
+
+        # 单实例：已有实例在跑就转发路径后退出
+        if _forward_to_existing(initial_project):
+            logger.info("检测到已运行的 mini-ide，已转发路径=%r 后退出", initial_project)
+            return
+
+        # 优先用 ICO（Windows 下任务栏显示更清晰），回落 PNG
+        for name in ("icon.ico", "icon.png"):
+            icon_path = ROOT / "src" / "resources" / name
+            if icon_path.exists():
+                app.setWindowIcon(QIcon(str(icon_path)))
+                break
+
+        apply_dark_theme(app)
+
+        config = AppConfig.load()
+        window = MainWindow(config)
+        window.pending_initial_project = initial_project
+        window.show()
+
+        # 启动 IPC server,接收后续右键请求
+        window._local_server = _start_local_server(window)
+
+        # 主线程心跳，给 freeze-watchdog 用
+        hb_timer = QTimer()
+        hb_timer.setInterval(1000)
+        hb_timer.timeout.connect(app_log.heartbeat)
+        hb_timer.start()
+
+        logger.info("进入事件循环")
+        rc = app.exec()
+        logger.info("mini-ide 正常退出 (rc=%d)", rc)
+        sys.exit(rc)
+    except Exception:
+        logger.exception("main() 抛出异常")
+        raise
+
+
+if __name__ == "__main__":
+    main()

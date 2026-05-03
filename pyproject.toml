@@ -1,0 +1,22 @@
+[tool.poetry]
+name = "mini-ide"
+version = "0.1.0"
+description = "AI 时代的开发指挥台 - Spring Boot / Vue / Python 项目轻量 IDE"
+authors = ["yxbkjh <yxbkjh@gmail.com>"]
+readme = "README.md"
+package-mode = false
+
+[tool.poetry.dependencies]
+python = ">=3.11,<3.14"
+PySide6 = "^6.7.0"
+psutil = "^5.9.8"
+watchdog = "^4.0.0"
+sqlparse = "^0.4.4"
+Pygments = "^2.17.0"
+
+[tool.poetry.group.dev.dependencies]
+Pillow = "^10.2.0"   # 只给 scripts/make_icon.py 用
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

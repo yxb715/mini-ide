@@ -1,0 +1,1545 @@
+"""单项目 Tab 面板
+
+把 项目元信息 / 工具栏按钮 / 日志 / 设置面板 / 状态条 / 进程运行器 串起来。
+"""
+from __future__ import annotations
+
+import re
+import time
+from pathlib import Path
+
+from PySide6.QtCore import Qt, QThread, QTimer, Signal
+from PySide6.QtGui import QAction, QFont
+from PySide6.QtWidgets import (
+    QApplication, QFrame, QHBoxLayout, QLabel, QMenu, QMessageBox, QPushButton,
+    QSplitter, QTabBar, QTabWidget, QToolButton, QVBoxLayout, QWidget, QSizePolicy,
+)
+
+from src.core.config import AppConfig, ProjectEntry
+from src.core.file_index import FileIndexer
+from src.core.git_worker import (
+    GitFetchWorker, GitMergeWorker, GitPullWorker, GitPushWorker,
+    GitUpdateBranchWorker,
+)
+from src.core.process_runner import ProcessRunner, RunContext
+from src.core.project_detector import ProjectMeta, RunProfile
+from src.ui.content_search import ContentSearchDialog
+from src.ui.file_tree import FileTree
+from src.ui.git_viewer import GitViewer
+from src.ui.log_widget import LogWidget
+from src.ui.quick_open import (
+    PickerItem, show_command_palette, show_recent_files,
+)
+from src.ui.service_panel import (
+    STATE_IDLE, STATE_RUNNING, STATE_STARTING, STATE_STOPPING, ServicePanel,
+)
+from src.ui.settings_panel import SettingsPanel
+from src.ui.theme import (
+    BG_L0, BG_L4, BORDER_SUBTLE, COLOR_SUCCESS, COLOR_WARN,
+    DOT_IDLE, DOT_RUNNING, DOT_WARN, FG_DIM, FG_PRIMARY, FG_SECONDARY,
+    FONT_PT_UI_SM, RADIUS_SM,
+)
+from src.util import git_info, notify
+from src.util.editor import open_in_editor, open_folder, reveal_in_explorer
+
+
+# 顶层调谐常量（提到顶部方便统一调，避免散在各方法里成 magic number）
+LEFT_PANEL_WIDTH = 240
+STATUS_REFRESH_MS = 3000
+GIT_FETCH_INTERVAL_MS = 5 * 60 * 1000
+GIT_FETCH_INITIAL_DELAY_MS = 8000
+MODULE_STOP_TIMEOUT_MS = 10000
+RESTART_GAP_MS = 1800
+COMPILE_THEN_RUN_GAP_MS = 300
+
+
+# 状态栏分支/改动按钮的 base QSS（透明、hover 高亮 BG_L4）
+def _status_btn_base_qss() -> str:
+    return (
+        f"QToolButton {{ background:transparent; border:none;"
+        f" padding:2px 8px; font-size:{FONT_PT_UI_SM}pt; }}"
+        f"QToolButton:hover {{ background:{BG_L4};"
+        f" border-radius:{RADIUS_SM}px; }}"
+        f"QToolButton::menu-indicator {{ image:none; width:0; }}"
+    )
+
+
+class _BranchMenu(QMenu):
+    """分支下拉菜单：右键带 data 的分支项时弹出「复制 / 更新 / 合并」上下文菜单。
+
+    QMenu 默认不会触发 customContextMenuRequested，所以走 contextMenuEvent。
+    - mergeRequested(branch)：把该分支合并到当前分支
+    - updateBranchRequested(branch)：把该分支更新到它的远程版本（不切分支）
+    """
+
+    mergeRequested = Signal(str)
+    updateBranchRequested = Signal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._current_branch = ""
+
+    def set_current_branch(self, name: str) -> None:
+        self._current_branch = name or ""
+
+    def contextMenuEvent(self, event):  # type: ignore[override]
+        action = self.actionAt(event.pos())
+        branch = action.data() if action is not None else None
+        if not branch:
+            super().contextMenuEvent(event)
+            return
+        is_current = branch == self._current_branch
+        ctx = QMenu(self)
+        copy_act = ctx.addAction("📋 复制分支名")
+        if is_current:
+            update_act = ctx.addAction("⤵ 更新此分支到远程 (git pull --ff-only)")
+        else:
+            update_act = ctx.addAction(f"⤵ 更新此分支到远程 ({branch} ← upstream)")
+        merge_act = ctx.addAction(f"🔀 合并到当前分支 (git merge {branch})")
+        if is_current:
+            merge_act.setEnabled(False)
+            merge_act.setText("🔀 合并到当前分支（不能合并自己）")
+        chosen = ctx.exec(event.globalPos())
+        if chosen is copy_act:
+            QApplication.clipboard().setText(branch)
+        elif chosen is update_act:
+            self.close()
+            self.updateBranchRequested.emit(branch)
+        elif chosen is merge_act:
+            # 关掉父菜单再弹确认对话框；否则父菜单会盖住对话框焦点
+            self.close()
+            self.mergeRequested.emit(branch)
+        event.accept()
+
+
+# 前端项目类型白名单：这些类型的项目如果 package.json 带 build script，就在工具栏多一个「打包」按钮
+_FRONTEND_TYPES = {"vue", "react", "next", "nuxt", "svelte", "node"}
+
+# 多模块 Spring Boot：从子模块启动日志里抓真实监听端口，覆盖 application.yml 里的默认值
+# 兼容 Spring Boot 2.x/3.x 的 Tomcat / Netty / Undertow / Jetty 启动行：
+#   Tomcat started on port(s): 8080 (http)
+#   Tomcat started on port 8080 (http)
+#   Netty started on port(s): 8080
+_RE_BOOT_LISTEN_PORT = re.compile(
+    r"(?:Tomcat|Netty|Undertow|Jetty)\s+started\s+on\s+port(?:\(s\))?[:\s]+(\d+)",
+    re.IGNORECASE,
+)
+
+
+class ProjectTab(QWidget):
+
+    statusChanged = Signal()   # 状态变化时通知主窗口刷新状态栏
+
+    def __init__(self, meta: ProjectMeta, entry: ProjectEntry, config: AppConfig, parent=None):
+        super().__init__(parent)
+        self.project_meta = meta
+        self.entry = entry
+        self.config = config
+        self.path = meta.path
+
+        # 多模块（Spring Cloud 那种）：每个 @SpringBootApplication 子模块一个独立 runner。
+        # 单模块项目这里就是 False，走 self.runner 的传统路径，行为 100% 不变。
+        self._is_multi_module = len(meta.spring_boot_modules) >= 2
+
+        # 项目级 runner：单模块项目的启动用它；多模块项目用它跑编译/Clean 等全局 profile
+        self.runner = ProcessRunner(self)
+        self.runner.outputLine.connect(self._on_output)
+        self.runner.stateChanged.connect(self._on_state)
+        self.runner.finished.connect(self._on_finished)
+
+        # 每个 Spring Boot 子模块独立的 runner + 日志 widget（仅多模块时有内容）
+        self.module_runners: dict[str, ProcessRunner] = {}
+        self.module_logs: dict[str, LogWidget] = {}
+        self._module_current: dict[str, RunProfile] = {}
+        # 模块启动日志里抓到的真实监听端口（覆盖 application.yml 默认值）
+        self._module_ports: dict[str, int] = {}
+        # 用户关 tab 触发 stop 的模块集合；finished 时自动清理 tab
+        self._closing_modules: set[str] = set()
+
+        # 文件树「▶ 运行脚本」启动的脚本：每个脚本绝对路径一个独立 runner + log tab。
+        # 与 module_runners 完全解耦，不进 ServicePanel，不影响多模块聚合状态。
+        # key 使用绝对路径（lower 后），同路径再次运行时会聚焦已有 tab 而不是再开一个
+        self._script_runners: dict[str, ProcessRunner] = {}
+        self._script_logs: dict[str, LogWidget] = {}
+        self._closing_scripts: set[str] = set()
+
+        self._current_profile: RunProfile | None = None
+        self._pending_after_compile: RunProfile | None = None
+        self._git_pull_worker: GitPullWorker | None = None
+        self._git_fetch_worker: GitFetchWorker | None = None
+        self._git_push_worker: GitPushWorker | None = None
+        self._git_merge_worker: GitMergeWorker | None = None
+        self._git_update_branch_worker: GitUpdateBranchWorker | None = None
+        # 启动完成标记：日志里看到 Started / ready in 等 marker 后，只给状态栏贴一次"✓ 启动完成"
+        self._startup_phase_marked = False
+        self._recent_files: list[str] = []     # 最近在预览里打开的文件
+
+        self.indexer = FileIndexer(self.project_meta.path, self)
+        self.indexer.start_async_scan()
+
+        self._build_ui()
+        self._register_shortcuts()
+
+        # 状态轮询（运行时长、占用端口、内存）
+        self._poll_timer = QTimer(self)
+        self._poll_timer.setInterval(STATUS_REFRESH_MS)
+        self._poll_timer.timeout.connect(self._refresh_status_row)
+        self._poll_timer.start()
+
+        # 远程分支轮询：每 5 分钟 git fetch 一次，发现新提交时高亮按钮 + 系统通知
+        self._fetch_timer = QTimer(self)
+        self._fetch_timer.setInterval(GIT_FETCH_INTERVAL_MS)
+        self._fetch_timer.timeout.connect(self._start_remote_fetch)
+        self._fetch_timer.start()
+        QTimer.singleShot(GIT_FETCH_INITIAL_DELAY_MS, self._start_remote_fetch)
+
+    # ---- UI ----
+
+    def _build_ui(self) -> None:
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        root.addWidget(self._build_toolbar())
+        root.addWidget(self._build_status_row())
+
+        self.splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.splitter.setHandleWidth(2)
+
+        self.file_tree = FileTree(
+            self.project_meta.path,
+            indexer=self.indexer,
+            project_type=self.project_meta.project_type,
+        )
+        self.file_tree.fileActivated.connect(self._on_file_activated)
+        self.file_tree.fileCreated.connect(self._on_file_created)
+        self.file_tree.scriptRunRequested.connect(self._run_script)
+
+        # 多模块项目：左侧垂直 splitter，上是服务面板、下是文件树
+        # 单模块项目：左侧只有文件树（行为不变）
+        self.service_panel: ServicePanel | None = None
+        if self._is_multi_module:
+            left_wrap = QSplitter(Qt.Orientation.Vertical)
+            left_wrap.setHandleWidth(2)
+            self.service_panel = ServicePanel(
+                [(name, port) for name, _path, port in self.project_meta.spring_boot_modules],
+                parent=self,
+            )
+            self.service_panel.startRequested.connect(self._start_module)
+            self.service_panel.stopRequested.connect(self._stop_module)
+            self.service_panel.focusRequested.connect(self._focus_module_log)
+            self.service_panel.startAllRequested.connect(self._start_all_modules)
+            self.service_panel.stopAllRequested.connect(self._stop_all_modules)
+            left_wrap.addWidget(self.service_panel)
+            left_wrap.addWidget(self.file_tree)
+            left_wrap.setSizes([220, 500])
+            self.splitter.addWidget(left_wrap)
+        else:
+            self.splitter.addWidget(self.file_tree)
+
+        self.log = LogWidget()
+        self.log.set_max_blocks(self.config.max_log_blocks)
+        self.log.fileJumpRequested.connect(self._jump_to_file)
+        self.log.set_ai_context_provider(self._make_ai_context)
+        self.log.portDiagnosisRequested.connect(self.open_port_dialog)
+
+        # 中心 Tab 容器：tab 0 固定是日志（不可关），其它 tab 是文件面板
+        self.center_tabs = QTabWidget()
+        self.center_tabs.setTabsClosable(True)
+        self.center_tabs.setMovable(True)
+        self.center_tabs.setDocumentMode(True)
+        self.center_tabs.tabCloseRequested.connect(self._on_tab_close_requested)
+        self.center_tabs.addTab(self.log, "📋 日志")
+        # 锁定日志 tab 的关闭按钮（两侧都清空，兼容不同平台默认位置）
+        _bar = self.center_tabs.tabBar()
+        _bar.setTabButton(0, QTabBar.ButtonPosition.RightSide, None)
+        _bar.setTabButton(0, QTabBar.ButtonPosition.LeftSide, None)
+        # tab 右键菜单：关闭 / 关闭其它 / 关闭右侧 / 关闭左侧
+        _bar.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        _bar.customContextMenuRequested.connect(self._on_tab_bar_context_menu)
+        # 已打开文件去重：key = abs_path.lower() → FilePreviewPane
+        self._file_panes: dict[str, object] = {}
+
+        self.splitter.addWidget(self.center_tabs)
+        self.splitter.setSizes([LEFT_PANEL_WIDTH, 1100])
+
+        root.addWidget(self.splitter, 1)
+
+    def _build_toolbar(self) -> QWidget:
+        bar = QFrame()
+        bar.setFrameShape(QFrame.Shape.NoFrame)
+        lay = QHBoxLayout(bar)
+        lay.setContentsMargins(10, 6, 10, 6)
+        lay.setSpacing(6)
+
+        type_lbl = QLabel(f"{self.project_meta.icon}  {self.project_meta.display_type}")
+        type_lbl.setProperty("role", "title")
+        lay.addWidget(type_lbl)
+
+        name_lbl = QLabel(self.project_meta.name)
+        name_lbl.setProperty("role", "subtitle")
+        lay.addWidget(name_lbl)
+
+        lay.addSpacing(20)
+
+        # 工具栏极简：只露主按钮（启动 ↔ 停止）
+        # 编译 / Clean / 重启 等次级命令统一进命令面板（Ctrl+Shift+P）
+        # 多模块项目：启停走左侧服务面板，主按钮隐藏
+        self._profile_buttons: dict[str, QPushButton] = {}
+        primary_profiles = [p for p in self.project_meta.profiles if p.primary]
+        self._primary_profile: RunProfile | None = primary_profiles[0] if primary_profiles else None
+
+        self.btn_main = QPushButton()
+        self.btn_main.setMinimumWidth(110)
+        self.btn_main.clicked.connect(self._on_main_clicked)
+        lay.addWidget(self.btn_main)
+        if self._is_multi_module:
+            self.btn_main.setVisible(False)
+        else:
+            self._update_main_button("idle")
+
+        # 前端项目：package.json 里有 build script 时多一个「🔒 打包」按钮，
+        # 走和主按钮同一套 _run_profile 逻辑（正在跑时会弹确认框先停再跑）
+        self._build_profile: RunProfile | None = None
+        if self.project_meta.project_type in _FRONTEND_TYPES:
+            build_prof = next(
+                (p for p in self.project_meta.profiles if p.name == "build"),
+                None,
+            )
+            if build_prof:
+                self._build_profile = build_prof
+                self.btn_build = QPushButton(
+                    f"{build_prof.icon}  {build_prof.label}" if build_prof.icon else build_prof.label
+                )
+                self.btn_build.setToolTip(
+                    build_prof.description or " ".join(build_prof.command)
+                )
+                self.btn_build.clicked.connect(lambda: self._run_profile(build_prof))
+                lay.addWidget(self.btn_build)
+
+        lay.addStretch(1)
+
+        # 工具栏极简：主按钮旁只留命令面板入口；其它常用动作全部进 Ctrl+Shift+P
+        btn_cmd = QToolButton()
+        btn_cmd.setText("⌘")
+        btn_cmd.setToolTip("命令面板 (Ctrl+Shift+P)")
+        btn_cmd.clicked.connect(self.open_command_palette)
+        lay.addWidget(btn_cmd)
+
+        return bar
+
+    def _build_status_row(self) -> QWidget:
+        bar = QFrame()
+        bar.setStyleSheet(
+            f"background:{BG_L0}; border-bottom:1px solid {BORDER_SUBTLE};"
+        )
+        lay = QHBoxLayout(bar)
+        lay.setContentsMargins(12, 4, 12, 4)
+        lay.setSpacing(14)
+
+        self.dot = QLabel("●")
+        self.dot.setStyleSheet(f"color: {DOT_IDLE};")
+        self.lbl_state = QLabel("就绪")
+        self.lbl_state.setProperty("role", "subtitle")
+        lay.addWidget(self.dot)
+        lay.addWidget(self.lbl_state)
+
+        lay.addWidget(QLabel(""))
+        self.lbl_elapsed = QLabel("")
+        self.lbl_elapsed.setProperty("role", "subtitle")
+        lay.addWidget(self.lbl_elapsed)
+
+        self.lbl_phase = QLabel("")
+        self.lbl_phase.setProperty("role", "subtitle")
+        lay.addWidget(self.lbl_phase)
+
+        # 分支按钮：点击弹出菜单切换分支
+        self.btn_branch = QToolButton()
+        self.btn_branch.setText("")
+        self.btn_branch.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.btn_branch.setToolTip("点击切换分支")
+        # 默认色（无 git 信息时不显示，初始 QSS 用次级灰）
+        self.btn_branch.setStyleSheet(
+            _status_btn_base_qss() + f"QToolButton {{ color:{FG_SECONDARY}; }}"
+        )
+        self._branch_menu = _BranchMenu(self.btn_branch)
+        self._branch_menu.aboutToShow.connect(self._populate_branch_menu)
+        self._branch_menu.mergeRequested.connect(self._on_git_merge)
+        self._branch_menu.updateBranchRequested.connect(self._on_update_branch)
+        self.btn_branch.setMenu(self._branch_menu)
+        self.btn_branch.setVisible(False)   # 没有 git 信息时隐藏
+        lay.addWidget(self.btn_branch)
+
+        # 改动按钮：紧贴分支按钮，显示本地改动文件数，点击打开 GitViewer
+        self.btn_changes = QToolButton()
+        self.btn_changes.setText("")
+        self.btn_changes.setToolTip("查看 Git 变更 + 提交历史")
+        self.btn_changes.clicked.connect(self.open_git_viewer)
+        self.btn_changes.setVisible(False)
+        lay.addWidget(self.btn_changes)
+
+        lay.addStretch(1)
+
+        return bar
+
+    # ---- 动作 ----
+
+    def _run_profile(self, prof: RunProfile) -> None:
+        if self.runner.is_running():
+            ret = QMessageBox.question(
+                self, "已有任务在运行",
+                "当前已有任务在运行，需要先停止再执行吗？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if ret != QMessageBox.StandardButton.Yes:
+                return
+            self.runner.stop()
+            QTimer.singleShot(RESTART_GAP_MS, lambda: self._run_profile(prof))
+            return
+
+        # 启动前强制编译
+        if prof.pre_compile:
+            compile_prof = self._find_compile_profile()
+            if compile_prof and compile_prof.name != prof.name:
+                self._pending_after_compile = prof
+                self._start_profile(compile_prof)
+                return
+        self._start_profile(prof)
+
+    def _find_compile_profile(self) -> RunProfile | None:
+        for p in self.project_meta.profiles:
+            if p.kind == "compile":
+                return p
+        return None
+
+    def _start_profile(self, prof: RunProfile) -> None:
+        self._current_profile = prof
+        self.log.begin_run(f"{self.project_meta.name}-{prof.name}")
+        ctx = RunContext(
+            cwd=self.project_meta.path,
+            env={},
+            jvm_opts="",
+            spring_profile="",
+            extra_args=[],
+        )
+        ok = self.runner.start(list(prof.command), ctx)
+        if not ok:
+            self.log.append_line("stderr", f"[启动失败] 无法启动 {prof.label}")
+
+    def _stop(self) -> None:
+        self._pending_after_compile = None
+        self.runner.stop()
+
+    def _on_main_clicked(self) -> None:
+        """主按钮点击：根据当前状态决定启动 or 停止"""
+        if self.runner.is_running():
+            self._stop()
+        elif self._primary_profile:
+            self._run_profile(self._primary_profile)
+
+    def _update_main_button(self, state: str) -> None:
+        btn = self.btn_main
+        if state == "running":
+            btn.setText("⏹  停止")
+            btn.setProperty("role", "danger")
+            btn.setToolTip("停止当前运行的进程（递归杀进程树）")
+            btn.setEnabled(True)
+        elif state == "stopping":
+            btn.setText("⏳  停止中...")
+            btn.setToolTip("正在停止...")
+            btn.setEnabled(False)
+        else:   # idle
+            p = self._primary_profile
+            if p:
+                btn.setText(f"{p.icon}  {p.label}" if p.icon else p.label)
+                btn.setToolTip(p.description or " ".join(p.command))
+            else:
+                btn.setText("▶  启动")
+                btn.setToolTip("(未识别出主启动命令)")
+                btn.setEnabled(False)
+                return
+            btn.setProperty("role", "primary")
+            btn.setEnabled(True)
+        btn.style().unpolish(btn)
+        btn.style().polish(btn)
+
+    def _restart(self) -> None:
+        primary = next((p for p in self.project_meta.profiles if p.primary), None)
+        if not primary:
+            return
+        if self.runner.is_running():
+            self._pending_after_stop = primary
+            self.runner.stop()
+            QTimer.singleShot(RESTART_GAP_MS, lambda: self._run_profile(primary))
+        else:
+            self._run_profile(primary)
+
+    # ---- 多模块（Spring Cloud）专用动作 ----
+
+    def _find_module_run_profile(self, module: str) -> RunProfile | None:
+        """模块名 → 对应的 bootRun RunProfile（project_detector 已生成）"""
+        # 子模块：profile.name == f"bootRun:{module}"
+        for p in self.project_meta.profiles:
+            if p.name == f"bootRun:{module}":
+                return p
+        # 主模块：primary=True 且 command 里含 :{module}:bootRun
+        marker = f":{module}:bootRun"
+        for p in self.project_meta.profiles:
+            if p.primary and p.kind == "run":
+                if any(marker in arg for arg in p.command):
+                    return p
+        return None
+
+    def _ensure_module_runner(self, module: str) -> ProcessRunner:
+        r = self.module_runners.get(module)
+        if r is not None:
+            return r
+        r = ProcessRunner(self)
+        r.outputLine.connect(lambda s, l, m=module: self._on_module_output(m, s, l))
+        r.stateChanged.connect(lambda st, m=module: self._on_module_state(m, st))
+        r.finished.connect(lambda c, m=module: self._on_module_finished(m, c))
+        self.module_runners[module] = r
+        return r
+
+    def _ensure_module_log_tab(self, module: str) -> LogWidget:
+        """第一次启动该模块时创建独立 LogWidget 并挂到中心 Tab 容器"""
+        lw = self.module_logs.get(module)
+        if lw is not None:
+            return lw
+        lw = LogWidget()
+        lw.set_max_blocks(self.config.max_log_blocks)
+        lw.fileJumpRequested.connect(self._jump_to_file)
+        lw.set_ai_context_provider(self._make_ai_context)
+        lw.portDiagnosisRequested.connect(self.open_port_dialog)
+        self.module_logs[module] = lw
+        idx = self.center_tabs.addTab(lw, f"📋 {module}")
+        self.center_tabs.setCurrentIndex(idx)
+        return lw
+
+    def _start_module(self, module: str) -> None:
+        prof = self._find_module_run_profile(module)
+        if not prof:
+            QMessageBox.warning(self, "启动失败", f"未找到模块「{module}」的启动命令")
+            return
+        runner = self._ensure_module_runner(module)
+        if runner.is_running():
+            return
+        log_w = self._ensure_module_log_tab(module)
+        log_w.begin_run(f"{self.project_meta.name}-{module}")
+        ctx = RunContext(
+            cwd=self.project_meta.path,
+            env={}, jvm_opts="", spring_profile="", extra_args=[],
+        )
+        self._module_current[module] = prof
+        # 上次运行抓到的端口失效，等本次启动日志里重新抓
+        self._module_ports.pop(module, None)
+        if self.service_panel:
+            self.service_panel.update_state(module, STATE_STARTING)
+        ok = runner.start(list(prof.command), ctx)
+        if not ok:
+            log_w.append_line("stderr", f"[启动失败] 无法启动 {module}")
+
+    def _stop_module(self, module: str) -> None:
+        runner = self.module_runners.get(module)
+        if not runner or not runner.is_running():
+            return
+        runner.stop()
+
+    def _start_all_modules(self) -> None:
+        """并行启动所有未运行的模块（无依赖编排——用户砍掉 Workspace 时已认可）"""
+        for mod_name, _path, _port in self.project_meta.spring_boot_modules:
+            r = self.module_runners.get(mod_name)
+            if r and r.is_running():
+                continue
+            self._start_module(mod_name)
+
+    def _stop_all_modules(self) -> None:
+        """并行停止所有运行中的模块"""
+        for mod_name, runner in list(self.module_runners.items()):
+            if runner.is_running():
+                runner.stop()
+
+    def _focus_module_log(self, module: str) -> None:
+        lw = self.module_logs.get(module)
+        if lw is not None:
+            idx = self.center_tabs.indexOf(lw)
+            if idx >= 0:
+                self.center_tabs.setCurrentIndex(idx)
+                return
+        # 模块还没启动过：提示用户先启动
+        self.log.append_line(
+            "meta",
+            f"[提示] {module} 还未启动；点击其右侧的 ▶ 按钮或"
+            f" Ctrl+Shift+P →「▶ 启动 {module}」",
+        )
+
+    def _on_module_output(self, module: str, stream: str, line: str) -> None:
+        lw = self.module_logs.get(module)
+        if lw is None:
+            return
+        lw.append_line(stream, line)
+        # 抓真实监听端口；只抓第一次命中（HTTP 端口通常先于 management 端口出现）
+        if module not in self._module_ports:
+            m = _RE_BOOT_LISTEN_PORT.search(line)
+            if m:
+                self._module_ports[module] = int(m.group(1))
+                if self.service_panel:
+                    self.service_panel.update_state(
+                        module, STATE_RUNNING,
+                        port=self._module_ports[module],
+                        elapsed_seconds=self.module_runners[module].elapsed_seconds()
+                            if module in self.module_runners else 0.0,
+                    )
+
+    def _on_module_state(self, module: str, state: str) -> None:
+        if self.service_panel:
+            mapping = {
+                "idle":     STATE_IDLE,
+                "running":  STATE_RUNNING,
+                "stopping": STATE_STOPPING,
+            }
+            panel_state = mapping.get(state, STATE_IDLE)
+            self.service_panel.update_state(module, panel_state)
+        self._refresh_aggregate_state()
+        self.statusChanged.emit()
+
+    def _on_module_finished(self, module: str, exit_code: int) -> None:
+        lw = self.module_logs.get(module)
+        if lw is not None:
+            lw.end_run()
+        self._module_current.pop(module, None)
+        if exit_code not in (0, -1):
+            notify.notify_error(
+                f"✗ {self.project_meta.name} / {module} 退出",
+                f"退出码 {exit_code}",
+            )
+        # 如果是"关 tab 触发的停止"，在这里把 tab 真正移除
+        if module in self._closing_modules:
+            self._closing_modules.discard(module)
+            self._remove_module_tab(module)
+
+    def _force_close_module_if_stuck(self, module: str) -> None:
+        """关 tab 触发 stop 10 秒后的兜底：若还在 _closing_modules 说明进程没正常退
+        （SIGTERM 被忽略 / QProcess.finished 丢失），强制清理 tab。"""
+        if module not in self._closing_modules:
+            return
+        self._closing_modules.discard(module)
+        self.log.append_line(
+            "meta",
+            f"[警告] 模块 {module} 停止超时（10s）；关闭 tab 但进程可能残留，"
+            f"请用「🔌 端口占用查询」或任务管理器确认",
+        )
+        self._remove_module_tab(module)
+
+    def _remove_module_tab(self, module: str) -> None:
+        """把某模块的 tab + runner + log 全部清理掉"""
+        lw = self.module_logs.pop(module, None)
+        if lw is not None:
+            idx = self.center_tabs.indexOf(lw)
+            if idx >= 0:
+                self.center_tabs.removeTab(idx)
+            lw.deleteLater()
+        runner = self.module_runners.pop(module, None)
+        if runner is not None:
+            runner.deleteLater()
+        self._module_current.pop(module, None)
+        self._module_ports.pop(module, None)
+        if self.service_panel:
+            self.service_panel.update_state(module, STATE_IDLE)
+
+    def _module_of_tab(self, widget) -> str | None:
+        for m, lw in self.module_logs.items():
+            if lw is widget:
+                return m
+        return None
+
+    def _any_module_running(self) -> bool:
+        return any(r.is_running() for r in self.module_runners.values())
+
+    # ---- 文件树「▶ 运行脚本」 ----
+
+    def _script_key(self, path: str) -> str:
+        """脚本 tab 的去重 key：用 resolve 后的小写绝对路径，跟 _file_panes 一致"""
+        try:
+            return str(Path(path).resolve()).lower()
+        except OSError:
+            return path.lower()
+
+    def _script_of_tab(self, widget) -> str | None:
+        for k, lw in self._script_logs.items():
+            if lw is widget:
+                return k
+        return None
+
+    def _run_script(self, path: str) -> None:
+        """文件树右键「▶ 运行 xxx.bat」：在中心 Tab 容器里开一个独立 LogWidget 跑脚本，
+        stdout/stderr 都灌进 tab。CREATE_NO_WINDOW 已在 process_runner 里贴上，不会弹黑窗。
+        关 tab 等同于停进程（与模块日志 tab 同套机制）。
+        """
+        p = Path(path)
+        if not p.is_file():
+            QMessageBox.warning(self, "运行脚本", f"文件不存在：\n{path}")
+            return
+
+        key = self._script_key(path)
+        existing = self._script_runners.get(key)
+        if existing and existing.is_running():
+            # 同一脚本已有运行中 tab：聚焦它，不重复启动
+            lw = self._script_logs.get(key)
+            if lw is not None:
+                idx = self.center_tabs.indexOf(lw)
+                if idx >= 0:
+                    self.center_tabs.setCurrentIndex(idx)
+            return
+
+        # 同路径上次运行已结束但 tab 还在：复用 LogWidget，新跑一轮
+        lw = self._script_logs.get(key)
+        if lw is None:
+            lw = LogWidget()
+            lw.set_max_blocks(self.config.max_log_blocks)
+            lw.fileJumpRequested.connect(self._jump_to_file)
+            lw.set_ai_context_provider(self._make_ai_context)
+            lw.portDiagnosisRequested.connect(self.open_port_dialog)
+            self._script_logs[key] = lw
+            idx = self.center_tabs.addTab(lw, f"▶ {p.name}")
+        else:
+            # 复用已有 LogWidget：保留上次输出，begin_run 会贴新 banner 区分两轮
+            idx = self.center_tabs.indexOf(lw)
+        self.center_tabs.setCurrentIndex(idx)
+
+        runner = self._script_runners.get(key)
+        if runner is None:
+            runner = ProcessRunner(self)
+            runner.outputLine.connect(lambda s, l, k=key: self._on_script_output(k, s, l))
+            runner.finished.connect(lambda c, k=key: self._on_script_finished(k, c))
+            self._script_runners[key] = runner
+
+        # 命令构造：cmd 系（.bat/.cmd）走 cmd /c，PowerShell 走 pwsh/powershell -File，
+        # .exe/其他直接当命令执行。process_runner._split_program 已帮 .bat/.cmd 包 cmd /c，
+        # 这里只把脚本绝对路径作为单个 token 交出去就行
+        ext = p.suffix.lower()
+        if ext == ".ps1":
+            command = ["powershell", "-NoLogo", "-NoProfile",
+                       "-ExecutionPolicy", "Bypass", "-File", str(p)]
+        else:
+            # .bat / .cmd / .exe 都直接交给 _split_program；它会按扩展名走 cmd /c 或直跑
+            command = [str(p)]
+
+        lw.begin_run(p.name)
+        ctx = RunContext(
+            cwd=str(p.parent),     # 用脚本所在目录作为 cwd——nginx 这类相对路径配置才能找到
+            env={}, jvm_opts="", spring_profile="", extra_args=[],
+        )
+        ok = runner.start(command, ctx)
+        if not ok:
+            lw.append_line("stderr", f"[启动失败] 无法启动 {p.name}")
+
+    def _on_script_output(self, key: str, stream: str, line: str) -> None:
+        lw = self._script_logs.get(key)
+        if lw is not None:
+            lw.append_line(stream, line)
+
+    def _on_script_finished(self, key: str, exit_code: int) -> None:
+        lw = self._script_logs.get(key)
+        if lw is not None:
+            lw.end_run()
+        # 关 tab 触发的停止：进程退出后真正清理 tab
+        if key in self._closing_scripts:
+            self._closing_scripts.discard(key)
+            self._remove_script_tab(key)
+
+    def _remove_script_tab(self, key: str) -> None:
+        lw = self._script_logs.pop(key, None)
+        if lw is not None:
+            idx = self.center_tabs.indexOf(lw)
+            if idx >= 0:
+                self.center_tabs.removeTab(idx)
+            lw.deleteLater()
+        runner = self._script_runners.pop(key, None)
+        if runner is not None:
+            runner.deleteLater()
+
+    def _force_close_script_if_stuck(self, key: str) -> None:
+        if key not in self._closing_scripts:
+            return
+        self._closing_scripts.discard(key)
+        self.log.append_line(
+            "meta",
+            f"[警告] 脚本 {key} 停止超时（10s）；关闭 tab 但进程可能残留，"
+            f"请用「🔌 端口占用查询」或任务管理器确认",
+        )
+        self._remove_script_tab(key)
+
+    def _any_script_running(self) -> bool:
+        return any(r.is_running() for r in self._script_runners.values())
+
+    def _refresh_aggregate_state(self) -> None:
+        """多模块项目：根据所有 runner 汇总状态更新状态栏 dot / lbl_state"""
+        if not self._is_multi_module:
+            return
+        total = len(self.project_meta.spring_boot_modules)
+        running = sum(1 for r in self.module_runners.values() if r.is_running())
+        stopping = any(r.state() == "stopping" for r in self.module_runners.values())
+        if running == 0 and not stopping:
+            self.dot.setStyleSheet(f"color: {DOT_IDLE};")
+            self.lbl_state.setText("就绪")
+        elif stopping:
+            self.dot.setStyleSheet(f"color: {DOT_WARN};")
+            self.lbl_state.setText(f"停止中 ({running}/{total} 运行中)")
+        else:
+            self.dot.setStyleSheet(f"color: {DOT_RUNNING};")
+            self.lbl_state.setText(f"{running}/{total} 运行中")
+
+    # ---- 事件回调 ----
+
+    def _on_output(self, stream: str, line: str) -> None:
+        self.log.append_line(stream, line)
+        # 日志里识别到启动完成 marker 后，状态栏贴一次"✓ 启动完成"（仅状态栏，不弹系统通知）
+        if not self._startup_phase_marked and self._current_profile and self._current_profile.kind == "run":
+            markers = ("Started ", "ready in ", "compiled successfully", "Netty started on port", "Tomcat started on port")
+            if any(m in line for m in markers):
+                self._startup_phase_marked = True
+                self.lbl_phase.setText("✓ 启动完成")
+                self.lbl_phase.setStyleSheet(f"color: {COLOR_SUCCESS};")
+
+    def _on_state(self, state: str) -> None:
+        mapping = {
+            "idle":     ("●", DOT_IDLE, "就绪"),
+            "running":  ("●", DOT_RUNNING, "运行中"),
+            "stopping": ("●", DOT_WARN, "正在停止..."),
+        }
+        dot, color, text = mapping.get(state, ("●", FG_SECONDARY, state))
+        self.dot.setText(dot)
+        self.dot.setStyleSheet(f"color: {color};")
+
+        if state == "running" and self._current_profile:
+            text = f"{self._current_profile.label} 中"
+        self.lbl_state.setText(text)
+
+        self._update_main_button(state)
+
+        # 多模块项目：self.runner 只用来跑编译/Clean 等项目级 profile。
+        # 跑完 idle 时要把状态栏恢复成"N/M 运行中"的聚合显示。
+        if self._is_multi_module and state == "idle":
+            self._refresh_aggregate_state()
+
+        self.statusChanged.emit()
+
+    def _on_finished(self, exit_code: int) -> None:
+        prof = self._current_profile
+        self.log.end_run()
+        self._current_profile = None
+
+        # 启动前编译完成，接着执行主任务
+        if prof and prof.kind == "compile" and self._pending_after_compile:
+            if exit_code == 0:
+                nxt = self._pending_after_compile
+                self._pending_after_compile = None
+                QTimer.singleShot(COMPILE_THEN_RUN_GAP_MS, lambda: self._start_profile(nxt))
+            else:
+                self._pending_after_compile = None
+                self.log.append_line("stderr", "[已取消] 编译失败，跳过启动")
+                notify.notify_error(
+                    f"✗ {self.project_meta.name} 编译失败",
+                    "点击日志查看错误详情；已取消后续启动",
+                )
+                return
+
+        # 运行任务异常退出
+        if prof and prof.kind == "run" and exit_code not in (0, -1):
+            notify.notify_error(
+                f"✗ {self.project_meta.name} 退出",
+                f"退出码 {exit_code}，查看日志定位原因",
+            )
+        self._startup_phase_marked = False
+
+    def _refresh_status_row(self) -> None:
+        if self._is_multi_module:
+            # 多模块：顶部只显示 "N/M 运行中"；每行运行时长更新到 ServicePanel
+            running = 0
+            for mod_name, r in self.module_runners.items():
+                if r.is_running():
+                    running += 1
+                    if self.service_panel:
+                        self.service_panel.update_state(
+                            mod_name, STATE_RUNNING,
+                            port=self._module_ports.get(mod_name),
+                            elapsed_seconds=r.elapsed_seconds(),
+                        )
+            total = len(self.project_meta.spring_boot_modules)
+            self.lbl_elapsed.setText(f"已运行 {running}/{total}" if running else "")
+        elif self.runner.is_running():
+            elapsed = self.runner.elapsed_seconds()
+            m, s = divmod(int(elapsed), 60)
+            h, m = divmod(m, 60)
+            self.lbl_elapsed.setText(f"已运行 {h}:{m:02d}:{s:02d}" if h else f"已运行 {m}:{s:02d}")
+        else:
+            self.lbl_elapsed.setText("")
+
+        info = git_info.get_info(self.project_meta.path)
+        text = git_info.format_status(info)
+        if text:
+            self.btn_branch.setText(text + "  ▾")
+            base = _status_btn_base_qss()
+            # behind > 0 → 橙色高亮提示远程有新提交，点开菜单可拉取
+            if info and info.behind > 0:
+                self.btn_branch.setStyleSheet(base + f"QToolButton {{ color:{COLOR_WARN}; }}")
+                self.btn_branch.setToolTip(
+                    f"远程有 {info.behind} 个新提交，点击菜单 → 「⬇ 从远程拉取」"
+                )
+            else:
+                self.btn_branch.setStyleSheet(base + f"QToolButton {{ color:{FG_SECONDARY}; }}")
+                self.btn_branch.setToolTip("点击切换分支 / 拉取远程")
+            self.btn_branch.setVisible(True)
+        else:
+            self.btn_branch.setVisible(False)
+
+        # 改动按钮：dirty 时高亮 + 显示数字；干净时灰色「无改动」
+        if info and info.branch:
+            n = info.changed
+            base = _status_btn_base_qss()
+            if n > 0:
+                self.btn_changes.setText(f"📝 {n} 处改动")
+                self.btn_changes.setStyleSheet(base + f"QToolButton {{ color:{COLOR_WARN}; }}")
+            else:
+                self.btn_changes.setText("📝 无改动")
+                self.btn_changes.setStyleSheet(base + f"QToolButton {{ color:{FG_DIM}; }}")
+            self.btn_changes.setVisible(True)
+        else:
+            self.btn_changes.setVisible(False)
+
+    # ---- 文件跳转 / AI ----
+
+    def _make_ai_context(self) -> str:
+        """给 LogWidget 的「复制错误给 AI」按钮提供项目上下文"""
+        info = git_info.get_info(self.project_meta.path)
+        branch = info.branch if info and info.branch else "(无或非 git 仓库)"
+        cur = self._current_profile
+        command = " ".join(cur.command) if cur else "(当前未运行)"
+        profile_label = cur.label if cur else "(无)"
+        return (
+            f"- 路径: {self.project_meta.path}\n"
+            f"- 类型: {self.project_meta.display_type} ({self.project_meta.project_type})\n"
+            f"- 分支: {branch}\n"
+            f"- 当前 profile: {profile_label}\n"
+            f"- 启动命令: {command}"
+        )
+
+    def _jump_to_file(self, path: str, line: int, col: int) -> None:
+        # file_open_mode=preview 总是用内置预览；auto 则先试外部编辑器
+        if self.config.file_open_mode == "preview":
+            self._show_preview(path, line, col)
+            return
+        ok = open_in_editor(
+            path, line=line, column=col,
+            editor_cmd=self.config.editor_cmd,
+            project_root=self.project_meta.path,
+        )
+        if not ok:
+            # 外部编辑器都不可用，回落到内置预览
+            self._show_preview(path, line, col)
+
+    def _show_preview(self, path: str, line: int, col: int) -> None:
+        """在中心 tab 区打开文件：同文件已开则聚焦，否则新建 tab（默认编辑模式）"""
+        from pathlib import Path
+        p = Path(path)
+        if not p.is_absolute():
+            from src.util.editor import search_in_project
+            found = search_in_project(Path(self.project_meta.path), p.name)
+            if found:
+                path = str(found)
+        self._remember_recent(path)
+
+        key = self._tab_key(path)
+        existing = self._file_panes.get(key)
+        if existing is not None:
+            idx = self.center_tabs.indexOf(existing)
+            if idx >= 0:
+                self.center_tabs.setCurrentIndex(idx)
+                if line > 0:
+                    existing.goto_line(line, col)
+                existing.setFocus()
+                return
+            # 索引丢失（异常），从字典里清掉走新建分支
+            self._file_panes.pop(key, None)
+
+        from src.ui.file_preview import FilePreviewPane
+        pane = FilePreviewPane(
+            path=path, line=line, column=col,
+            project_root=self.project_meta.path,
+            config=self.config, parent=self.center_tabs,
+        )
+        pane.dirtyChanged.connect(
+            lambda dirty, pn=pane: self._on_pane_dirty_changed(pn, dirty)
+        )
+        label = Path(path).name
+        try:
+            rel = str(Path(path).relative_to(self.project_meta.path))
+        except ValueError:
+            rel = path
+        idx = self.center_tabs.addTab(pane, label)
+        self.center_tabs.setTabToolTip(idx, rel)
+        self._file_panes[key] = pane
+        self.center_tabs.setCurrentIndex(idx)
+        pane.setFocus()
+
+    def _on_file_created(self, path: str) -> None:
+        """文件树新建文件后：直接在 tab 区打开（本来就是默认编辑模式）"""
+        self._show_preview(path, 0, 0)
+
+    def _tab_key(self, path: str) -> str:
+        from pathlib import Path
+        try:
+            return str(Path(path).resolve()).lower()
+        except OSError:
+            return path.lower()
+
+    def _on_pane_dirty_changed(self, pane, dirty: bool) -> None:
+        from pathlib import Path
+        idx = self.center_tabs.indexOf(pane)
+        if idx <= 0:
+            return
+        name = Path(pane.get_path()).name
+        self.center_tabs.setTabText(idx, f"{name} *" if dirty else name)
+
+    def _on_tab_close_requested(self, index: int) -> None:
+        """× 按钮 / 中键 / Ctrl+W 触发。项目级日志 tab（index==0）不关。
+
+        - 文件预览 tab：flush_save 后直接 removeTab
+        - 模块日志 tab：如果进程在跑，弹确认 → 停进程；真正的 tab 移除推迟到 finished 回调里
+        """
+        if index == 0:
+            return
+        widget = self.center_tabs.widget(index)
+
+        # 模块日志 tab
+        module = self._module_of_tab(widget)
+        if module is not None:
+            runner = self.module_runners.get(module)
+            if runner and runner.is_running():
+                ret = QMessageBox.question(
+                    self, "关闭模块",
+                    f"「{module}」正在运行。关闭此 tab 会停止该模块的进程，继续吗？",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if ret != QMessageBox.StandardButton.Yes:
+                    return
+                self._closing_modules.add(module)
+                runner.stop()
+                # 不立即 removeTab，等 _on_module_finished 触发清理。
+                # 兜底：进程 10 秒还没退出就强制清理 tab（子进程可能卡在 SIGTERM，
+                # 或 QProcess.finished 信号丢失；UI 不能永远留个关不掉的 tab）。
+                QTimer.singleShot(MODULE_STOP_TIMEOUT_MS, lambda m=module: self._force_close_module_if_stuck(m))
+            else:
+                self._remove_module_tab(module)
+            return
+
+        # 脚本运行 tab（文件树「▶ 运行」启动的 .bat/.cmd/.ps1/.exe）
+        script_key = self._script_of_tab(widget)
+        if script_key is not None:
+            runner = self._script_runners.get(script_key)
+            if runner and runner.is_running():
+                ret = QMessageBox.question(
+                    self, "关闭脚本",
+                    f"脚本正在运行。关闭此 tab 会停止该进程，继续吗？\n\n{script_key}",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if ret != QMessageBox.StandardButton.Yes:
+                    return
+                self._closing_scripts.add(script_key)
+                runner.stop()
+                QTimer.singleShot(MODULE_STOP_TIMEOUT_MS, lambda k=script_key: self._force_close_script_if_stuck(k))
+            else:
+                self._remove_script_tab(script_key)
+            return
+
+        # 文件预览 tab
+        from src.ui.file_preview import FilePreviewPane
+        if isinstance(widget, FilePreviewPane):
+            widget.flush_save()
+            key = self._tab_key(widget.get_path())
+            self._file_panes.pop(key, None)
+        self.center_tabs.removeTab(index)
+        widget.deleteLater()
+
+    def _close_current_file_tab(self) -> None:
+        """Ctrl+W：关闭当前 file tab（日志 tab 被忽略）"""
+        idx = self.center_tabs.currentIndex()
+        if idx <= 0:
+            return
+        self._on_tab_close_requested(idx)
+
+    def _on_tab_bar_context_menu(self, pos) -> None:
+        """tabBar 右键菜单：关闭 / 关闭其它 / 关闭右侧 / 关闭左侧。
+
+        日志 tab（index 0）永不可关，所以在筛选目标时统一过滤掉 0；
+        模块 / 脚本 tab 的关闭走 _on_tab_close_requested（已弹确认 + 异步停进程）。
+        """
+        bar = self.center_tabs.tabBar()
+        index = bar.tabAt(pos)
+        if index < 0:
+            return
+        total = self.center_tabs.count()
+
+        others = [i for i in range(total) if i != index and i != 0]
+        rights = [i for i in range(total) if i > index and i != 0]
+        lefts = [i for i in range(total) if i < index and i != 0]
+
+        menu = QMenu(self)
+        act_close = menu.addAction("关闭")
+        act_close.setEnabled(index != 0)
+        menu.addSeparator()
+        act_others = menu.addAction("关闭其它")
+        act_others.setEnabled(bool(others))
+        act_right = menu.addAction("关闭右侧")
+        act_right.setEnabled(bool(rights))
+        act_left = menu.addAction("关闭左侧")
+        act_left.setEnabled(bool(lefts))
+
+        chosen = menu.exec(bar.mapToGlobal(pos))
+        if chosen is None:
+            return
+        if chosen is act_close:
+            self._on_tab_close_requested(index)
+        elif chosen is act_others:
+            self._close_tab_indices(others)
+        elif chosen is act_right:
+            self._close_tab_indices(rights)
+        elif chosen is act_left:
+            self._close_tab_indices(lefts)
+
+    def _close_tab_indices(self, indices: list[int]) -> None:
+        """批量关闭一组 tab。倒序关，避免中途 index 错位。
+
+        模块 / 脚本 tab 走异步删除（finished 回调里 removeTab），
+        但倒序处理保证我们处理某个 index 时它前面（更小 index）的元素位置不变；
+        异步删除发生时被删的就是当前 index 自身，对剩余待处理的更小 index 没影响。
+        """
+        for i in sorted(indices, reverse=True):
+            if i <= 0 or i >= self.center_tabs.count():
+                continue
+            self._on_tab_close_requested(i)
+
+    def _remember_recent(self, path: str) -> None:
+        if not path:
+            return
+        if path in self._recent_files:
+            self._recent_files.remove(path)
+        self._recent_files.insert(0, path)
+        self._recent_files = self._recent_files[:30]
+
+    # ---- 分支切换 ----
+
+    def _populate_branch_menu(self) -> None:
+        """每次菜单弹出前重建：拉取 + 本地分支 + 远程分支（无同名本地的）"""
+        from src.core.git_ops import has_upstream, is_git_repo, list_branches
+        menu = self._branch_menu
+        menu.clear()
+        if not is_git_repo(self.project_meta.path):
+            act = menu.addAction("（不是 git 仓库）")
+            act.setEnabled(False)
+            return
+
+        upstream_ok = has_upstream(self.project_meta.path)
+
+        # 顶部：从远程拉取
+        pulling = bool(self._git_pull_worker and self._git_pull_worker.isRunning())
+        if pulling:
+            act = menu.addAction("⬇  拉取中...")
+            act.setEnabled(False)
+        else:
+            act = menu.addAction("⬇  从远程拉取 (git pull --ff-only)")
+            if upstream_ok:
+                act.triggered.connect(self._on_git_pull)
+            else:
+                act.setEnabled(False)
+                act.setText("⬇  从远程拉取（当前分支无上游）")
+
+        # 推送到远程（merge 完通常接着推一下，所以紧贴着 pull 摆）
+        pushing = bool(self._git_push_worker and self._git_push_worker.isRunning())
+        if pushing:
+            act = menu.addAction("⬆  推送中...")
+            act.setEnabled(False)
+        else:
+            act = menu.addAction("⬆  推送到远程 (git push)")
+            if upstream_ok:
+                act.triggered.connect(self._on_git_push)
+            else:
+                act.setEnabled(False)
+                act.setText("⬆  推送到远程（当前分支无上游）")
+        menu.addSeparator()
+
+        data = list_branches(self.project_meta.path)
+        cur = data["current"]
+        local = data["local"]
+        remote = data["remote"]
+        menu.set_current_branch(cur)
+
+        if local:
+            head = menu.addAction("本地分支")
+            head.setEnabled(False)
+            for b in local:
+                label = ("● " if b == cur else "    ") + b
+                act = menu.addAction(label)
+                act.setData(b)   # 右键复制分支名用
+                if b == cur:
+                    act.setEnabled(False)
+                else:
+                    act.triggered.connect(lambda _=False, br=b: self._on_switch_branch(br))
+        if remote:
+            menu.addSeparator()
+            head = menu.addAction("远程分支（切换会创建本地跟踪分支）")
+            head.setEnabled(False)
+            for b in remote:
+                act = menu.addAction("    " + b)
+                act.setData(b)   # 右键复制分支名用
+                act.triggered.connect(lambda _=False, br=b: self._on_switch_branch(br))
+
+    def _start_remote_fetch(self) -> None:
+        """后台 git fetch；不弹窗、不打扰，结果通过状态栏 + 系统通知体现"""
+        if self._git_fetch_worker and self._git_fetch_worker.isRunning():
+            return
+        from src.core.git_ops import has_upstream, is_git_repo
+        path = self.project_meta.path
+        if not is_git_repo(path) or not has_upstream(path):
+            return
+        self._git_fetch_worker = GitFetchWorker(path, parent=self)
+        self._git_fetch_worker.done.connect(self._on_remote_fetch_done)
+        self._git_fetch_worker.start()
+
+    def _on_remote_fetch_done(self, ok: bool) -> None:
+        if not ok:
+            return
+        # 清缓存让 _refresh_status_row 拿到最新 ahead/behind；behind 变化会反映在分支按钮高亮上
+        git_info.invalidate(self.project_meta.path)
+        self._refresh_status_row()
+
+    def _on_git_pull(self) -> None:
+        if self._git_pull_worker and self._git_pull_worker.isRunning():
+            return
+        self.log.append_line("stdout", "[git] 开始拉取远程更新...")
+        self._git_pull_worker = GitPullWorker(self.project_meta.path, parent=self)
+        self._git_pull_worker.done.connect(self._on_git_pull_done)
+        self._git_pull_worker.start()
+
+    def _on_git_pull_done(self, ok: bool, output: str) -> None:
+        # 不论成功失败都清缓存，下次刷新拿到最新 ahead/behind
+        git_info.invalidate(self.project_meta.path)
+        if ok:
+            self.log.append_line("stdout", f"[git] 拉取完成：\n{output}")
+        else:
+            self.log.append_line("stderr", f"[git] 拉取失败：\n{output}")
+            QMessageBox.warning(
+                self, "Git 拉取失败",
+                f"git pull 失败：\n\n{output or '(无输出)'}",
+            )
+        self._refresh_status_row()
+        self.statusChanged.emit()
+
+    def _on_git_push(self) -> None:
+        if self._git_push_worker and self._git_push_worker.isRunning():
+            return
+        self.log.append_line("stdout", "[git] 开始推送到远程...")
+        self._git_push_worker = GitPushWorker(self.project_meta.path, parent=self)
+        self._git_push_worker.done.connect(self._on_git_push_done)
+        self._git_push_worker.start()
+
+    def _on_git_push_done(self, ok: bool, output: str) -> None:
+        git_info.invalidate(self.project_meta.path)
+        if ok:
+            self.log.append_line("stdout", f"[git] 推送完成：\n{output}")
+        else:
+            self.log.append_line("stderr", f"[git] 推送失败：\n{output}")
+            QMessageBox.warning(
+                self, "Git 推送失败",
+                f"git push 失败：\n\n{output or '(无输出)'}",
+            )
+        self._refresh_status_row()
+        self.statusChanged.emit()
+
+    def _on_git_merge(self, branch: str) -> None:
+        from src.core.git_ops import current_branch, has_uncommitted_changes
+        if self._git_merge_worker and self._git_merge_worker.isRunning():
+            return
+        cur = current_branch(self.project_meta.path) or "(未知)"
+        # 工作区脏 → 弹确认（merge 在脏工作区上跑容易出冲突卷地毯）
+        if has_uncommitted_changes(self.project_meta.path):
+            ret = QMessageBox.question(
+                self, "工作区有未提交改动",
+                f"当前工作区有未提交的改动，把「{branch}」合并到「{cur}」可能会失败或与你的改动混在一起。\n\n仍要继续？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if ret != QMessageBox.StandardButton.Yes:
+                return
+        else:
+            ret = QMessageBox.question(
+                self, "确认合并",
+                f"把「{branch}」合并到当前分支「{cur}」？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if ret != QMessageBox.StandardButton.Yes:
+                return
+
+        self.log.append_line("stdout", f"[git] 开始合并 {branch} → {cur} ...")
+        self._git_merge_worker = GitMergeWorker(self.project_meta.path, branch, parent=self)
+        self._git_merge_worker.done.connect(self._on_git_merge_done)
+        self._git_merge_worker.start()
+
+    def _on_git_merge_done(self, ok: bool, output: str) -> None:
+        git_info.invalidate(self.project_meta.path)
+        if ok:
+            self.log.append_line("stdout", f"[git] 合并完成：\n{output}")
+        else:
+            self.log.append_line("stderr", f"[git] 合并失败：\n{output}")
+            QMessageBox.warning(
+                self, "Git 合并失败 / 有冲突",
+                "git merge 失败，可能存在冲突。请到「📝 改动」面板或外部工具解决冲突后再继续。\n\n"
+                f"git 输出：\n\n{output or '(无输出)'}",
+            )
+        self._refresh_status_row()
+        self.statusChanged.emit()
+
+    def _on_update_branch(self, branch: str) -> None:
+        from src.core.git_ops import current_branch
+        if self._git_update_branch_worker and self._git_update_branch_worker.isRunning():
+            return
+        cur = current_branch(self.project_meta.path) or ""
+        is_current = (branch == cur)
+        self.log.append_line("stdout", f"[git] 开始更新分支 {branch} 到远程...")
+        self._git_update_branch_worker = GitUpdateBranchWorker(
+            self.project_meta.path, branch, is_current, parent=self,
+        )
+        self._git_update_branch_worker.done.connect(self._on_update_branch_done)
+        self._git_update_branch_worker.start()
+
+    def _on_update_branch_done(self, branch: str, ok: bool, output: str) -> None:
+        git_info.invalidate(self.project_meta.path)
+        if ok:
+            self.log.append_line("stdout", f"[git] 分支 {branch} 已更新：\n{output}")
+        else:
+            self.log.append_line("stderr", f"[git] 更新分支 {branch} 失败：\n{output}")
+            QMessageBox.warning(
+                self, "更新分支失败",
+                f"更新「{branch}」失败：\n\n{output or '(无输出)'}",
+            )
+        self._refresh_status_row()
+        self.statusChanged.emit()
+
+    def _on_switch_branch(self, branch: str) -> None:
+        from src.core.git_ops import has_uncommitted_changes, switch_branch
+        if has_uncommitted_changes(self.project_meta.path):
+            ret = QMessageBox.question(
+                self, "工作区有未提交改动",
+                f"当前工作区有未提交的改动，切换到「{branch}」可能会失败或被合并到新分支。\n\n仍要继续？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if ret != QMessageBox.StandardButton.Yes:
+                return
+        if self.runner.is_running():
+            ret = QMessageBox.question(
+                self, "项目正在运行",
+                f"{self.project_meta.name} 正在运行。切换分支不会自动重启，建议切换后手动重启以加载新代码。\n\n继续切换到「{branch}」？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if ret != QMessageBox.StandardButton.Yes:
+                return
+
+        ok, err = switch_branch(self.project_meta.path, branch)
+        # 不论成功失败都要清缓存，下一次刷新拿到的是最新分支信息
+        git_info.invalidate(self.project_meta.path)
+        if ok:
+            short = branch.split("/", 1)[1] if "/" in branch else branch
+            self.log.append_line("stdout", f"[git] 已切换到分支：{short}")
+            self._refresh_status_row()
+            self.statusChanged.emit()
+        else:
+            QMessageBox.warning(
+                self, "切换分支失败",
+                f"切换到「{branch}」失败：\n\n{err or '(git 没有返回错误信息)'}",
+            )
+
+    # ---- 其他 ----
+
+    def _on_file_activated(self, path: str) -> None:
+        if self.config.file_open_mode == "preview":
+            self._show_preview(path, 0, 0)
+            return
+        ok = open_in_editor(path, editor_cmd=self.config.editor_cmd,
+                            project_root=self.project_meta.path)
+        if not ok:
+            self._show_preview(path, 0, 0)
+
+    def request_close(self) -> bool:
+        any_running = (self.runner.is_running()
+                       or self._any_module_running()
+                       or self._any_script_running())
+        if any_running:
+            ret = QMessageBox.question(
+                self, "项目正在运行",
+                f"{self.project_meta.name} 正在运行，关闭会停止所有进程。确认关闭？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if ret != QMessageBox.StandardButton.Yes:
+                return False
+            if self.runner.is_running():
+                self.runner.stop()
+            for r in self.module_runners.values():
+                if r.is_running():
+                    r.stop()
+            for r in self._script_runners.values():
+                if r.is_running():
+                    r.stop()
+        # 关闭前强制把所有 pending 自动保存刷盘
+        for pane in list(self._file_panes.values()):
+            try:
+                pane.flush_save()
+            except Exception:
+                pass
+        self._poll_timer.stop()
+        self._fetch_timer.stop()
+        self.indexer.stop()
+        return True
+
+    # ---- 快捷键与导航 ----
+
+    def _register_shortcuts(self) -> None:
+        from PySide6.QtGui import QKeySequence, QShortcut
+        sc_file = QShortcut(QKeySequence("Ctrl+Shift+N"), self)
+        sc_file.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        sc_file.activated.connect(self.open_file_picker)
+
+        sc_find = QShortcut(QKeySequence("Ctrl+Shift+F"), self)
+        sc_find.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        sc_find.activated.connect(self.open_content_search)
+
+        sc_recent = QShortcut(QKeySequence("Ctrl+E"), self)
+        sc_recent.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        sc_recent.activated.connect(self.open_recent_files)
+
+        sc_cmd = QShortcut(QKeySequence("Ctrl+Shift+P"), self)
+        sc_cmd.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        sc_cmd.activated.connect(self.open_command_palette)
+
+        sc_restart = QShortcut(QKeySequence("Ctrl+Shift+R"), self)
+        sc_restart.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        sc_restart.activated.connect(self._restart)
+
+        sc_close_tab = QShortcut(QKeySequence("Ctrl+W"), self)
+        sc_close_tab.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        sc_close_tab.activated.connect(self._close_current_file_tab)
+
+    def open_file_picker(self) -> None:
+        """Ctrl+Shift+N：聚焦左侧文件树的过滤框"""
+        if not self.file_tree.isVisible():
+            self.file_tree.setVisible(True)
+        self.file_tree.focus_filter()
+
+    def open_content_search(self) -> None:
+        dlg = ContentSearchDialog(self.project_meta.path, parent=self)
+        dlg.open_requested.connect(lambda p, l, c: self._show_preview(p, l, c))
+        dlg.show()
+
+    def open_recent_files(self) -> None:
+        if not self._recent_files:
+            QMessageBox.information(self, "最近打开", "还没有打开过文件")
+            return
+        dlg = show_recent_files(
+            self._recent_files, self.project_meta.path,
+            on_pick=lambda p: self._show_preview(p, 0, 0),
+            parent=self,
+        )
+        dlg.show()
+
+    def open_command_palette(self) -> None:
+        commands: list[tuple[str, str, callable]] = []
+
+        if self._is_multi_module:
+            # 多模块：模块启停走 _start_module / _stop_module；编译 / Clean 仍走 self.runner
+            commands.append((
+                "▶  全部启动",
+                f"并行启动所有 {len(self.project_meta.spring_boot_modules)} 个模块",
+                self._start_all_modules,
+            ))
+            for mod_name, _path, _port in self.project_meta.spring_boot_modules:
+                r = self.module_runners.get(mod_name)
+                if r and r.is_running():
+                    commands.append((
+                        f"⏹  停止 {mod_name}",
+                        "停止该模块进程",
+                        lambda m=mod_name: self._stop_module(m),
+                    ))
+                else:
+                    commands.append((
+                        f"▶  启动 {mod_name}",
+                        "",
+                        lambda m=mod_name: self._start_module(m),
+                    ))
+            for prof in self.project_meta.profiles:
+                if prof.kind in ("compile", "clean"):
+                    commands.append((
+                        f"{prof.icon}  {prof.label}",
+                        f"{' '.join(prof.command[:4])}  ...",
+                        lambda p=prof: self._run_profile(p),
+                    ))
+        else:
+            for prof in self.project_meta.profiles:
+                commands.append((
+                    f"{prof.icon}  {prof.label}",
+                    f"{' '.join(prof.command[:4])}  ...",
+                    lambda p=prof: self._run_profile(p),
+                ))
+            if self.runner.is_running():
+                commands.append(("⏹  停止运行", "kill 当前进程树", self._stop))
+            commands.append(("↻  重启项目", "Ctrl+Shift+R", self._restart))
+
+        commands.append(("🔍  搜索文件名", "Ctrl+Shift+N", self.open_file_picker))
+        commands.append(("🔎  搜索文件内容", "Ctrl+Shift+F", self.open_content_search))
+        commands.append(("⏱  最近打开的文件", "Ctrl+E", self.open_recent_files))
+        commands.append(("📁  打开项目目录", "用资源管理器", lambda: open_folder(self.project_meta.path)))
+        commands.append(("🧹  清空日志", "", self.log.clear))
+        commands.append(("🌿  Git 查看器", "本地改动 + 提交历史（只读）", self.open_git_viewer))
+        commands.append(("🔌  端口占用查询", "查看指定端口被哪个进程占用 / kill", lambda: self.open_port_dialog(0)))
+        commands.append(("📋  环境/配置文件", ".env / application*.yml 等集中查看", self.open_env_panel))
+        commands.append(("ℹ️  项目信息", "路径 / 类型 / 包管理 / 主类（只读）", self.open_project_info))
+
+        dlg = show_command_palette(commands, parent=self)
+        dlg.show()
+
+    def open_git_viewer(self) -> None:
+        from src.core.git_ops import is_git_repo
+        if not is_git_repo(self.project_meta.path):
+            QMessageBox.information(self, "Git", "当前项目不是 git 仓库")
+            return
+        dlg = GitViewer(self.project_meta.path, parent=self)
+        dlg.openFileRequested.connect(lambda p: self._show_preview(p, 0, 0))
+        dlg.show()
+
+    def open_port_dialog(self, default_port: int = 0) -> None:
+        """端口占用查询对话框。default_port>0 时自动预填并查询。"""
+        from src.ui.port_dialog import PortDialog
+        dlg = PortDialog(default_port=default_port, parent=self)
+        dlg.show()
+
+    def open_env_panel(self) -> None:
+        """环境/配置文件集中面板（只读查看入口）"""
+        from src.ui.env_panel import EnvPanel
+        dlg = EnvPanel(self.project_meta.path, parent=self)
+        dlg.openFileRequested.connect(lambda p: self._show_preview(p, 0, 0))
+        dlg.show()
+
+    def open_project_info(self) -> None:
+        """项目信息弹窗（路径/类型/包管理/主类，只读）"""
+        from PySide6.QtWidgets import QDialog, QVBoxLayout
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"ℹ️ 项目信息 — {self.project_meta.name}")
+        dlg.resize(440, 280)
+        lay = QVBoxLayout(dlg)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(SettingsPanel(self.project_meta, self.entry, parent=dlg))
+        dlg.show()

@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtualenvs
+.venv/
+venv/
+env/
+
+# PyInstaller 产物（spec 文件保留入库以便复现打包）
+build/
+dist/
+*.manifest
+
+# IDE / 编辑器
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Claude Code 本地状态（settings.local.json 是机器特定的）
+.claude/settings.local.json
+
+# OS 垃圾
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 日志
+*.log
