@@ -63,6 +63,43 @@ QTreeWidget::branch:closed:has-children:has-siblings {{
 _RUNNABLE_SCRIPT_EXTS = {".bat", ".cmd", ".ps1", ".exe"}
 
 
+class _MultiSelectTree(QTreeWidget):
+    """ExtendedSelection 下右键点击时保存 selection 快照。
+
+    Qt 默认 mousePressEvent 会改写 selection（右键点未选中项 → 替换为单项；
+    点已多选项理论上保留，但 PySide6 在 Windows 上观察到也被替换）。这里在 super
+    调用之前先抓快照，customContextMenuRequested 触发时优先用快照而不是
+    selectedItems() 的实时值，保证菜单操作的是用户右键瞬间的真实选区。
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._right_press_snapshot: list = []
+
+    def mousePressEvent(self, event):
+        # 右键 press：在 super 改 selection 之前先抓快照
+        # （super 还是要调，否则 contextMenuEvent / customContextMenuRequested 不会触发）
+        if event.button() == Qt.MouseButton.RightButton:
+            idx = self.indexAt(event.pos())
+            item = self.itemFromIndex(idx) if idx.isValid() else None
+            current = self.selectedItems()
+            if item is not None and len(current) > 1:
+                clicked_path = item.data(0, Qt.ItemDataRole.UserRole)
+                selected_paths = {it.data(0, Qt.ItemDataRole.UserRole) for it in current}
+                if clicked_path in selected_paths:
+                    self._right_press_snapshot = list(current)
+                else:
+                    self._right_press_snapshot = []
+            else:
+                self._right_press_snapshot = []
+        super().mousePressEvent(event)
+
+    def take_right_press_snapshot(self) -> list:
+        snap = self._right_press_snapshot
+        self._right_press_snapshot = []
+        return snap
+
+
 class FileTree(QWidget):
 
     fileActivated = Signal(str)          # 双击文件时（带绝对路径）
@@ -127,7 +164,7 @@ class FileTree(QWidget):
         self.stack = QStackedWidget()
 
         # 树
-        self.tree = QTreeWidget()
+        self.tree = _MultiSelectTree()
         self.tree.setHeaderHidden(True)
         self.tree.setColumnCount(1)
         self.tree.setIndentation(18)
@@ -330,10 +367,12 @@ class FileTree(QWidget):
             return
         path = item.data(0, Qt.ItemDataRole.UserRole)
         kind = item.data(0, Qt.ItemDataRole.UserRole + 1)
-        # 多选场景：右键点中的项若在选区内，则批量操作（删除）走整个选区；
-        # 否则只针对右键点中的那一项（与一般文件管理器一致）
-        selected = self.tree.selectedItems()
-        if item in selected and len(selected) > 1:
+        # 多选场景：优先用 mousePressEvent 抓的快照（避免 super 改 selection 影响判断）；
+        # 快照为空时回退到 selectedItems()。判断走 path 字符串，不依赖对象身份。
+        snapshot = self.tree.take_right_press_snapshot()
+        selected = snapshot if snapshot else self.tree.selectedItems()
+        selected_paths = {it.data(0, Qt.ItemDataRole.UserRole) for it in selected}
+        if path in selected_paths and len(selected) > 1:
             batch = [(Path(it.data(0, Qt.ItemDataRole.UserRole)),
                       it.data(0, Qt.ItemDataRole.UserRole + 1), it)
                      for it in selected
@@ -476,7 +515,10 @@ class FileTree(QWidget):
             if not p.exists():
                 continue  # 已经随父一起进回收站了
             try:
-                ok, _ = QFile.moveToTrash(str(p))
+                # PySide6 上 QFile.moveToTrash 返回单个 bool（不是 tuple）；
+                # 老版本/Qt C++ 的 (bool, path) 二元组在这里不适用，不要解包。
+                result = QFile.moveToTrash(str(p))
+                ok = bool(result[0]) if isinstance(result, tuple) else bool(result)
             except (OSError, RuntimeError) as e:
                 failed.append(f"{p}\n  {e}")
                 continue

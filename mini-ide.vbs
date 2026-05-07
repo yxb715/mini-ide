@@ -16,6 +16,5 @@ For i = 0 To args.Count - 1
     extra = extra & " """ & args(i) & """"
 Next
 
-' Run poetry's pythonw with main.py, hidden console (0), non-blocking
 shell.CurrentDirectory = here
-shell.Run "poetry run pythonw main.py" & extra, 0, False
+shell.Run ".venv\Scripts\mini-ide.exe main.py" & extra, 0, False
