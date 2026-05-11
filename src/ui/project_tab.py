@@ -8,19 +8,15 @@ import re
 import time
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QAction, QFont
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QApplication, QFrame, QHBoxLayout, QLabel, QMenu, QMessageBox, QPushButton,
-    QSplitter, QTabBar, QTabWidget, QToolButton, QVBoxLayout, QWidget, QSizePolicy,
+    QSplitter, QTabBar, QTabWidget, QToolButton, QVBoxLayout, QWidget,
 )
 
 from src.core.config import AppConfig, ProjectEntry
 from src.core.file_index import FileIndexer
-from src.core.git_worker import (
-    GitFetchWorker, GitMergeWorker, GitPullWorker, GitPushWorker,
-    GitUpdateBranchWorker,
-)
+from src.core.git_worker import GitFetchWorker
 from src.core.process_runner import ProcessRunner, RunContext
 from src.core.project_detector import ProjectMeta, RunProfile
 from src.ui.content_search import ContentSearchDialog
@@ -65,15 +61,7 @@ def _status_btn_base_qss() -> str:
 
 
 class _BranchMenu(QMenu):
-    """分支下拉菜单：右键带 data 的分支项时弹出「复制 / 更新 / 合并」上下文菜单。
-
-    QMenu 默认不会触发 customContextMenuRequested，所以走 contextMenuEvent。
-    - mergeRequested(branch)：把该分支合并到当前分支
-    - updateBranchRequested(branch)：把该分支更新到它的远程版本（不切分支）
-    """
-
-    mergeRequested = Signal(str)
-    updateBranchRequested = Signal(str)
+    """分支下拉菜单：点击或右键都只做复制分支名。"""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -88,27 +76,11 @@ class _BranchMenu(QMenu):
         if not branch:
             super().contextMenuEvent(event)
             return
-        is_current = branch == self._current_branch
         ctx = QMenu(self)
         copy_act = ctx.addAction("📋 复制分支名")
-        if is_current:
-            update_act = ctx.addAction("⤵ 更新此分支到远程 (git pull --ff-only)")
-        else:
-            update_act = ctx.addAction(f"⤵ 更新此分支到远程 ({branch} ← upstream)")
-        merge_act = ctx.addAction(f"🔀 合并到当前分支 (git merge {branch})")
-        if is_current:
-            merge_act.setEnabled(False)
-            merge_act.setText("🔀 合并到当前分支（不能合并自己）")
         chosen = ctx.exec(event.globalPos())
         if chosen is copy_act:
             QApplication.clipboard().setText(branch)
-        elif chosen is update_act:
-            self.close()
-            self.updateBranchRequested.emit(branch)
-        elif chosen is merge_act:
-            # 关掉父菜单再弹确认对话框；否则父菜单会盖住对话框焦点
-            self.close()
-            self.mergeRequested.emit(branch)
         event.accept()
 
 
@@ -165,11 +137,8 @@ class ProjectTab(QWidget):
 
         self._current_profile: RunProfile | None = None
         self._pending_after_compile: RunProfile | None = None
-        self._git_pull_worker: GitPullWorker | None = None
         self._git_fetch_worker: GitFetchWorker | None = None
-        self._git_push_worker: GitPushWorker | None = None
-        self._git_merge_worker: GitMergeWorker | None = None
-        self._git_update_branch_worker: GitUpdateBranchWorker | None = None
+        self._git_viewer = None
         # 启动完成标记：日志里看到 Started / ready in 等 marker 后，只给状态栏贴一次"✓ 启动完成"
         self._startup_phase_marked = False
         self._recent_files: list[str] = []     # 最近在预览里打开的文件
@@ -186,7 +155,7 @@ class ProjectTab(QWidget):
         self._poll_timer.timeout.connect(self._refresh_status_row)
         self._poll_timer.start()
 
-        # 远程分支轮询：每 5 分钟 git fetch 一次，发现新提交时高亮按钮 + 系统通知
+        # 远程分支轮询：每 5 分钟 git fetch 一次，发现新提交时高亮分支按钮
         self._fetch_timer = QTimer(self)
         self._fetch_timer.setInterval(GIT_FETCH_INTERVAL_MS)
         self._fetch_timer.timeout.connect(self._start_remote_fetch)
@@ -240,7 +209,6 @@ class ProjectTab(QWidget):
         self.log = LogWidget()
         self.log.set_max_blocks(self.config.max_log_blocks)
         self.log.fileJumpRequested.connect(self._jump_to_file)
-        self.log.set_ai_context_provider(self._make_ai_context)
         self.log.portDiagnosisRequested.connect(self.open_port_dialog)
 
         # 中心 Tab 容器：tab 0 固定是日志（不可关），其它 tab 是文件面板
@@ -353,19 +321,17 @@ class ProjectTab(QWidget):
         self.lbl_phase.setProperty("role", "subtitle")
         lay.addWidget(self.lbl_phase)
 
-        # 分支按钮：点击弹出菜单切换分支
+        # 分支按钮：点击弹出菜单复制分支名
         self.btn_branch = QToolButton()
         self.btn_branch.setText("")
         self.btn_branch.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
-        self.btn_branch.setToolTip("点击切换分支")
+        self.btn_branch.setToolTip("点击复制分支名")
         # 默认色（无 git 信息时不显示，初始 QSS 用次级灰）
         self.btn_branch.setStyleSheet(
             _status_btn_base_qss() + f"QToolButton {{ color:{FG_SECONDARY}; }}"
         )
         self._branch_menu = _BranchMenu(self.btn_branch)
         self._branch_menu.aboutToShow.connect(self._populate_branch_menu)
-        self._branch_menu.mergeRequested.connect(self._on_git_merge)
-        self._branch_menu.updateBranchRequested.connect(self._on_update_branch)
         self.btn_branch.setMenu(self._branch_menu)
         self.btn_branch.setVisible(False)   # 没有 git 信息时隐藏
         lay.addWidget(self.btn_branch)
@@ -373,7 +339,7 @@ class ProjectTab(QWidget):
         # 改动按钮：紧贴分支按钮，显示本地改动文件数，点击打开 GitViewer
         self.btn_changes = QToolButton()
         self.btn_changes.setText("")
-        self.btn_changes.setToolTip("查看 Git 变更 + 提交历史")
+        self.btn_changes.setToolTip("查看当前分支改动文件")
         self.btn_changes.clicked.connect(self.open_git_viewer)
         self.btn_changes.setVisible(False)
         lay.addWidget(self.btn_changes)
@@ -509,7 +475,6 @@ class ProjectTab(QWidget):
         lw = LogWidget()
         lw.set_max_blocks(self.config.max_log_blocks)
         lw.fileJumpRequested.connect(self._jump_to_file)
-        lw.set_ai_context_provider(self._make_ai_context)
         lw.portDiagnosisRequested.connect(self.open_port_dialog)
         self.module_logs[module] = lw
         idx = self.center_tabs.addTab(lw, f"📋 {module}")
@@ -698,7 +663,6 @@ class ProjectTab(QWidget):
             lw = LogWidget()
             lw.set_max_blocks(self.config.max_log_blocks)
             lw.fileJumpRequested.connect(self._jump_to_file)
-            lw.set_ai_context_provider(self._make_ai_context)
             lw.portDiagnosisRequested.connect(self.open_port_dialog)
             self._script_logs[key] = lw
             idx = self.center_tabs.addTab(lw, f"▶ {p.name}")
@@ -881,15 +845,15 @@ class ProjectTab(QWidget):
         if text:
             self.btn_branch.setText(text + "  ▾")
             base = _status_btn_base_qss()
-            # behind > 0 → 橙色高亮提示远程有新提交，点开菜单可拉取
+            # behind > 0 → 橙色高亮提示远程有新提交，点开菜单复制分支名
             if info and info.behind > 0:
                 self.btn_branch.setStyleSheet(base + f"QToolButton {{ color:{COLOR_WARN}; }}")
                 self.btn_branch.setToolTip(
-                    f"远程有 {info.behind} 个新提交，点击菜单 → 「⬇ 从远程拉取」"
+                    f"远程有 {info.behind} 个新提交；点击菜单可复制分支名给 AI"
                 )
             else:
                 self.btn_branch.setStyleSheet(base + f"QToolButton {{ color:{FG_SECONDARY}; }}")
-                self.btn_branch.setToolTip("点击切换分支 / 拉取远程")
+                self.btn_branch.setToolTip("点击选择要复制的分支名")
             self.btn_branch.setVisible(True)
         else:
             self.btn_branch.setVisible(False)
@@ -908,22 +872,7 @@ class ProjectTab(QWidget):
         else:
             self.btn_changes.setVisible(False)
 
-    # ---- 文件跳转 / AI ----
-
-    def _make_ai_context(self) -> str:
-        """给 LogWidget 的「复制错误给 AI」按钮提供项目上下文"""
-        info = git_info.get_info(self.project_meta.path)
-        branch = info.branch if info and info.branch else "(无或非 git 仓库)"
-        cur = self._current_profile
-        command = " ".join(cur.command) if cur else "(当前未运行)"
-        profile_label = cur.label if cur else "(无)"
-        return (
-            f"- 路径: {self.project_meta.path}\n"
-            f"- 类型: {self.project_meta.display_type} ({self.project_meta.project_type})\n"
-            f"- 分支: {branch}\n"
-            f"- 当前 profile: {profile_label}\n"
-            f"- 启动命令: {command}"
-        )
+    # ---- 文件跳转 ----
 
     def _jump_to_file(self, path: str, line: int, col: int) -> None:
         # file_open_mode=preview 总是用内置预览；auto 则先试外部编辑器
@@ -1058,7 +1007,14 @@ class ProjectTab(QWidget):
         # 文件预览 tab
         from src.ui.file_preview import FilePreviewPane
         if isinstance(widget, FilePreviewPane):
-            widget.flush_save()
+            if not widget.flush_save():
+                QMessageBox.warning(
+                    self,
+                    "保存失败",
+                    "文件仍有未保存改动，已保留此 tab。\n\n"
+                    f"{widget.get_path()}",
+                )
+                return
             key = self._tab_key(widget.get_path())
             self._file_panes.pop(key, None)
         self.center_tabs.removeTab(index)
@@ -1130,11 +1086,11 @@ class ProjectTab(QWidget):
         self._recent_files.insert(0, path)
         self._recent_files = self._recent_files[:30]
 
-    # ---- 分支切换 ----
+    # ---- 分支复制 ----
 
     def _populate_branch_menu(self) -> None:
-        """每次菜单弹出前重建：拉取 + 本地分支 + 远程分支（无同名本地的）"""
-        from src.core.git_ops import has_upstream, is_git_repo, list_branches
+        """每次菜单弹出前重建：只提供分支名复制，Git 操作交给外部 AI / 终端。"""
+        from src.core.git_ops import is_git_repo, list_branches
         menu = self._branch_menu
         menu.clear()
         if not is_git_repo(self.project_meta.path):
@@ -1142,63 +1098,36 @@ class ProjectTab(QWidget):
             act.setEnabled(False)
             return
 
-        upstream_ok = has_upstream(self.project_meta.path)
-
-        # 顶部：从远程拉取
-        pulling = bool(self._git_pull_worker and self._git_pull_worker.isRunning())
-        if pulling:
-            act = menu.addAction("⬇  拉取中...")
-            act.setEnabled(False)
-        else:
-            act = menu.addAction("⬇  从远程拉取 (git pull --ff-only)")
-            if upstream_ok:
-                act.triggered.connect(self._on_git_pull)
-            else:
-                act.setEnabled(False)
-                act.setText("⬇  从远程拉取（当前分支无上游）")
-
-        # 推送到远程（merge 完通常接着推一下，所以紧贴着 pull 摆）
-        pushing = bool(self._git_push_worker and self._git_push_worker.isRunning())
-        if pushing:
-            act = menu.addAction("⬆  推送中...")
-            act.setEnabled(False)
-        else:
-            act = menu.addAction("⬆  推送到远程 (git push)")
-            if upstream_ok:
-                act.triggered.connect(self._on_git_push)
-            else:
-                act.setEnabled(False)
-                act.setText("⬆  推送到远程（当前分支无上游）")
-        menu.addSeparator()
-
         data = list_branches(self.project_meta.path)
         cur = data["current"]
         local = data["local"]
         remote = data["remote"]
         menu.set_current_branch(cur)
 
+        if cur:
+            act = menu.addAction(f"📋 复制当前分支：{cur}")
+            act.setData(cur)
+            act.triggered.connect(lambda _=False, br=cur: QApplication.clipboard().setText(br))
+            menu.addSeparator()
         if local:
-            head = menu.addAction("本地分支")
+            head = menu.addAction("本地分支（点击复制）")
             head.setEnabled(False)
             for b in local:
                 label = ("● " if b == cur else "    ") + b
                 act = menu.addAction(label)
-                act.setData(b)   # 右键复制分支名用
-                if b == cur:
-                    act.setEnabled(False)
-                else:
-                    act.triggered.connect(lambda _=False, br=b: self._on_switch_branch(br))
+                act.setData(b)
+                act.triggered.connect(lambda _=False, br=b: QApplication.clipboard().setText(br))
         if remote:
             menu.addSeparator()
-            head = menu.addAction("远程分支（切换会创建本地跟踪分支）")
+            head = menu.addAction("远程分支（点击复制）")
             head.setEnabled(False)
             for b in remote:
                 act = menu.addAction("    " + b)
-                act.setData(b)   # 右键复制分支名用
-                act.triggered.connect(lambda _=False, br=b: self._on_switch_branch(br))
+                act.setData(b)
+                act.triggered.connect(lambda _=False, br=b: QApplication.clipboard().setText(br))
 
     def _start_remote_fetch(self) -> None:
-        """后台 git fetch；不弹窗、不打扰，结果通过状态栏 + 系统通知体现"""
+        """后台 git fetch；不弹窗、不打扰，结果通过状态栏体现"""
         if self._git_fetch_worker and self._git_fetch_worker.isRunning():
             return
         from src.core.git_ops import has_upstream, is_git_repo
@@ -1215,154 +1144,6 @@ class ProjectTab(QWidget):
         # 清缓存让 _refresh_status_row 拿到最新 ahead/behind；behind 变化会反映在分支按钮高亮上
         git_info.invalidate(self.project_meta.path)
         self._refresh_status_row()
-
-    def _on_git_pull(self) -> None:
-        if self._git_pull_worker and self._git_pull_worker.isRunning():
-            return
-        self.log.append_line("stdout", "[git] 开始拉取远程更新...")
-        self._git_pull_worker = GitPullWorker(self.project_meta.path, parent=self)
-        self._git_pull_worker.done.connect(self._on_git_pull_done)
-        self._git_pull_worker.start()
-
-    def _on_git_pull_done(self, ok: bool, output: str) -> None:
-        # 不论成功失败都清缓存，下次刷新拿到最新 ahead/behind
-        git_info.invalidate(self.project_meta.path)
-        if ok:
-            self.log.append_line("stdout", f"[git] 拉取完成：\n{output}")
-        else:
-            self.log.append_line("stderr", f"[git] 拉取失败：\n{output}")
-            QMessageBox.warning(
-                self, "Git 拉取失败",
-                f"git pull 失败：\n\n{output or '(无输出)'}",
-            )
-        self._refresh_status_row()
-        self.statusChanged.emit()
-
-    def _on_git_push(self) -> None:
-        if self._git_push_worker and self._git_push_worker.isRunning():
-            return
-        self.log.append_line("stdout", "[git] 开始推送到远程...")
-        self._git_push_worker = GitPushWorker(self.project_meta.path, parent=self)
-        self._git_push_worker.done.connect(self._on_git_push_done)
-        self._git_push_worker.start()
-
-    def _on_git_push_done(self, ok: bool, output: str) -> None:
-        git_info.invalidate(self.project_meta.path)
-        if ok:
-            self.log.append_line("stdout", f"[git] 推送完成：\n{output}")
-        else:
-            self.log.append_line("stderr", f"[git] 推送失败：\n{output}")
-            QMessageBox.warning(
-                self, "Git 推送失败",
-                f"git push 失败：\n\n{output or '(无输出)'}",
-            )
-        self._refresh_status_row()
-        self.statusChanged.emit()
-
-    def _on_git_merge(self, branch: str) -> None:
-        from src.core.git_ops import current_branch, has_uncommitted_changes
-        if self._git_merge_worker and self._git_merge_worker.isRunning():
-            return
-        cur = current_branch(self.project_meta.path) or "(未知)"
-        # 工作区脏 → 弹确认（merge 在脏工作区上跑容易出冲突卷地毯）
-        if has_uncommitted_changes(self.project_meta.path):
-            ret = QMessageBox.question(
-                self, "工作区有未提交改动",
-                f"当前工作区有未提交的改动，把「{branch}」合并到「{cur}」可能会失败或与你的改动混在一起。\n\n仍要继续？",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            if ret != QMessageBox.StandardButton.Yes:
-                return
-        else:
-            ret = QMessageBox.question(
-                self, "确认合并",
-                f"把「{branch}」合并到当前分支「{cur}」？",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.Yes,
-            )
-            if ret != QMessageBox.StandardButton.Yes:
-                return
-
-        self.log.append_line("stdout", f"[git] 开始合并 {branch} → {cur} ...")
-        self._git_merge_worker = GitMergeWorker(self.project_meta.path, branch, parent=self)
-        self._git_merge_worker.done.connect(self._on_git_merge_done)
-        self._git_merge_worker.start()
-
-    def _on_git_merge_done(self, ok: bool, output: str) -> None:
-        git_info.invalidate(self.project_meta.path)
-        if ok:
-            self.log.append_line("stdout", f"[git] 合并完成：\n{output}")
-        else:
-            self.log.append_line("stderr", f"[git] 合并失败：\n{output}")
-            QMessageBox.warning(
-                self, "Git 合并失败 / 有冲突",
-                "git merge 失败，可能存在冲突。请到「📝 改动」面板或外部工具解决冲突后再继续。\n\n"
-                f"git 输出：\n\n{output or '(无输出)'}",
-            )
-        self._refresh_status_row()
-        self.statusChanged.emit()
-
-    def _on_update_branch(self, branch: str) -> None:
-        from src.core.git_ops import current_branch
-        if self._git_update_branch_worker and self._git_update_branch_worker.isRunning():
-            return
-        cur = current_branch(self.project_meta.path) or ""
-        is_current = (branch == cur)
-        self.log.append_line("stdout", f"[git] 开始更新分支 {branch} 到远程...")
-        self._git_update_branch_worker = GitUpdateBranchWorker(
-            self.project_meta.path, branch, is_current, parent=self,
-        )
-        self._git_update_branch_worker.done.connect(self._on_update_branch_done)
-        self._git_update_branch_worker.start()
-
-    def _on_update_branch_done(self, branch: str, ok: bool, output: str) -> None:
-        git_info.invalidate(self.project_meta.path)
-        if ok:
-            self.log.append_line("stdout", f"[git] 分支 {branch} 已更新：\n{output}")
-        else:
-            self.log.append_line("stderr", f"[git] 更新分支 {branch} 失败：\n{output}")
-            QMessageBox.warning(
-                self, "更新分支失败",
-                f"更新「{branch}」失败：\n\n{output or '(无输出)'}",
-            )
-        self._refresh_status_row()
-        self.statusChanged.emit()
-
-    def _on_switch_branch(self, branch: str) -> None:
-        from src.core.git_ops import has_uncommitted_changes, switch_branch
-        if has_uncommitted_changes(self.project_meta.path):
-            ret = QMessageBox.question(
-                self, "工作区有未提交改动",
-                f"当前工作区有未提交的改动，切换到「{branch}」可能会失败或被合并到新分支。\n\n仍要继续？",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            if ret != QMessageBox.StandardButton.Yes:
-                return
-        if self.runner.is_running():
-            ret = QMessageBox.question(
-                self, "项目正在运行",
-                f"{self.project_meta.name} 正在运行。切换分支不会自动重启，建议切换后手动重启以加载新代码。\n\n继续切换到「{branch}」？",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.Yes,
-            )
-            if ret != QMessageBox.StandardButton.Yes:
-                return
-
-        ok, err = switch_branch(self.project_meta.path, branch)
-        # 不论成功失败都要清缓存，下一次刷新拿到的是最新分支信息
-        git_info.invalidate(self.project_meta.path)
-        if ok:
-            short = branch.split("/", 1)[1] if "/" in branch else branch
-            self.log.append_line("stdout", f"[git] 已切换到分支：{short}")
-            self._refresh_status_row()
-            self.statusChanged.emit()
-        else:
-            QMessageBox.warning(
-                self, "切换分支失败",
-                f"切换到「{branch}」失败：\n\n{err or '(git 没有返回错误信息)'}",
-            )
 
     # ---- 其他 ----
 
@@ -1387,6 +1168,27 @@ class ProjectTab(QWidget):
             )
             if ret != QMessageBox.StandardButton.Yes:
                 return False
+        # 关闭前强制把所有 pending 自动保存刷盘。保存失败时保留项目，
+        # 避免 tab 被关掉后用户误以为改动已经落盘。
+        failed_panes = []
+        for pane in list(self._file_panes.values()):
+            try:
+                if not pane.flush_save():
+                    failed_panes.append(pane)
+            except Exception:
+                failed_panes.append(pane)
+        if failed_panes:
+            first = failed_panes[0]
+            idx = self.center_tabs.indexOf(first)
+            if idx >= 0:
+                self.center_tabs.setCurrentIndex(idx)
+            QMessageBox.warning(
+                self,
+                "保存失败",
+                f"有 {len(failed_panes)} 个文件未能保存，已取消关闭项目。",
+            )
+            return False
+        if any_running:
             if self.runner.is_running():
                 self.runner.stop()
             for r in self.module_runners.values():
@@ -1395,12 +1197,6 @@ class ProjectTab(QWidget):
             for r in self._script_runners.values():
                 if r.is_running():
                     r.stop()
-        # 关闭前强制把所有 pending 自动保存刷盘
-        for pane in list(self._file_panes.values()):
-            try:
-                pane.flush_save()
-            except Exception:
-                pass
         self._poll_timer.stop()
         self._fetch_timer.stop()
         self.indexer.stop()
@@ -1503,7 +1299,7 @@ class ProjectTab(QWidget):
         commands.append(("⏱  最近打开的文件", "Ctrl+E", self.open_recent_files))
         commands.append(("📁  打开项目目录", "用资源管理器", lambda: open_folder(self.project_meta.path)))
         commands.append(("🧹  清空日志", "", self.log.clear))
-        commands.append(("🌿  Git 查看器", "本地改动 + 提交历史（只读）", self.open_git_viewer))
+        commands.append(("🌿  Git 改动", "实时查看当前分支改动文件", self.open_git_viewer))
         commands.append(("🔌  端口占用查询", "查看指定端口被哪个进程占用 / kill", lambda: self.open_port_dialog(0)))
         commands.append(("📋  环境/配置文件", ".env / application*.yml 等集中查看", self.open_env_panel))
         commands.append(("ℹ️  项目信息", "路径 / 类型 / 包管理 / 主类（只读）", self.open_project_info))
@@ -1516,7 +1312,14 @@ class ProjectTab(QWidget):
         if not is_git_repo(self.project_meta.path):
             QMessageBox.information(self, "Git", "当前项目不是 git 仓库")
             return
+        if self._git_viewer is not None:
+            self._git_viewer.show()
+            self._git_viewer.raise_()
+            self._git_viewer.activateWindow()
+            return
         dlg = GitViewer(self.project_meta.path, parent=self)
+        self._git_viewer = dlg
+        dlg.destroyed.connect(lambda: setattr(self, "_git_viewer", None))
         dlg.openFileRequested.connect(lambda p: self._show_preview(p, 0, 0))
         dlg.show()
 
@@ -1537,6 +1340,7 @@ class ProjectTab(QWidget):
         """项目信息弹窗（路径/类型/包管理/主类，只读）"""
         from PySide6.QtWidgets import QDialog, QVBoxLayout
         dlg = QDialog(self)
+        dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         dlg.setWindowTitle(f"ℹ️ 项目信息 — {self.project_meta.name}")
         dlg.resize(440, 280)
         lay = QVBoxLayout(dlg)

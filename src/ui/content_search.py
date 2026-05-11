@@ -10,7 +10,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtGui import (
     QAbstractTextDocumentLayout, QColor, QFont, QPalette, QTextCharFormat,
     QTextCursor, QTextDocument,
@@ -226,11 +226,13 @@ class ContentSearchDialog(QDialog):
 
     def __init__(self, project_root: str, parent=None):
         super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self.root = project_root
         self.setWindowTitle(f"在项目中搜索   (Ctrl+Shift+F)   —   {project_root}")
         self.resize(1100, 700)
 
         self._worker: SearchWorker | None = None
+        self._pending_restart = False
 
         root_lay = QVBoxLayout(self)
         root_lay.setContentsMargins(10, 10, 10, 10)
@@ -308,7 +310,9 @@ class ContentSearchDialog(QDialog):
         query = self.input.text().strip()
         if not query:
             return
-        self._stop_search()
+        if self._worker and self._worker.isRunning():
+            self._stop_search(restart=True)
+            return
 
         exts = [e.strip() if e.strip().startswith(".") else ("." + e.strip())
                 for e in self.ext_filter.text().split(",") if e.strip()]
@@ -335,20 +339,28 @@ class ContentSearchDialog(QDialog):
             case_sensitive=self.chk_case.isChecked(),
             whole_word=self.chk_word.isChecked(),
             use_regex=self.chk_regex.isChecked(),
-            include_exts=exts, parent=self,
+            include_exts=exts, parent=QApplication.instance(),
         )
         self._worker.match_found.connect(self._on_matches)
         self._worker.progress.connect(self._on_progress)
         self._worker.done.connect(self._on_done)
         self._worker.stopped.connect(self._on_stopped)
+        self._worker.finished.connect(self._worker.deleteLater)
         self._worker.start()
 
-    def _stop_search(self) -> None:
+    def _stop_search(self, restart: bool = False) -> None:
         if self._worker and self._worker.isRunning():
+            self._pending_restart = restart
             self._worker.stop()
-            self._worker.wait(1000)
+            self.status.setText("正在停止...")
+            self.btn_search.setEnabled(False)
+            self.btn_stop.setEnabled(False)
+        elif not restart:
+            self._pending_restart = False
 
     def _on_matches(self, batch: list[ContentMatch]) -> None:
+        if self.sender() is not self._worker:
+            return
         for m in batch:
             parent = self._file_items.get(m.rel_path)
             if parent is None:
@@ -386,18 +398,32 @@ class ContentSearchDialog(QDialog):
             parent.setText(1, f"{d}    ·    {n} 处命中" if d else f"{n} 处命中")
 
     def _on_progress(self, scanned: int, total: int) -> None:
+        if self.sender() is not self._worker:
+            return
         self.status.setText(f"已扫 {scanned} 文件 | 命中 {total}")
 
     def _on_done(self, scanned: int, total: int) -> None:
+        if self.sender() is not self._worker:
+            return
         self.status.setText(f"完成：扫描 {scanned} 文件 | 命中 {total}" +
                             (f"  (达到上限 {MAX_MATCHES})" if total >= MAX_MATCHES else ""))
         self.btn_search.setEnabled(True)
         self.btn_stop.setEnabled(False)
+        self._worker = None
+        if self._pending_restart:
+            self._pending_restart = False
+            QTimer.singleShot(0, self._start_search)
 
     def _on_stopped(self) -> None:
+        if self.sender() is not self._worker:
+            return
         self.status.setText("已停止")
         self.btn_search.setEnabled(True)
         self.btn_stop.setEnabled(False)
+        self._worker = None
+        if self._pending_restart:
+            self._pending_restart = False
+            QTimer.singleShot(0, self._start_search)
 
     def _on_activate(self, item: QTreeWidgetItem, _col: int) -> None:
         data = item.data(0, Qt.ItemDataRole.UserRole)
@@ -406,5 +432,6 @@ class ContentSearchDialog(QDialog):
             self.open_requested.emit(path, line, col)
 
     def closeEvent(self, e):
+        self._pending_restart = False
         self._stop_search()
         super().closeEvent(e)

@@ -8,11 +8,10 @@ from __future__ import annotations
 
 import shutil
 import subprocess
-import sys
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QFile, Signal
-from PySide6.QtGui import QAction, QIcon
+from PySide6.QtCore import Qt, QFile, QMimeData, QThread, QUrl, Signal
+from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QFrame, QHBoxLayout, QInputDialog, QLabel,
     QLineEdit, QListWidget, QListWidgetItem, QMenu, QMessageBox, QStackedWidget,
@@ -22,7 +21,7 @@ from PySide6.QtWidgets import (
 from src.ui.theme import (
     ACCENT_SUBTLE, BG_L2, BG_L4, FG_BRIGHT, FG_PRIMARY, apply_search_style,
 )
-from src.util.editor import open_in_editor, open_folder, reveal_in_explorer
+from src.util.editor import reveal_in_explorer
 
 
 # 永远隐藏：只藏操作系统垃圾文件。构建产物/依赖目录（build/dist/node_modules/.git 等）
@@ -61,6 +60,88 @@ QTreeWidget::branch:closed:has-children:has-siblings {{
 
 # 右键菜单"▶ 运行"显示的可执行脚本类型（按用户场景：bat/cmd/ps1/exe）
 _RUNNABLE_SCRIPT_EXTS = {".bat", ".cmd", ".ps1", ".exe"}
+_CUT_MIME = "application/x-mini-ide-cut"
+
+
+def _is_same_or_child(path: Path, parent: Path) -> bool:
+    try:
+        path_resolved = path.resolve()
+        parent_resolved = parent.resolve()
+    except OSError:
+        return False
+    if path_resolved == parent_resolved:
+        return True
+    try:
+        path_resolved.relative_to(parent_resolved)
+        return True
+    except ValueError:
+        return False
+
+
+def _copy_destination(target_dir: Path, src: Path) -> Path:
+    is_dir = src.is_dir()
+    base = src.name if is_dir else src.stem
+    suffix = "" if is_dir else src.suffix
+    candidate = target_dir / src.name
+    if not candidate.exists():
+        return candidate
+    candidate = target_dir / f"{base} - 副本{suffix}"
+    if not candidate.exists():
+        return candidate
+    index = 2
+    while True:
+        candidate = target_dir / f"{base} - 副本 {index}{suffix}"
+        if not candidate.exists():
+            return candidate
+        index += 1
+
+
+class _PasteWorker(QThread):
+    done = Signal(str, int, list, bool)  # target_dir, changed_count, failed messages, move
+
+    def __init__(self, sources: list[str], target_dir: str, move: bool = False, parent=None):
+        super().__init__(parent)
+        self._sources = sources
+        self._target_dir = target_dir
+        self._move = move
+
+    def run(self) -> None:
+        target_dir = Path(self._target_dir)
+        failed: list[str] = []
+        changed = 0
+        if not target_dir.exists() or not target_dir.is_dir():
+            self.done.emit(str(target_dir), changed, [f"目标目录不存在：{target_dir}"], self._move)
+            return
+        for raw in self._sources:
+            src = Path(raw)
+            if not src.exists():
+                failed.append(f"源路径不存在：{src}")
+                continue
+            try:
+                if src.is_dir():
+                    if _is_same_or_child(target_dir, src):
+                        failed.append(f"不能把目录粘贴到自身或子目录：{src}")
+                        continue
+                    if self._move:
+                        if src.parent.resolve() == target_dir.resolve():
+                            continue
+                        shutil.move(str(src), str(_copy_destination(target_dir, src)))
+                    else:
+                        shutil.copytree(src, _copy_destination(target_dir, src))
+                elif src.is_file():
+                    if self._move:
+                        if src.parent.resolve() == target_dir.resolve():
+                            continue
+                        shutil.move(str(src), str(_copy_destination(target_dir, src)))
+                    else:
+                        shutil.copy2(src, _copy_destination(target_dir, src))
+                else:
+                    failed.append(f"不支持的路径类型：{src}")
+                    continue
+                changed += 1
+            except OSError as e:
+                failed.append(f"{src}\n  {e}")
+        self.done.emit(str(target_dir), changed, failed, self._move)
 
 
 class _MultiSelectTree(QTreeWidget):
@@ -109,12 +190,13 @@ class FileTree(QWidget):
 
     def __init__(self, root_path: str, indexer=None, project_type: str = "", parent=None):
         """indexer 是 FileIndexer 实例；有它时，过滤框使用全局索引搜索。
-        project_type 用来决定右键菜单里弹哪个 JetBrains IDE（IDEA / WebStorm / PyCharm）。
+        project_type 保留给旧调用方兼容，目录树菜单不再按项目类型打开外部 IDE。
         """
         super().__init__(parent)
         self.root_path = Path(root_path)
         self.indexer = indexer
         self.project_type = project_type
+        self._paste_workers: list[_PasteWorker] = []
         self.setMinimumWidth(240)
         self._build()
         self._reload()
@@ -179,6 +261,15 @@ class FileTree(QWidget):
         self.tree.itemDoubleClicked.connect(self._on_item_activated)
         self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self._on_context_menu)
+        self._shortcut_copy_tree = QShortcut(QKeySequence.StandardKey.Copy, self.tree)
+        self._shortcut_copy_tree.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        self._shortcut_copy_tree.activated.connect(self._copy_tree_selection)
+        self._shortcut_cut_tree = QShortcut(QKeySequence.StandardKey.Cut, self.tree)
+        self._shortcut_cut_tree.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        self._shortcut_cut_tree.activated.connect(self._cut_tree_selection)
+        self._shortcut_paste_tree = QShortcut(QKeySequence.StandardKey.Paste, self.tree)
+        self._shortcut_paste_tree.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        self._shortcut_paste_tree.activated.connect(self._paste_to_tree_current)
         self.stack.addWidget(self.tree)
 
         # 搜索结果扁平列表
@@ -193,6 +284,15 @@ class FileTree(QWidget):
         self.search_list.itemClicked.connect(self._on_search_item_activated)
         self.search_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.search_list.customContextMenuRequested.connect(self._on_search_context_menu)
+        self._shortcut_copy_search = QShortcut(QKeySequence.StandardKey.Copy, self.search_list)
+        self._shortcut_copy_search.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        self._shortcut_copy_search.activated.connect(self._copy_search_selection)
+        self._shortcut_cut_search = QShortcut(QKeySequence.StandardKey.Cut, self.search_list)
+        self._shortcut_cut_search.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        self._shortcut_cut_search.activated.connect(self._cut_search_selection)
+        self._shortcut_paste_search = QShortcut(QKeySequence.StandardKey.Paste, self.search_list)
+        self._shortcut_paste_search.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        self._shortcut_paste_search.activated.connect(self._paste_to_search_current)
         self.stack.addWidget(self.search_list)
 
         root.addWidget(self.stack, 1)
@@ -364,6 +464,7 @@ class FileTree(QWidget):
     def _on_context_menu(self, pos) -> None:
         item = self.tree.itemAt(pos)
         if not item:
+            self._show_blank_context_menu(self.tree.mapToGlobal(pos))
             return
         path = item.data(0, Qt.ItemDataRole.UserRole)
         kind = item.data(0, Qt.ItemDataRole.UserRole + 1)
@@ -410,6 +511,24 @@ class FileTree(QWidget):
                            lambda fp=str(p): self.scriptRunRequested.emit(fp))
             menu.addSeparator()
 
+        # 当前对象的文件操作：复制 / 粘贴 / 重命名先放一起，符合资源管理器习惯
+        if batch and len(batch) > 1:
+            copy_label = f"复制选中的 {len(batch)} 项"
+        else:
+            copy_label = "复制目录" if kind == "dir" else "复制文件"
+        menu.addAction(copy_label,
+                       lambda b=batch: self._copy_paths_to_clipboard([x[0] for x in b or []]))
+        cut_action = menu.addAction("剪切",
+                                    lambda b=batch: self._cut_paths_to_clipboard([x[0] for x in b or []]))
+        if p.resolve() == self.root_path.resolve():
+            cut_action.setEnabled(False)
+        paste_label = "粘贴到此目录" if kind == "dir" else "粘贴到所在目录"
+        paste_action = menu.addAction(paste_label,
+                                      lambda d=target_dir: self._paste_clipboard_to(d))
+        paste_action.setEnabled(bool(self._clipboard_file_paths()))
+        menu.addAction("重命名…", lambda: self._rename_path(p, kind, tree_item))
+        menu.addSeparator()
+
         # 新建文件（最常用：md）+ 新建目录
         menu.addAction("📄  新建 Markdown 文件…",
                        lambda d=target_dir: self._create_new_file(d, default_ext=".md"))
@@ -419,33 +538,26 @@ class FileTree(QWidget):
                        lambda d=target_dir: self._create_new_dir(d))
         menu.addSeparator()
 
-        # 在文件所在目录（或选中目录）打开终端并进入 Codex
-        menu.addAction("codex", lambda d=target_dir: self._open_codex(d))
-        # JetBrains IDE：根据项目类型选 IDEA / WebStorm / PyCharm
-        from src.util.jetbrains import pick_ide_for
-        ide = pick_ide_for(self.project_type)
-        if ide is not None:
-            ide_name, ide_exe = ide
-            menu.addAction(f"用 {ide_name} 打开",
-                           lambda exe=ide_exe: self._open_in_jetbrains(exe))
-        if kind == "dir":
-            menu.addAction("打开目录", lambda: open_folder(path))
+        # 外部工具 / 系统定位
+        menu.addAction("在 codex 中打开", lambda d=target_dir: self._open_codex(d))
         menu.addAction("在资源管理器中显示", lambda: reveal_in_explorer(path))
         menu.addSeparator()
-        menu.addAction("复制文件名", lambda: QApplication.clipboard().setText(filename))
-        menu.addAction("复制文件名（不含扩展名）",
-                       lambda: QApplication.clipboard().setText(p.stem))
+
+        # 复制文本形式的路径信息
+        name_label = "复制目录名" if kind == "dir" else "复制文件名"
+        menu.addAction(name_label, lambda: QApplication.clipboard().setText(filename))
+        if kind != "dir":
+            menu.addAction("复制文件名（不含扩展名）",
+                           lambda: QApplication.clipboard().setText(p.stem))
         menu.addAction("复制绝对路径", lambda: QApplication.clipboard().setText(path))
         try:
             rel = str(p.relative_to(self.root_path)).replace("\\", "/")
         except ValueError:
             rel = path
         menu.addAction("复制相对路径", lambda r=rel: QApplication.clipboard().setText(r))
-        # 文件系统修改：重命名 + 删除（分到底部一段，避免误点）
+
+        # 危险操作放到底部，避免误点
         menu.addSeparator()
-        rename_label = "✏  重命名目录…" if kind == "dir" else "✏  重命名…"
-        menu.addAction(rename_label, lambda: self._rename_path(p, kind, tree_item))
-        # 删除：单选时按 kind 走原文案；多选时显示数量
         if batch and len(batch) > 1:
             del_label = f"🗑  删除选中的 {len(batch)} 项到回收站"
         else:
@@ -453,6 +565,148 @@ class FileTree(QWidget):
         menu.addAction(del_label, lambda b=batch: self._delete_paths(b))
 
         menu.exec(global_pos)
+
+    def _show_blank_context_menu(self, global_pos) -> None:
+        menu = QMenu(self)
+        paste_action = menu.addAction("粘贴到项目根目录",
+                                      lambda: self._paste_clipboard_to(self.root_path))
+        paste_action.setEnabled(bool(self._clipboard_file_paths()))
+        menu.exec(global_pos)
+
+    def _copy_tree_selection(self) -> None:
+        items = self.tree.selectedItems()
+        if not items and self.tree.currentItem() is not None:
+            items = [self.tree.currentItem()]
+        paths = [Path(it.data(0, Qt.ItemDataRole.UserRole)) for it in items
+                 if it.data(0, Qt.ItemDataRole.UserRole)]
+        self._copy_paths_to_clipboard(paths)
+
+    def _cut_tree_selection(self) -> None:
+        items = self.tree.selectedItems()
+        if not items and self.tree.currentItem() is not None:
+            items = [self.tree.currentItem()]
+        paths = [Path(it.data(0, Qt.ItemDataRole.UserRole)) for it in items
+                 if it.data(0, Qt.ItemDataRole.UserRole)]
+        self._cut_paths_to_clipboard(paths)
+
+    def _copy_search_selection(self) -> None:
+        items = self.search_list.selectedItems()
+        if not items and self.search_list.currentItem() is not None:
+            items = [self.search_list.currentItem()]
+        paths = [Path(it.data(Qt.ItemDataRole.UserRole)) for it in items
+                 if it.data(Qt.ItemDataRole.UserRole)]
+        self._copy_paths_to_clipboard(paths)
+
+    def _cut_search_selection(self) -> None:
+        items = self.search_list.selectedItems()
+        if not items and self.search_list.currentItem() is not None:
+            items = [self.search_list.currentItem()]
+        paths = [Path(it.data(Qt.ItemDataRole.UserRole)) for it in items
+                 if it.data(Qt.ItemDataRole.UserRole)]
+        self._cut_paths_to_clipboard(paths)
+
+    def _paste_to_tree_current(self) -> None:
+        item = self.tree.currentItem()
+        if item is None:
+            self._paste_clipboard_to(self.root_path)
+            return
+        path = item.data(0, Qt.ItemDataRole.UserRole)
+        kind = item.data(0, Qt.ItemDataRole.UserRole + 1)
+        if not path:
+            self._paste_clipboard_to(self.root_path)
+            return
+        p = Path(path)
+        self._paste_clipboard_to(p if kind == "dir" else p.parent)
+
+    def _paste_to_search_current(self) -> None:
+        item = self.search_list.currentItem()
+        if item is None:
+            self._paste_clipboard_to(self.root_path)
+            return
+        path = item.data(Qt.ItemDataRole.UserRole)
+        self._paste_clipboard_to(Path(path).parent if path else self.root_path)
+
+    def _copy_paths_to_clipboard(self, paths: list[Path]) -> None:
+        existing = [p for p in paths if p.exists()]
+        if not existing:
+            return
+        mime = QMimeData()
+        mime.setUrls([QUrl.fromLocalFile(str(p)) for p in existing])
+        mime.setText("\n".join(str(p) for p in existing))
+        QApplication.clipboard().setMimeData(mime)
+
+    def _cut_paths_to_clipboard(self, paths: list[Path]) -> None:
+        existing = [p for p in paths
+                    if p.exists() and p.resolve() != self.root_path.resolve()]
+        if not existing:
+            return
+        mime = QMimeData()
+        mime.setUrls([QUrl.fromLocalFile(str(p)) for p in existing])
+        mime.setText("\n".join(str(p) for p in existing))
+        mime.setData(_CUT_MIME, b"1")
+        QApplication.clipboard().setMimeData(mime)
+
+    def _clipboard_is_cut(self) -> bool:
+        mime = QApplication.clipboard().mimeData()
+        return bool(mime and mime.hasFormat(_CUT_MIME))
+
+    def _clipboard_file_paths(self) -> list[Path]:
+        mime = QApplication.clipboard().mimeData()
+        if mime is None:
+            return []
+        paths: list[Path] = []
+        if mime.hasUrls():
+            for url in mime.urls():
+                if url.isLocalFile():
+                    local = url.toLocalFile()
+                    if local:
+                        paths.append(Path(local))
+        if not paths and mime.hasText():
+            for line in mime.text().splitlines():
+                text = line.strip().strip('"')
+                if text:
+                    paths.append(Path(text))
+        out: list[Path] = []
+        seen: set[str] = set()
+        for p in paths:
+            if not p.exists():
+                continue
+            try:
+                key = str(p.resolve()).lower()
+            except OSError:
+                key = str(p).lower()
+            if key not in seen:
+                seen.add(key)
+                out.append(p)
+        return out
+
+    def _paste_clipboard_to(self, target_dir: Path) -> None:
+        sources = self._clipboard_file_paths()
+        if not sources:
+            QMessageBox.warning(self, "粘贴", "剪贴板里没有可粘贴的文件或目录")
+            return
+        move = self._clipboard_is_cut()
+        worker = _PasteWorker([str(p) for p in sources], str(target_dir), move,
+                              QApplication.instance())
+        self._paste_workers.append(worker)
+        worker.done.connect(self._on_paste_done)
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+
+    def _on_paste_done(self, target_dir: str, changed: int,
+                       failed: list, move: bool) -> None:
+        worker = self.sender()
+        if worker in self._paste_workers:
+            self._paste_workers.remove(worker)
+        self._refresh_dir_node(Path(target_dir))
+        if move and changed > 0:
+            QApplication.clipboard().clear()
+        if self.stack.currentWidget() is self.search_list:
+            self._apply_filter(self.filter_input.text())
+        if failed:
+            shown = "\n\n".join(str(x) for x in failed[:5])
+            more = f"\n\n还有 {len(failed) - 5} 项失败" if len(failed) > 5 else ""
+            QMessageBox.warning(self, "部分粘贴失败", shown + more)
 
     def _rename_path(self, p: Path, kind: str | None, tree_item=None) -> None:
         # 不允许重命名项目根目录
@@ -533,18 +787,6 @@ class FileTree(QWidget):
             QMessageBox.warning(self, "部分删除失败", "\n\n".join(failed[:5]))
         if self.stack.currentWidget() is self.search_list:
             self._apply_filter(self.filter_input.text())
-
-    def _open_in_jetbrains(self, exe: str) -> None:
-        """让 JetBrains IDE 打开项目根目录（IDEA/WebStorm/PyCharm 用法一致）"""
-        no_window = 0x08000000 if sys.platform == "win32" else 0
-        try:
-            subprocess.Popen(
-                [exe, str(self.root_path)],
-                creationflags=no_window,
-                close_fds=True,
-            )
-        except OSError as e:
-            QMessageBox.warning(self, "启动失败", f"{exe}\n\n{e}")
 
     def _open_codex(self, target_dir: Path) -> None:
         """在指定目录下打开 PowerShell 并启动 codex（不阻塞 mini-ide）"""

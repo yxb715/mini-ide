@@ -11,8 +11,8 @@ from __future__ import annotations
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
-    QAbstractItemView, QDialog, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
-    QMessageBox, QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout,
+    QAbstractItemView, QApplication, QDialog, QHBoxLayout, QHeaderView, QLabel,
+    QLineEdit, QMessageBox, QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout,
 )
 
 from src.core import port_scanner
@@ -47,6 +47,7 @@ class PortDialog(QDialog):
 
     def __init__(self, default_port: int = 0, parent=None):
         super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self.setWindowTitle("🔌 端口占用查询")
         self.resize(640, 380)
         self._scan_worker: _ScanWorker | None = None
@@ -130,11 +131,16 @@ class PortDialog(QDialog):
         self.btn_scan.setEnabled(False)
         self.lbl_status.setText(f"查询端口 {port} 占用情况...")
         self.table.setRowCount(0)
-        self._scan_worker = _ScanWorker(port, self)
-        self._scan_worker.done.connect(self._on_scan_done)
-        self._scan_worker.start()
+        worker = _ScanWorker(port, QApplication.instance())
+        self._scan_worker = worker
+        worker.done.connect(self._on_scan_done)
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
 
     def _on_scan_done(self, port: int, owners: list) -> None:
+        if self.sender() is not self._scan_worker:
+            return
+        self._scan_worker = None
         self.btn_scan.setEnabled(True)
         if not owners:
             self.lbl_status.setText(f"✓ 端口 {port} 当前空闲（未找到监听或连接进程）")
@@ -187,11 +193,16 @@ class PortDialog(QDialog):
             return
         self.btn_kill.setEnabled(False)
         self.lbl_status.setText(f"正在 kill PID {pid} ...")
-        self._kill_worker = _KillWorker(pid, self)
-        self._kill_worker.done.connect(self._on_kill_done)
-        self._kill_worker.start()
+        worker = _KillWorker(pid, QApplication.instance())
+        self._kill_worker = worker
+        worker.done.connect(self._on_kill_done)
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
 
     def _on_kill_done(self, pid: int, ok: bool, msg: str) -> None:
+        if self.sender() is not self._kill_worker:
+            return
+        self._kill_worker = None
         if ok:
             self.lbl_status.setText(f"✓ PID {pid} 已结束：{msg}。点「查询」可刷新")
         else:

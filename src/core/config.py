@@ -50,14 +50,12 @@ class AppConfig:
     #   external：用 VS Code / IDEA 等外部编辑器
     #   auto：先试外部，失败回落内置
     file_open_mode: str = "preview"
-    ide_cmd: str = ""
-    auto_scroll_logs: bool = True
     show_memory_usage: bool = True
     # 每个 Tab 保留的最大日志行数（超过会自动淘汰最旧）。
     # 10000 行 ≈ 1MB 显存；降低能省内存，但看历史日志范围变短。
     max_log_blocks: int = 10000
     # "打开项目" 对话框默认定位到的目录。空字符串：fallback 到最近项目父目录或家目录
-    default_project_dir: str = ""
+    default_project_dir: str = r"G:\whaty\project"
 
     @classmethod
     def load(cls) -> "AppConfig":
@@ -82,6 +80,10 @@ class AppConfig:
         # 老配置迁移：默认改成内置预览（用户反馈外部编辑器链路不符合预期）
         if cfg.file_open_mode == "auto":
             cfg.file_open_mode = "preview"
+            cfg.save()
+
+        if not cfg.default_project_dir and Path(r"G:\whaty\project").is_dir():
+            cfg.default_project_dir = r"G:\whaty\project"
             cfg.save()
 
         return cfg

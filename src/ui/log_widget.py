@@ -2,7 +2,7 @@
 
 负责：
 - 按 classifier 的结果高亮着色
-- 异常堆栈折叠（点击摘要展开）
+- 异常堆栈明细默认折叠
 - 文件:行号 可点击跳转
 - 搜索（Ctrl+F）+ 正则
 - 错误计数、诊断提示浮层
@@ -33,8 +33,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QHBoxLayout, QLabel, QLineEdit, QMenu,
-    QPushButton, QPlainTextEdit, QSizePolicy, QVBoxLayout, QWidget,
-    QToolButton,
+    QPushButton, QPlainTextEdit, QVBoxLayout, QWidget, QToolButton,
 )
 
 from src.core import log_classifier as lc
@@ -47,28 +46,6 @@ from src.ui.theme import (
 )
 
 
-# 按级别过滤用：kind → 过滤分组。"info" 组兜底所有未明确归类的 kind。
-_KIND_GROUPS: dict[str, set[str]] = {
-    "error": {"error", "caused_by"},
-    "warn":  {"warn"},
-    "info":  {"info", "startup_ready", "startup_banner", "plain"},
-    "debug": {"debug", "trace"},
-    "sql":   {"sql", "sql_continuation"},
-    "stack": {"stack"},
-    "meta":  {"meta"},
-}
-_KIND_TO_GROUP: dict[str, str] = {k: g for g, ks in _KIND_GROUPS.items() for k in ks}
-_FILTER_LABELS: list[tuple[str, str]] = [
-    ("error", "错误 (error / caused_by)"),
-    ("warn",  "警告 (warn)"),
-    ("info",  "普通信息 (info / plain / banner)"),
-    ("debug", "调试 (debug / trace)"),
-    ("sql",   "SQL"),
-    ("stack", "异常堆栈 (stack)"),
-    ("meta",  "元信息 (meta)"),
-]
-
-
 # ---- 每行附带的分类数据 ----
 
 @dataclass
@@ -77,7 +54,6 @@ class LineMeta:
     stream: str = "stdout"
     jumps: list[lc.FileJump] = field(default_factory=list)
     stack_group: str = ""
-    is_folded: bool = False
     diagnosis: str = ""
     diagnosis_port: int = 0
 
@@ -94,7 +70,6 @@ class LogWidget(QWidget):
         self._lines: list[LineMeta] = []       # 每一块的元数据（与文档 block 一一对应）
         self._error_count = 0
         self._warn_count = 0
-        self._stack_heads: dict[str, int] = {}    # 堆栈首行 block 号
         self._log_file: Path | None = None
         self._persistent_fh = None
         self._last_diagnosis = ""
@@ -106,10 +81,7 @@ class LogWidget(QWidget):
         self._flush_timer.setInterval(50)
         self._flush_timer.timeout.connect(self._flush_pending)
 
-        # 按级别过滤：集合中的组不显示。默认全部显示（空集）。
-        self._hidden_groups: set[str] = set()
-        # AI 上下文提供器：调用方（ProjectTab）注入一个 () -> str，返回项目元信息
-        self._ai_context_provider = None
+        self._hide_stack = True
 
         self._build_ui()
         self._apply_formats()
@@ -129,43 +101,6 @@ class LogWidget(QWidget):
         self.lbl_counts = QLabel("")
         self.lbl_counts.setProperty("role", "subtitle")
         tb.addWidget(self.lbl_counts, 1)
-
-        self.chk_autoscroll = QCheckBox("自动滚动")
-        self.chk_autoscroll.setChecked(True)
-        tb.addWidget(self.chk_autoscroll)
-
-        self.chk_hide_stack = QCheckBox("折叠堆栈")
-        self.chk_hide_stack.setChecked(True)
-        self.chk_hide_stack.toggled.connect(self._toggle_all_stacks)
-        tb.addWidget(self.chk_hide_stack)
-
-        self.btn_filter = QToolButton()
-        self.btn_filter.setText("过滤 ▾")
-        self.btn_filter.setToolTip("按级别过滤显示（勾选的显示，取消勾选则隐藏）")
-        self.btn_filter.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
-        self._filter_menu = QMenu(self.btn_filter)
-        self._filter_actions: dict[str, QAction] = {}
-        for group, label in _FILTER_LABELS:
-            act = self._filter_menu.addAction(label)
-            act.setCheckable(True)
-            act.setChecked(True)
-            act.toggled.connect(lambda checked, g=group: self._on_filter_toggled(g, checked))
-            self._filter_actions[group] = act
-        self.btn_filter.setMenu(self._filter_menu)
-        tb.addWidget(self.btn_filter)
-
-        self.btn_search = QToolButton()
-        self.btn_search.setText("🔍")
-        self.btn_search.setToolTip("搜索 (Ctrl+F)")
-        self.btn_search.clicked.connect(self._toggle_search)
-        tb.addWidget(self.btn_search)
-
-        self.btn_copy_errors = QPushButton("📋 复制错误给 AI")
-        self.btn_copy_errors.setToolTip(
-            "收集错误/堆栈 + 项目上下文，拼成 prompt 放到剪贴板，直接粘给 Claude"
-        )
-        self.btn_copy_errors.clicked.connect(self._copy_errors_for_ai)
-        tb.addWidget(self.btn_copy_errors)
 
         self.btn_clear = QToolButton()
         self.btn_clear.setText("🗑")
@@ -257,7 +192,6 @@ class LogWidget(QWidget):
             "startup_banner": mk(COLOR_BANNER),
             "meta":         mk(FG_SECONDARY, italic=True),
             "plain":        mk(FG_PRIMARY),
-            "fold_summary": mk(COLOR_LINK, italic=True),
         }
         self._fmt_link = QTextCharFormat()
         self._fmt_link.setForeground(QColor(COLOR_LINK))
@@ -339,21 +273,14 @@ class LogWidget(QWidget):
                 if cls.diagnosis and cls.diagnosis != self._last_diagnosis:
                     self._last_diagnosis = cls.diagnosis
                     self._show_diagnosis(cls.diagnosis, cls.diagnosis_port)
-                # 新 block 可见性：按级别过滤 + 堆栈折叠叠加判断
-                group = _KIND_TO_GROUP.get(cls.kind, "info")
-                hide_by_filter = group in self._hidden_groups
-                hide_by_stack = (
-                    self.chk_hide_stack.isChecked() and cls.kind == "stack" and bool(meta.stack_group)
-                )
-                if hide_by_filter or hide_by_stack:
+                if self._hide_stack and cls.kind == "stack" and bool(meta.stack_group):
                     self.edit.document().lastBlock().setVisible(False)
         finally:
             self.edit.setUpdatesEnabled(True)
 
-        # 批次末尾统一刷新一次计数和自动滚动
+        # 批次末尾统一刷新一次计数并滚动到底部
         self._update_counts(None)
-        if self.chk_autoscroll.isChecked():
-            self.edit.verticalScrollBar().setValue(self.edit.verticalScrollBar().maximum())
+        self.edit.verticalScrollBar().setValue(self.edit.verticalScrollBar().maximum())
 
         if self._persistent_fh:
             try:
@@ -366,7 +293,6 @@ class LogWidget(QWidget):
         self._lines.clear()
         self._error_count = 0
         self._warn_count = 0
-        self._stack_heads.clear()
         self._last_diagnosis = ""
         self._diagnosis_port = 0
         self.btn_port_diagnose.setVisible(False)
@@ -374,7 +300,7 @@ class LogWidget(QWidget):
         self._update_counts(None)
 
     def error_snippets(self, max_chars: int = 8000) -> str:
-        """收集所有 error/caused_by 行及其紧随的 stack 行，供 AI 分析用"""
+        """收集 error/caused_by 行及其紧随的 stack 行，供右键复制用"""
         doc = self.edit.document()
         out_lines: list[str] = []
         block = doc.firstBlock()
@@ -439,12 +365,6 @@ class LogWidget(QWidget):
         block.setUserState(_kind_to_state(meta.kind))
         # 用 list 索引关联
         self._lines.append(meta)
-        block_num = block.blockNumber()
-
-        # 记录堆栈首行（折叠摘要用）
-        if cls.is_foldable_head and meta.stack_group:
-            self._stack_heads[meta.stack_group] = block_num
-
     def _update_counts(self, cls: lc.Classification | None) -> None:
         # 计数已在 _flush_pending 里累加，这里只更新 UI 标签
         parts = []
@@ -455,39 +375,6 @@ class LogWidget(QWidget):
         if not parts:
             parts.append(f"<span style='color:{FG_SECONDARY};'>0 errors</span>")
         self.lbl_counts.setText("  ".join(parts))
-
-    def _toggle_all_stacks(self, _hide: bool) -> None:
-        # 折叠堆栈和级别过滤会叠加，统一走 _apply_visibility
-        self._apply_visibility()
-
-    def _on_filter_toggled(self, group: str, checked: bool) -> None:
-        if checked:
-            self._hidden_groups.discard(group)
-        else:
-            self._hidden_groups.add(group)
-        self._apply_visibility()
-
-    def _apply_visibility(self) -> None:
-        """把 _hidden_groups 和 chk_hide_stack 两路隐藏条件合并应用到所有 block"""
-        hide_stack = self.chk_hide_stack.isChecked()
-        doc = self.edit.document()
-        block = doc.firstBlock()
-        idx = 0
-        while block.isValid():
-            meta = self._lines[idx] if idx < len(self._lines) else None
-            if meta:
-                group = _KIND_TO_GROUP.get(meta.kind, "info")
-                hidden_by_filter = group in self._hidden_groups
-                hidden_by_stack = hide_stack and meta.kind == "stack" and bool(meta.stack_group)
-                block.setVisible(not (hidden_by_filter or hidden_by_stack))
-            block = block.next()
-            idx += 1
-        self.edit.viewport().update()
-
-    def set_ai_context_provider(self, provider) -> None:
-        """注入一个 () -> str 回调，返回项目上下文文本（路径/类型/分支/启动命令等）。
-        LogWidget 不直接依赖 ProjectTab，通过回调拿上下文。"""
-        self._ai_context_provider = provider
 
     def _show_diagnosis(self, text: str, port: int) -> None:
         """在诊断栏显示一行提示。port > 0 时挂上「查看占用进程」按钮。"""
@@ -506,7 +393,6 @@ class LogWidget(QWidget):
 
     def _on_double_click(self, event: QMouseEvent) -> None:
         cursor = self.edit.cursorForPosition(event.position().toPoint())
-        line_text = cursor.block().text()
         block_num = cursor.block().blockNumber()
         if block_num < len(self._lines) and self._lines[block_num].jumps:
             # 取最近的 jump
@@ -544,32 +430,6 @@ class LogWidget(QWidget):
 
     def _copy_line(self, cursor: QTextCursor) -> None:
         QApplication.clipboard().setText(cursor.block().text())
-
-    def _copy_errors_for_ai(self) -> None:
-        """把错误/堆栈 + 项目上下文拼成 prompt 放剪贴板。
-        项目上下文通过 set_ai_context_provider 注入；未注入时仅包含错误段"""
-        snippets = self.error_snippets().strip()
-        ctx = ""
-        if self._ai_context_provider is not None:
-            try:
-                ctx = (self._ai_context_provider() or "").strip()
-            except Exception:
-                ctx = ""
-
-        parts: list[str] = [
-            "# 问题",
-            "（在这里写下你想问的具体问题，例如：启动为什么失败？这个报错意味着什么？）",
-            "",
-        ]
-        if ctx:
-            parts += ["## 项目", ctx, ""]
-        parts += ["## 错误日志", "```"]
-        if snippets:
-            parts.append(snippets)
-        else:
-            parts.append("(当前没有捕获到错误行。如果启动失败请检查完整日志。)")
-        parts += ["```", ""]
-        QApplication.clipboard().setText("\n".join(parts))
 
     def _copy_error_context(self) -> None:
         txt = self.edit.textCursor().selectedText()

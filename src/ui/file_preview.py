@@ -23,11 +23,12 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt, QFileSystemWatcher, QRect, QSize, QTimer, Signal
 from PySide6.QtGui import (
-    QAction, QColor, QFont, QKeySequence, QPainter, QTextCursor, QTextFormat,
+    QAction, QColor, QFont, QKeySequence, QPainter, QTextCursor, QTextDocument,
+    QTextFormat,
 )
 from PySide6.QtWidgets import (
-    QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPlainTextEdit, QPushButton,
-    QTextEdit, QToolButton, QVBoxLayout, QWidget,
+    QCheckBox, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPlainTextEdit,
+    QPushButton, QTextEdit, QToolButton, QVBoxLayout, QWidget,
 )
 
 from src.ui.syntax_highlighter import PygmentsHighlighter, get_lexer_for
@@ -357,7 +358,14 @@ class FilePreviewPane(QWidget):
         self.search_input.setPlaceholderText("搜索（Ctrl+F）")
         apply_search_style(self.search_input)
         self.search_input.returnPressed.connect(self._find_next)
+        self.search_input.textChanged.connect(self._update_search_status)
         search_row.addWidget(self.search_input, 1)
+        self.chk_search_case = QCheckBox("大小写")
+        self.chk_search_case.toggled.connect(self._update_search_status)
+        search_row.addWidget(self.chk_search_case)
+        self.lbl_search_status = QLabel("")
+        self.lbl_search_status.setStyleSheet(f"color:{FG_SECONDARY};")
+        search_row.addWidget(self.lbl_search_status)
         btn_prev = QToolButton(); btn_prev.setText("↑"); btn_prev.clicked.connect(self._find_prev)
         btn_next = QToolButton(); btn_next.setText("↓"); btn_next.clicked.connect(self._find_next)
         search_row.addWidget(btn_prev); search_row.addWidget(btn_next)
@@ -367,6 +375,7 @@ class FilePreviewPane(QWidget):
         self.view = CodeView()
         self.view.document().modificationChanged.connect(self._on_modified)
         self.view.textChanged.connect(self._on_text_changed)
+        self.view.textChanged.connect(self._update_search_status)
         root.addWidget(self.view, 1)
 
         # 自动保存
@@ -618,13 +627,66 @@ class FilePreviewPane(QWidget):
     # ---- 搜索 ----
 
     def _find_next(self) -> None:
-        if self.search_input.text():
-            self.view.find(self.search_input.text())
+        self._find(True)
 
     def _find_prev(self) -> None:
-        from PySide6.QtGui import QTextDocument
-        if self.search_input.text():
-            self.view.find(self.search_input.text(), QTextDocument.FindFlag.FindBackward)
+        self._find(False)
+
+    def _find(self, forward: bool) -> None:
+        q = self.search_input.text()
+        if not q:
+            self._update_search_status()
+            return
+        flags = QTextDocument.FindFlag(0)
+        if not forward:
+            flags |= QTextDocument.FindFlag.FindBackward
+        if self.chk_search_case.isChecked():
+            flags |= QTextDocument.FindFlag.FindCaseSensitively
+        if not self.view.find(q, flags):
+            cur = self.view.textCursor()
+            cur.movePosition(
+                QTextCursor.MoveOperation.Start if forward else QTextCursor.MoveOperation.End
+            )
+            self.view.setTextCursor(cur)
+            self.view.find(q, flags)
+        self._update_search_status()
+
+    def _search_positions(self, query: str) -> list[int]:
+        if not query:
+            return []
+        text = self.view.toPlainText()
+        haystack = text if self.chk_search_case.isChecked() else text.lower()
+        needle = query if self.chk_search_case.isChecked() else query.lower()
+        positions: list[int] = []
+        start = 0
+        while True:
+            pos = haystack.find(needle, start)
+            if pos < 0:
+                break
+            positions.append(pos)
+            start = pos + max(1, len(needle))
+        return positions
+
+    def _update_search_status(self) -> None:
+        q = self.search_input.text()
+        if not q:
+            self.lbl_search_status.setText("")
+            return
+        positions = self._search_positions(q)
+        if not positions:
+            self.lbl_search_status.setText("无匹配")
+            return
+        sel_start = self.view.textCursor().selectionStart()
+        current = 1
+        for i, pos in enumerate(positions, 1):
+            if pos >= sel_start:
+                current = i
+                break
+        else:
+            current = len(positions)
+        if sel_start in positions:
+            current = positions.index(sel_start) + 1
+        self.lbl_search_status.setText(f"{current}/{len(positions)}")
 
     # ---- 快捷键 ----
 

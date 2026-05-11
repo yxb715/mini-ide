@@ -1,18 +1,18 @@
-"""Git 变更 & 日志查看器（只读）
+"""Git 改动查看器（只读）
 
-用 Tab 切换：「本地改动」(git status + diff) / 「提交历史」(git log + 单 commit 详情)。
-做不了 commit/push/merge 这些危险操作，那些还是回 IDEA。
+只做一件事：实时展示当前分支有哪些文件被改动。
+提交、拉取、合并等 Git 操作交给外部 AI / 终端处理。
 """
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
-from PySide6.QtCore import QFile, Qt, QThread, Signal
+from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QTextCharFormat, QSyntaxHighlighter
 from PySide6.QtWidgets import (
-    QDialog, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMenu,
-    QMessageBox, QPlainTextEdit, QPushButton, QSplitter, QTabWidget,
-    QVBoxLayout, QWidget,
+    QApplication, QDialog, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMenu,
+    QMessageBox, QPlainTextEdit, QPushButton, QSplitter, QVBoxLayout, QWidget,
 )
 
 from src.core import git_ops
@@ -20,6 +20,44 @@ from src.ui.theme import (
     FG_SECONDARY, GIT_ADD, GIT_DEL, GIT_FILE_HEAD, GIT_HUNK, GIT_META,
     GIT_MODIFY,
 )
+from src.util.editor import reveal_in_explorer
+
+WORKER_CLOSE_WAIT_MS = 16000
+
+
+class _OverviewWorker(QThread):
+    done = Signal(str, list)  # branch, changed files
+
+    def __init__(self, root: str, parent=None):
+        super().__init__(parent)
+        self.root = root
+
+    def run(self) -> None:
+        branch = git_ops.current_branch(self.root)
+        files = git_ops.list_changed_files(self.root)
+        self.done.emit(branch, files)
+
+
+class _FileDiffWorker(QThread):
+    done = Signal(str, str)  # path, diff text
+
+    def __init__(self, root: str, changed_file: git_ops.ChangedFile, parent=None):
+        super().__init__(parent)
+        self.root = root
+        self.changed_file = changed_file
+
+    def run(self) -> None:
+        f = self.changed_file
+        if f.status.startswith("?"):
+            text = git_ops.get_untracked_preview(self.root, f.path)
+        else:
+            parts = []
+            if f.is_staged:
+                parts.append("=== Staged ===\n" + git_ops.get_file_diff(self.root, f.path, staged=True))
+            if f.is_unstaged:
+                parts.append("=== Unstaged ===\n" + git_ops.get_file_diff(self.root, f.path, staged=False))
+            text = "\n\n".join(parts) or "(无 diff 内容)"
+        self.done.emit(f.path, text)
 
 
 class DiffHighlighter(QSyntaxHighlighter):
@@ -65,39 +103,54 @@ class GitViewer(QDialog):
 
     def __init__(self, project_root: str, parent=None):
         super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self.root = git_ops.repo_root(project_root)
-        self.setWindowTitle(f"Git 查看器 — {self.root}")
-        self.resize(1200, 780)
+        self.setWindowTitle(f"Git 改动 — {self.root}")
+        self.resize(1120, 720)
+        self._overview_worker: _OverviewWorker | None = None
+        self._diff_worker: _FileDiffWorker | None = None
+        self._last_signature = ""
+        self._selected_path = ""
+        self._current_branch = ""
+        self._closing = False
+        self._active_workers: list[QThread] = []
 
         root = QVBoxLayout(self)
         root.setContentsMargins(6, 6, 6, 6)
+        root.setSpacing(6)
 
         header = QHBoxLayout()
-        branch = git_ops.current_branch(self.root)
-        lbl = QLabel(
-            f"🌿 {branch or '(无分支)'} "
-            f"<span style='color:{FG_SECONDARY};'>@ {self.root}</span>"
-        )
-        lbl.setTextFormat(Qt.TextFormat.RichText)
-        header.addWidget(lbl, 1)
+        self.lbl_branch = QLabel("")
+        self.lbl_branch.setTextFormat(Qt.TextFormat.RichText)
+        header.addWidget(self.lbl_branch, 1)
+        self.btn_copy_branch = QPushButton("复制当前分支")
+        self.btn_copy_branch.clicked.connect(self._copy_current_branch)
+        header.addWidget(self.btn_copy_branch)
         btn_refresh = QPushButton("刷新")
-        btn_refresh.clicked.connect(self._reload)
+        btn_refresh.clicked.connect(lambda: self._reload(force=True))
         header.addWidget(btn_refresh)
         root.addLayout(header)
 
-        self.tabs = QTabWidget()
-        self.tabs.addTab(self._build_changes_tab(), "本地改动")
-        self.tabs.addTab(self._build_log_tab(), "提交历史")
-        root.addWidget(self.tabs, 1)
+        self.lbl_summary = QLabel("")
+        self.lbl_summary.setStyleSheet(f"color:{FG_SECONDARY};")
+        root.addWidget(self.lbl_summary)
 
-        self._reload()
+        root.addWidget(self._build_changes_view(), 1)
 
-    # ---- 改动 Tab ----
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.setInterval(1500)
+        self._refresh_timer.timeout.connect(self._reload)
+        self._refresh_timer.start()
 
-    def _build_changes_tab(self) -> QWidget:
+        self._reload(force=True)
+
+    # ---- 改动视图 ----
+
+    def _build_changes_view(self) -> QWidget:
         w = QWidget()
         lay = QHBoxLayout(w)
         lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(6)
 
         split = QSplitter(Qt.Orientation.Horizontal)
 
@@ -122,39 +175,111 @@ class GitViewer(QDialog):
         lay.addWidget(split)
         return w
 
-    def _load_changes(self) -> None:
+    def _status_label(self, f: git_ops.ChangedFile) -> str:
+        status = f.status
+        if "U" in status or status in {"AA", "DD"}:
+            return "冲突"
+        if status.startswith("?"):
+            return "未跟踪"
+        if "D" in status:
+            return "删除"
+        if f.is_staged and f.is_unstaged:
+            return "已暂存+修改"
+        if f.is_staged:
+            return "已暂存"
+        return "修改"
+
+    def _status_color(self, f: git_ops.ChangedFile) -> str:
+        label = self._status_label(f)
+        if label == "未跟踪":
+            return GIT_ADD
+        if label == "删除":
+            return GIT_DEL
+        if label == "冲突":
+            return GIT_DEL
+        return GIT_MODIFY
+
+    def _signature(self, branch: str, files: list[git_ops.ChangedFile]) -> str:
+        parts = [branch]
+        for f in files:
+            abs_path = Path(self.root) / f.path
+            try:
+                st = abs_path.stat()
+                stamp = f"{st.st_mtime_ns}:{st.st_size}"
+            except OSError:
+                stamp = "-"
+            parts.append(f"{f.status}:{f.path}:{stamp}")
+        return "\n".join(parts)
+
+    def _sort_files(self, files: list[git_ops.ChangedFile]) -> list[git_ops.ChangedFile]:
+        order = {"冲突": 0, "修改": 1, "已暂存": 2, "已暂存+修改": 3, "未跟踪": 4, "删除": 5}
+        return sorted(files, key=lambda f: (order.get(self._status_label(f), 9), f.path.lower()))
+
+    def _update_header(self, branch: str, files: list[git_ops.ChangedFile]) -> None:
+        self._current_branch = branch
+        self.lbl_branch.setText(
+            f"🌿 {branch or '(无分支)'} "
+            f"<span style='color:{FG_SECONDARY};'>@ {self.root}</span>"
+        )
+        self.btn_copy_branch.setEnabled(bool(branch))
+        counts: dict[str, int] = {}
+        for f in self._sort_files(files):
+            label = self._status_label(f)
+            counts[label] = counts.get(label, 0) + 1
+        if not files:
+            text = f"工作区干净 · {time.strftime('%H:%M:%S')}"
+        else:
+            order = ["冲突", "修改", "已暂存", "已暂存+修改", "未跟踪", "删除"]
+            parts = [f"{len(files)} 个改动"]
+            parts.extend(f"{k} {counts[k]}" for k in order if counts.get(k))
+            text = " · ".join(parts) + f" · {time.strftime('%H:%M:%S')}"
+        self.lbl_summary.setText(text)
+
+    def _load_changes(self, files: list[git_ops.ChangedFile]) -> None:
+        current_path = self._selected_path
         self.changes_list.clear()
-        files = git_ops.list_changed_files(self.root)
         if not files:
             self.diff_view.setPlainText("(工作区很干净，无改动)")
+            self._selected_path = ""
             return
+        target_row = 0
         for f in files:
-            prefix = "+ " if f.status.startswith("?") else f.status + " "
-            item = QListWidgetItem(f"{prefix}{f.path}")
+            label = self._status_label(f)
+            item = QListWidgetItem(f"[{label}]  {f.path}")
             item.setData(Qt.ItemDataRole.UserRole, f)
-            color = GIT_ADD if f.status.startswith("?") else (
-                GIT_DEL if "D" in f.status else GIT_MODIFY
-            )
-            item.setForeground(QColor(color))
+            item.setToolTip(f"{f.status}  {f.path}")
+            item.setForeground(QColor(self._status_color(f)))
             self.changes_list.addItem(item)
-        self.changes_list.setCurrentRow(0)
+            if f.path == current_path:
+                target_row = self.changes_list.count() - 1
+        self.changes_list.setCurrentRow(target_row)
 
     def _on_change_selected(self, current, _prev) -> None:
+        if self._closing:
+            return
         if not current:
             self.diff_view.setPlainText("")
             return
         f: git_ops.ChangedFile = current.data(Qt.ItemDataRole.UserRole)
-        if f.status.startswith("?"):
-            text = git_ops.get_untracked_preview(self.root, f.path)
-        else:
-            # 组合 staged + unstaged
-            parts = []
-            if f.is_staged:
-                parts.append("=== Staged ===\n" + git_ops.get_file_diff(self.root, f.path, staged=True))
-            if f.is_unstaged:
-                parts.append("=== Unstaged ===\n" + git_ops.get_file_diff(self.root, f.path, staged=False))
-            text = "\n\n".join(parts) or "(无 diff 内容)"
-        self.diff_view.setPlainText(text)
+        self._selected_path = f.path
+        self.diff_view.setPlainText("正在加载 diff...")
+        worker = _FileDiffWorker(self.root, f, parent=QApplication.instance())
+        self._diff_worker = worker
+        worker.done.connect(self._on_file_diff_loaded)
+        self._track_worker(worker)
+        worker.start()
+
+    def _on_file_diff_loaded(self, path: str, text: str) -> None:
+        if self._closing:
+            return
+        if self.sender() is not self._diff_worker:
+            return
+        current = self.changes_list.currentItem()
+        if current:
+            f: git_ops.ChangedFile = current.data(Qt.ItemDataRole.UserRole)
+            if f.path == path:
+                self.diff_view.setPlainText(text)
+        self._diff_worker = None
 
     def _on_changes_context_menu(self, pos) -> None:
         item = self.changes_list.itemAt(pos)
@@ -165,12 +290,16 @@ class GitViewer(QDialog):
         file_exists = abs_path.exists() and abs_path.is_file()
 
         menu = QMenu(self.changes_list)
-        act_jump = menu.addAction("↗ 跳转到文件", lambda: self._jump_to_file(f))
+        act_jump = menu.addAction("打开文件", lambda: self._jump_to_file(f))
         if not file_exists:
             act_jump.setEnabled(False)
-            act_jump.setText("↗ 跳转到文件（已删除）")
+            act_jump.setText("打开文件（已删除）")
+        act_reveal = menu.addAction("在资源管理器中显示", lambda: reveal_in_explorer(str(abs_path)))
+        act_reveal.setEnabled(abs_path.exists())
         menu.addSeparator()
-        menu.addAction("↺ 还原到远程版本（@{u}）", lambda: self._restore_changed_file(f))
+        menu.addAction("复制相对路径", lambda: QApplication.clipboard().setText(f.path))
+        menu.addAction("复制绝对路径", lambda: QApplication.clipboard().setText(str(abs_path)))
+        menu.addAction("复制当前 diff", lambda: QApplication.clipboard().setText(self.diff_view.toPlainText()))
         menu.exec(self.changes_list.viewport().mapToGlobal(pos))
 
     def _jump_to_file(self, f: git_ops.ChangedFile) -> None:
@@ -182,121 +311,52 @@ class GitViewer(QDialog):
             )
             return
         self.openFileRequested.emit(str(abs_path))
-        # 打开 tab 后关闭 viewer，让主界面露出来
-        self.accept()
 
-    def _restore_changed_file(self, f: git_ops.ChangedFile) -> None:
-        if not git_ops.has_upstream(self.root):
-            QMessageBox.warning(
-                self, "无法还原",
-                "当前分支未配置远程 upstream（@{u}），无法还原到远程版本。\n"
-                "请先 push 建立上游，或手动切到有 upstream 的分支。",
-            )
+    def _copy_current_branch(self) -> None:
+        if self._current_branch:
+            QApplication.clipboard().setText(self._current_branch)
+
+    def _reload(self, force: bool = False) -> None:
+        if self._closing:
             return
-
-        is_untracked = f.status.startswith("?")
-        in_upstream = False if is_untracked else git_ops.file_exists_in_upstream(self.root, f.path)
-
-        if is_untracked:
-            mode = "trash_only"
-            msg = (
-                f"该文件未入库，远程 @{{u}} 里没有对应版本。\n"
-                f"将把以下文件移到系统回收站：\n\n{f.path}"
-            )
-        elif in_upstream:
-            mode = "checkout"
-            msg = (
-                f"将把以下文件还原到远程 @{{u}} 版本，丢弃所有本地改动（含已暂存）：\n\n{f.path}\n\n"
-                f"操作不可撤销。"
-            )
-        else:
-            mode = "unstage_trash"
-            msg = (
-                f"该文件在远程 @{{u}} 上不存在（本地新增且未 push）。\n"
-                f"将从暂存区移除并把文件移到系统回收站：\n\n{f.path}"
-            )
-
-        ret = QMessageBox.question(
-            self, "还原确认", msg,
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if ret != QMessageBox.StandardButton.Yes:
+        if self._overview_worker and self._overview_worker.isRunning():
             return
+        if force and not self._last_signature:
+            self.diff_view.setPlainText("正在加载本地改动...")
+        worker = _OverviewWorker(self.root, parent=QApplication.instance())
+        self._overview_worker = worker
+        worker.done.connect(self._on_overview_loaded)
+        self._track_worker(worker)
+        worker.start()
 
-        if mode == "checkout":
-            ok, err = git_ops.restore_file_to_upstream(self.root, f.path)
-            if not ok:
-                QMessageBox.warning(self, "还原失败", f"{f.path}\n\n{err or '(git 未返回错误信息)'}")
-                return
-        else:
-            if mode == "unstage_trash" and f.is_staged:
-                ok, err = git_ops.unstage_file(self.root, f.path)
-                if not ok:
-                    QMessageBox.warning(self, "还原失败", f"移除暂存失败：{f.path}\n\n{err}")
-                    return
-            abs_path = str(Path(self.root) / f.path)
-            if Path(abs_path).exists():
-                try:
-                    ok, _ = QFile.moveToTrash(abs_path)
-                except (OSError, RuntimeError) as e:
-                    QMessageBox.warning(self, "还原失败", f"{f.path}\n\n{e}")
-                    return
-                if not ok:
-                    QMessageBox.warning(self, "还原失败", f"无法将以下路径移到回收站：\n\n{abs_path}")
-                    return
-
-        self._load_changes()
-
-    # ---- 日志 Tab ----
-
-    def _build_log_tab(self) -> QWidget:
-        w = QWidget()
-        lay = QHBoxLayout(w)
-        lay.setContentsMargins(0, 0, 0, 0)
-
-        split = QSplitter(Qt.Orientation.Horizontal)
-
-        self.log_list = QListWidget()
-        self.log_list.setMinimumWidth(420)
-        self.log_list.currentItemChanged.connect(self._on_commit_selected)
-        split.addWidget(self.log_list)
-
-        self.commit_view = QPlainTextEdit()
-        self.commit_view.setReadOnly(True)
-        self.commit_view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
-        f = QFont()
-        f.setFamilies(["Cascadia Mono", "Consolas"])
-        f.setPointSize(10)
-        self.commit_view.setFont(f)
-        DiffHighlighter(self.commit_view.document())
-        split.addWidget(self.commit_view)
-
-        split.setSizes([440, 760])
-        lay.addWidget(split)
-        return w
-
-    def _load_log(self) -> None:
-        self.log_list.clear()
-        commits = git_ops.get_log(self.root, limit=80)
-        if not commits:
-            self.commit_view.setPlainText("(无提交历史)")
+    def _on_overview_loaded(self, branch: str, files: list[git_ops.ChangedFile]) -> None:
+        if self._closing:
             return
-        for c in commits:
-            refs = f"  [{c.refs}]" if c.refs else ""
-            text = f"{c.sha}  {c.date}  {c.author}\n  {c.subject}{refs}"
-            item = QListWidgetItem(text)
-            item.setData(Qt.ItemDataRole.UserRole, c)
-            self.log_list.addItem(item)
-        self.log_list.setCurrentRow(0)
-
-    def _on_commit_selected(self, current, _prev) -> None:
-        if not current:
-            self.commit_view.setPlainText("")
+        if self.sender() is not self._overview_worker:
             return
-        c: git_ops.Commit = current.data(Qt.ItemDataRole.UserRole)
-        self.commit_view.setPlainText(git_ops.get_commit_diff(self.root, c.sha_full))
+        self._overview_worker = None
+        self._update_header(branch, files)
+        signature = self._signature(branch, files)
+        if signature != self._last_signature:
+            self._last_signature = signature
+            self._load_changes(files)
 
-    def _reload(self) -> None:
-        self._load_changes()
-        self._load_log()
+    def _track_worker(self, worker: QThread) -> None:
+        self._active_workers.append(worker)
+
+        def cleanup(w=worker) -> None:
+            try:
+                self._active_workers.remove(w)
+            except ValueError:
+                pass
+
+        worker.finished.connect(cleanup)
+        worker.finished.connect(worker.deleteLater)
+
+    def closeEvent(self, event) -> None:
+        self._closing = True
+        self._refresh_timer.stop()
+        for worker in list(self._active_workers):
+            if worker.isRunning():
+                worker.wait(WORKER_CLOSE_WAIT_MS)
+        super().closeEvent(event)

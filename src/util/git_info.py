@@ -1,7 +1,7 @@
 """Git 分支信息（只读）
 
 在项目路径里跑轻量 git 命令，失败静默。在 Windows 下必须加 CREATE_NO_WINDOW
-否则 GUI 程序每次调 git 都会闪一个 cmd 窗口。结果缓存 30s 减少开销。
+否则 GUI 程序每次调 git 都会闪一个 cmd 窗口。结果短缓存，保证 AI 改动/提交后状态栏及时刷新。
 """
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 _CACHE: dict[str, tuple[float, "GitInfo | None"]] = {}
-_TTL = 30.0    # 秒，分支信息变化不频繁，加长缓存
+_TTL = 2.0    # 秒，状态栏每 3s 刷一次；短缓存保证 AI 提交后改动数及时归零
 
 # Windows：防止 GUI 程序调 subprocess 时弹黑框
 _NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
@@ -80,7 +80,7 @@ def get_info(project_path: str) -> GitInfo | None:
 
 
 def invalidate(project_path: str) -> None:
-    """让指定路径的缓存失效——pull / fetch / 切分支后调用，下次 get_info 重新查 git。
+    """让指定路径的缓存失效，下一次 get_info 重新查 git。
 
     替代以前外部直接 `git_info._CACHE.pop(path, None)` 的私有访问。
     """

@@ -13,8 +13,8 @@ from pathlib import Path
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
-    QDialog, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QPushButton,
-    QVBoxLayout,
+    QApplication, QDialog, QHBoxLayout, QLabel, QListWidget, QListWidgetItem,
+    QPushButton, QVBoxLayout,
 )
 
 from src.core import env_scanner
@@ -26,6 +26,7 @@ class _ScanWorker(QThread):
 
     def __init__(self, project_root: str, parent=None):
         super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self.project_root = project_root
 
     def run(self) -> None:
@@ -94,11 +95,16 @@ class EnvPanel(QDialog):
         self.btn_refresh.setEnabled(False)
         self.lbl_status.setText("扫描中...")
         self.list.clear()
-        self._scan_worker = _ScanWorker(self.project_root, self)
-        self._scan_worker.done.connect(self._on_scan_done)
-        self._scan_worker.start()
+        worker = _ScanWorker(self.project_root, QApplication.instance())
+        self._scan_worker = worker
+        worker.done.connect(self._on_scan_done)
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
 
     def _on_scan_done(self, files: list[str]) -> None:
+        if self.sender() is not self._scan_worker:
+            return
+        self._scan_worker = None
         self.btn_refresh.setEnabled(True)
         if not files:
             self.lbl_status.setText("未找到环境/配置文件")
