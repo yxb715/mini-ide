@@ -8,7 +8,13 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import sys
 from pathlib import Path
+
+if sys.platform == "win32":
+    import winreg
+else:
+    winreg = None
 
 from PySide6.QtCore import Qt, QFile, QMimeData, QThread, QUrl, Signal
 from PySide6.QtGui import QKeySequence, QShortcut
@@ -61,6 +67,12 @@ QTreeWidget::branch:closed:has-children:has-siblings {{
 # 右键菜单"▶ 运行"显示的可执行脚本类型（按用户场景：bat/cmd/ps1/exe）
 _RUNNABLE_SCRIPT_EXTS = {".bat", ".cmd", ".ps1", ".exe"}
 _CUT_MIME = "application/x-mini-ide-cut"
+_CODEX_REGISTRY_COMMANDS = [] if winreg is None else [
+    (winreg.HKEY_CURRENT_USER, r"Software\Classes\Directory\shell\open-in-codex\command"),
+    (winreg.HKEY_CURRENT_USER, r"Software\Classes\Directory\Background\shell\open-in-codex\command"),
+    (winreg.HKEY_CLASSES_ROOT, r"Directory\shell\open-in-codex\command"),
+    (winreg.HKEY_CLASSES_ROOT, r"Directory\Background\shell\open-in-codex\command"),
+]
 
 
 def _is_same_or_child(path: Path, parent: Path) -> bool:
@@ -94,6 +106,33 @@ def _copy_destination(target_dir: Path, src: Path) -> Path:
         if not candidate.exists():
             return candidate
         index += 1
+
+
+def _open_in_codex_command(target_dir: Path) -> str:
+    target = str(target_dir)
+    if winreg is not None:
+        for hive, subkey in _CODEX_REGISTRY_COMMANDS:
+            try:
+                with winreg.OpenKey(hive, subkey) as key:
+                    command, _kind = winreg.QueryValueEx(key, "")
+            except OSError:
+                continue
+            if command:
+                return command.replace("%1", target).replace("%V", target)
+
+    wt = shutil.which("wt.exe") or shutil.which("wt")
+    pwsh = shutil.which("pwsh.exe") or shutil.which("pwsh")
+    if wt and pwsh:
+        return f'"{wt}" -d "{target}" "{pwsh}" -NoExit -Command codex'
+    ps = shutil.which("powershell.exe") or shutil.which("powershell")
+    if ps:
+        target_literal = "'" + target.replace("'", "''") + "'"
+        ps_command = f"Set-Location -LiteralPath {target_literal}; codex"
+        return (
+            f'"{ps}" -NoExit -NoLogo -NoProfile '
+            f'-ExecutionPolicy Bypass -Command "{ps_command}"'
+        )
+    return ""
 
 
 class _PasteWorker(QThread):
@@ -789,26 +828,17 @@ class FileTree(QWidget):
             self._apply_filter(self.filter_input.text())
 
     def _open_codex(self, target_dir: Path) -> None:
-        """在指定目录下打开 PowerShell 并启动 codex（不阻塞 mini-ide）"""
-        exe = shutil.which("powershell") or shutil.which("powershell.exe")
-        if not exe:
+        """按系统右键菜单 open-in-codex 的注册表命令启动 Codex。"""
+        command = _open_in_codex_command(target_dir)
+        if not command:
             QMessageBox.warning(
                 self, "未找到 PowerShell",
-                "PATH 里找不到 powershell。\n"
-                "请在 cmd 里运行 `where powershell` 确认。",
+                "没有找到系统右键菜单的 Open in Codex 命令，也未找到 PowerShell。",
             )
             return
-        target_literal = "'" + str(target_dir).replace("'", "''") + "'"
         try:
             subprocess.Popen(
-                [
-                    exe,
-                    "-NoExit",
-                    "-NoLogo",
-                    "-NoProfile",
-                    "-Command",
-                    f"Set-Location -LiteralPath {target_literal}; codex",
-                ],
+                command,
                 close_fds=True,
             )
         except OSError as e:
