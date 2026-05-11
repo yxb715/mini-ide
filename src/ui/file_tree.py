@@ -419,9 +419,8 @@ class FileTree(QWidget):
                        lambda d=target_dir: self._create_new_dir(d))
         menu.addSeparator()
 
-        # 在文件所在目录（或选中目录）打开 alacritty，方便直接跑 claude
-        menu.addAction("在 Alacritty 打开（可直接 claude）",
-                       lambda d=target_dir: self._open_in_alacritty(d))
+        # 在文件所在目录（或选中目录）打开终端并进入 Codex
+        menu.addAction("codex", lambda d=target_dir: self._open_codex(d))
         # JetBrains IDE：根据项目类型选 IDEA / WebStorm / PyCharm
         from src.util.jetbrains import pick_ide_for
         ide = pick_ide_for(self.project_type)
@@ -547,27 +546,31 @@ class FileTree(QWidget):
         except OSError as e:
             QMessageBox.warning(self, "启动失败", f"{exe}\n\n{e}")
 
-    def _open_in_alacritty(self, target_dir: Path) -> None:
-        """在指定目录下打开 alacritty 终端（不阻塞 mini-ide）"""
-        exe = shutil.which("alacritty")
+    def _open_codex(self, target_dir: Path) -> None:
+        """在指定目录下打开 PowerShell 并启动 codex（不阻塞 mini-ide）"""
+        exe = shutil.which("powershell") or shutil.which("powershell.exe")
         if not exe:
             QMessageBox.warning(
-                self, "未找到 Alacritty",
-                "PATH 里找不到 alacritty。\n"
-                "请确认 Alacritty 已安装且加入 PATH，"
-                "或在 cmd 里运行 `where alacritty` 确认。",
+                self, "未找到 PowerShell",
+                "PATH 里找不到 powershell。\n"
+                "请在 cmd 里运行 `where powershell` 确认。",
             )
             return
-        # CREATE_NO_WINDOW: GUI 父进程 spawn 时避免任何中间 console 闪一下
-        no_window = 0x08000000 if sys.platform == "win32" else 0
+        target_literal = "'" + str(target_dir).replace("'", "''") + "'"
         try:
             subprocess.Popen(
-                [exe, "--working-directory", str(target_dir)],
-                creationflags=no_window,
+                [
+                    exe,
+                    "-NoExit",
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-Command",
+                    f"Set-Location -LiteralPath {target_literal}; codex",
+                ],
                 close_fds=True,
             )
         except OSError as e:
-            QMessageBox.warning(self, "启动 Alacritty 失败", f"{e}")
+            QMessageBox.warning(self, "启动 codex 失败", f"{e}")
 
     def _create_new_file(self, target_dir: Path, default_ext: str = "") -> None:
         """在指定目录下新建文件。用户输入文件名，自动补 default_ext 后缀。"""
