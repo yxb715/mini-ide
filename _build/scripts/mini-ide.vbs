@@ -4,10 +4,11 @@
 '   wscript mini-ide.vbs "C:\path\to\project"
 Option Explicit
 
-Dim shell, fso, here, args, extra, i, pythonw, entry, cmd
+Dim shell, fso, scriptDir, here, args, extra, i, pythonw, entry, cmd
 Set shell = CreateObject("WScript.Shell")
 Set fso = CreateObject("Scripting.FileSystemObject")
-here = fso.GetParentFolderName(WScript.ScriptFullName)
+scriptDir = fso.GetParentFolderName(WScript.ScriptFullName)
+here = fso.GetParentFolderName(scriptDir)
 
 ' Build passthrough argument string (each arg wrapped in double quotes)
 extra = ""

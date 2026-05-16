@@ -8,13 +8,16 @@ __pycache__/
 .ruff_cache/
 
 # Virtualenvs
+_build/.venv/
 .venv/
 venv/
 env/
 
-# PyInstaller 产物（spec 文件保留入库以便复现打包）
-build/
-dist/
+# PyInstaller 产物
+_build/pyinstaller-work/
+_build/dist/
+_build/*.spec
+mini-ide.exe
 *.manifest
 
 # IDE / 编辑器

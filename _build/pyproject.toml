@@ -3,7 +3,6 @@ name = "mini-ide"
 version = "0.1.0"
 description = "AI 时代的开发指挥台 - Spring Boot / Vue / Python 项目轻量 IDE"
 authors = ["yxbkjh <yxbkjh@gmail.com>"]
-readme = "README.md"
 package-mode = false
 
 [tool.poetry.dependencies]
