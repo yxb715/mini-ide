@@ -21,11 +21,10 @@ Poetry 管理依赖。Python 版本范围 `>=3.11,<3.14`。
 
 | 场景 | 命令 |
 |---|---|
-| 开发（保留 cmd 窗口看启动日志） | `_build\scripts\run.bat` |
-| 日常使用（静默启动，无黑框） | 双击 `_build\scripts\mini-ide.vbs` |
-| 打包后使用 | 双击根目录 `mini-ide.exe`（生产推荐） |
-| 带初始项目启动 | `_build\scripts\mini-ide.vbs "D:\path\to\project"` 或 `python _build\main.py <path>` |
-| 一键打包成 exe | 双击 `_build\scripts\build.bat` —— 自动建 venv、装依赖（清华镜像）、调 PyInstaller，产物输出到根目录 `mini-ide.exe` |
+| 日常使用 | 双击根目录 `mini-ide.exe`（推荐） |
+| 带初始项目启动 | `mini-ide.exe "D:\path\to\project"` 或 `python _build\main.py <path>`（开发态） |
+| 开发态调试（看实时日志） | `cd _build && poetry run python main.py` |
+| 一键重新打包 exe | 双击 `_build\scripts\build.bat` —— 自动建 venv、装依赖（清华镜像）、调 PyInstaller，产物输出到根目录 `mini-ide.exe` |
 | 冒烟测试 | `cd _build && poetry run python scripts/_smoke.py`（28 个模块 import + 全项目 hex 颜色硬扫描） |
 
 **单实例**：已有 mini-ide 在跑时，再次启动不会开第二个窗口——新进程通过 `QLocalServer` 把 `sys.argv[1]` 转发给老实例后立刻退出；老实例 `activate_and_open()` 把自己拉到前台并打开该路径。适合配合资源管理器右键菜单「用 mini-ide 打开」之类的外部入口。
@@ -50,9 +49,6 @@ mini-ide/
     │
     ├── scripts/
     │   ├── build.bat           # 一键打包脚本：自包含，自动建 venv + 装依赖（清华镜像） + 出 exe（输出到根目录）
-    │   ├── run.bat             # 开发用：保留 cmd 窗口看实时日志
-    │   ├── mini-ide.vbs        # Windows 无黑框启动脚本（支持透传路径参数）
-    │   ├── stop.vbs            # 用 taskkill /T 级联杀 mini-ide.exe 及其子进程
     │   ├── _smoke.py           # 导入冒烟测试（28 个模块）+ 全项目 hex 颜色硬扫描
     │   └── make_icon.py        # 用 Pillow 生成 .ico 图标（dev 依赖才用得到）
     │
@@ -300,7 +296,7 @@ Spring Cloud 这种"一个父 Gradle 仓库 + N 个 `@SpringBootApplication` 子
 
 1. 打开 `%APPDATA%\mini-ide\logs\mini-ide-YYYYMMDD.log` 看启动 / 进程 / 崩溃记录（崩溃栈完整）
 2. `cd _build && poetry run python scripts/_smoke.py` 跑一遍：① 28/28 模块 import 通过 ② 0 hex hits（违反硬约束 15 会列出文件:行号）
-3. 改完用 `_build\scripts\run.bat` 启动，看控制台输出实时日志
+3. 改完用 `cd _build && poetry run python main.py` 启动，看控制台输出实时日志
 4. 打开 `G:\whaty\project\race\server`（多模块 Spring Boot）测 Java 路径
 5. 打开 `G:\whaty\project\race\webapp` 测 Vue 路径
 6. 打开 `G:\whaty\project\race\py-prediction` 测 Python / Poetry 路径
