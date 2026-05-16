@@ -11,12 +11,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-if sys.platform == "win32":
-    import winreg
-else:
-    winreg = None
-
-from PySide6.QtCore import Qt, QFile, QMimeData, QThread, QUrl, Signal
+from PySide6.QtCore import Qt, QFile, QMimeData, QThread, QTimer, QUrl, Signal
 from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QFrame, QHBoxLayout, QInputDialog, QLabel,
@@ -67,12 +62,7 @@ QTreeWidget::branch:closed:has-children:has-siblings {{
 # 右键菜单"▶ 运行"显示的可执行脚本类型（按用户场景：bat/cmd/ps1/exe）
 _RUNNABLE_SCRIPT_EXTS = {".bat", ".cmd", ".ps1", ".exe"}
 _CUT_MIME = "application/x-mini-ide-cut"
-_CODEX_REGISTRY_COMMANDS = [] if winreg is None else [
-    (winreg.HKEY_CURRENT_USER, r"Software\Classes\Directory\shell\open-in-codex\command"),
-    (winreg.HKEY_CURRENT_USER, r"Software\Classes\Directory\Background\shell\open-in-codex\command"),
-    (winreg.HKEY_CLASSES_ROOT, r"Directory\shell\open-in-codex\command"),
-    (winreg.HKEY_CLASSES_ROOT, r"Directory\Background\shell\open-in-codex\command"),
-]
+_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 
 
 def _is_same_or_child(path: Path, parent: Path) -> bool:
@@ -108,31 +98,27 @@ def _copy_destination(target_dir: Path, src: Path) -> Path:
         index += 1
 
 
-def _open_in_codex_command(target_dir: Path) -> str:
-    target = str(target_dir)
-    if winreg is not None:
-        for hive, subkey in _CODEX_REGISTRY_COMMANDS:
-            try:
-                with winreg.OpenKey(hive, subkey) as key:
-                    command, _kind = winreg.QueryValueEx(key, "")
-            except OSError:
-                continue
-            if command:
-                return command.replace("%1", target).replace("%V", target)
-
-    wt = shutil.which("wt.exe") or shutil.which("wt")
-    pwsh = shutil.which("pwsh.exe") or shutil.which("pwsh")
-    if wt and pwsh:
-        return f'"{wt}" -d "{target}" "{pwsh}" -NoExit -Command codex'
-    ps = shutil.which("powershell.exe") or shutil.which("powershell")
-    if ps:
-        target_literal = "'" + target.replace("'", "''") + "'"
-        ps_command = f"Set-Location -LiteralPath {target_literal}; codex"
-        return (
-            f'"{ps}" -NoExit -NoLogo -NoProfile '
-            f'-ExecutionPolicy Bypass -Command "{ps_command}"'
-        )
+def _find_powershell() -> str:
+    for name in ("pwsh.exe", "pwsh", "powershell.exe", "powershell"):
+        found = shutil.which(name)
+        if found:
+            return found
     return ""
+
+
+def _open_in_codex_args(target_dir: Path) -> list[str]:
+    """Build a portable Codex launcher for the current machine.
+
+    Do not reuse the Explorer registry command here: that command often embeds
+    a machine-local PowerShell path, which breaks when this project is copied to
+    another computer.
+    """
+    target = str(target_dir)
+    cmd = shutil.which("cmd.exe") or "cmd.exe"
+    ps = _find_powershell()
+    if ps:
+        return [cmd, "/c", "start", "", "/D", target, ps, "-NoExit", "-NoLogo", "-Command", "codex"]
+    return [cmd, "/c", "start", "", "/D", target, cmd, "/k", "codex"]
 
 
 class _PasteWorker(QThread):
@@ -803,6 +789,7 @@ class FileTree(QWidget):
         # 同时子的磁盘路径也已经随父进了回收站，下面用 exists() + parent() 双重判空跳过。
         items.sort(key=lambda x: len(str(x[0])))
         failed = []
+        affected_parents: set[Path] = set()
         for p, _kind, tree_item in items:
             if not p.exists():
                 continue  # 已经随父一起进回收站了
@@ -817,6 +804,7 @@ class FileTree(QWidget):
             if not ok:
                 failed.append(str(p))
                 continue
+            affected_parents.add(p.parent)
             if tree_item is not None and tree_item.parent() is not None:
                 tree_item.parent().removeChild(tree_item)
             elif tree_item is None:
@@ -824,21 +812,25 @@ class FileTree(QWidget):
                 self._refresh_dir_node(p.parent)
         if failed:
             QMessageBox.warning(self, "部分删除失败", "\n\n".join(failed[:5]))
+        if affected_parents:
+            QTimer.singleShot(400, lambda dirs=list(affected_parents): self._deferred_refresh(dirs))
+        if self.stack.currentWidget() is self.search_list:
+            self._apply_filter(self.filter_input.text())
+
+    def _deferred_refresh(self, dirs: list[Path]) -> None:
+        for d in dirs:
+            self._refresh_dir_node(d)
         if self.stack.currentWidget() is self.search_list:
             self._apply_filter(self.filter_input.text())
 
     def _open_codex(self, target_dir: Path) -> None:
-        """按系统右键菜单 open-in-codex 的注册表命令启动 Codex。"""
-        command = _open_in_codex_command(target_dir)
-        if not command:
-            QMessageBox.warning(
-                self, "未找到 PowerShell",
-                "没有找到系统右键菜单的 Open in Codex 命令，也未找到 PowerShell。",
-            )
-            return
+        """在当前目录打开 Codex，按当前电脑环境动态选择终端。"""
+        command = _open_in_codex_args(target_dir)
         try:
             subprocess.Popen(
                 command,
+                cwd=str(target_dir),
+                creationflags=_NO_WINDOW,
                 close_fds=True,
             )
         except OSError as e:

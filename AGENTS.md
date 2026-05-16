@@ -48,7 +48,7 @@ mini-ide/
 │   ├── git_ops.py             # git 命令封装（status/log/diff/fetch/pull/branch、还原到 @{u}）
 │   ├── port_scanner.py        # psutil 查指定端口占用进程 + kill（必须 QThread 调用）
 │   ├── env_scanner.py         # 扫项目 .env* / application*.yml / bootstrap* 等配置文件
-│   └── git_worker.py          # GitFetchWorker（QThread 包装的静默 fetch）
+│   └── git_worker.py          # GitPullWorker / GitFetchWorker（QThread 包装的网络操作）
 │
 ├── src/ui/                     # Qt UI 组件
 │   ├── theme.py               # 主题 SSoT：颜色/形状/间距/字号 token + apply_theme（自写 QSS，不依赖 qdarkstyle）
@@ -57,13 +57,13 @@ mini-ide/
 │   ├── empty_state.py         # 没开任何项目时的引导页
 │   ├── project_tab.py         # 单项目面板（工具栏 + 左侧 [服务面板?+文件树] + 右侧中心 Tab[日志+模块日志+文件 tab]）
 │   ├── service_panel.py       # 多模块 Spring Boot 的左上侧服务面板（启停 + 状态 + 切日志）
-│   ├── log_widget.py          # 智能日志（批量刷新、ANSI 剥离、错误计数、搜索、端口诊断按钮）
-│   ├── file_tree.py           # 左侧目录树（懒加载 + 全项目搜索 + 新建/重命名/复制粘贴/删除/Codex 右键）
+│   ├── log_widget.py          # 智能日志（批量刷新、ANSI 剥离、堆栈折叠、级别过滤、复制错误给 AI、端口诊断按钮）
+│   ├── file_tree.py           # 左侧目录树（懒加载 + 全项目搜索 + 新建/重命名/删除/Alacritty/JetBrains 右键）
 │   ├── file_preview.py        # FilePreviewPane：tab 内嵌的文件编辑面板（行号、语法高亮、字号、3s 自动保存）
 │   ├── syntax_highlighter.py  # Pygments → QSyntaxHighlighter 适配
 │   ├── quick_open.py          # PickerDialog 基类 + 最近文件 + 命令面板（FramelessDialog + 失焦关闭）
 │   ├── content_search.py      # Ctrl+Shift+F 全项目内容搜索
-│   ├── git_viewer.py          # Git 改动实时查看器；支持复制分支名 / 文件路径 / diff
+│   ├── git_viewer.py          # Git 改动 + 历史查看器；右键支持「↗ 跳转到文件」「↺ 还原到远程版本」
 │   ├── port_dialog.py         # 🔌 端口占用查询对话框（查询 / kill，异步 QThread）
 │   ├── env_panel.py           # 📋 环境/配置文件集中面板（列出 .env*/application*.yml 点开走 FilePreviewPane）
 │   └── settings_panel.py      # 项目信息面板（只读：路径/类型/包管理/主类）；不再常驻，通过命令面板弹窗
@@ -71,7 +71,8 @@ mini-ide/
 └── src/util/
     ├── app_log.py             # 自己的运行日志 + 崩溃捕获 + 主线程卡死 watchdog
     ├── editor.py              # 外部编辑器探测 + 打开文件到指定行（fallback 路径） + search_in_project
-    ├── git_info.py            # 状态栏用的轻量 git 信息（branch/dirty/ahead/behind/changed，缓存 2s + invalidate API）
+    ├── jetbrains.py           # 按项目类型选 JetBrains IDE（IDEA / WebStorm / PyCharm）
+    ├── git_info.py            # 状态栏用的轻量 git 信息（branch/dirty/ahead/behind/changed，缓存 30s + invalidate API）
     └── notify.py              # Windows 系统通知（QSystemTrayIcon.showMessage）
 ```
 
@@ -92,7 +93,7 @@ subprocess.run([...], creationflags=_NO_WINDOW, ...)
 proc.setCreateProcessArgumentsModifier(lambda a: setattr(a, 'flags', a.flags | 0x08000000))
 ```
 
-**违反这条会有黑窗口一闪而过 / Windows Terminal 弹 tab。** Alacritty 这类 GUI 程序 spawn 时也要加（防中间 console 闪烁）。
+**违反这条会有黑窗口一闪而过 / Windows Terminal 弹 tab。** Alacritty / JetBrains 这类 GUI 程序 spawn 时也要加（防中间 console 闪烁）。
 
 ### 2. 子进程环境必须清 mini-ide 自己的 venv
 
@@ -116,7 +117,7 @@ proc.setCreateProcessArgumentsModifier(lambda a: setattr(a, 'flags', a.flags | 0
 - FileIndexer 初次扫描（`_IndexWorker` QThread）
 - 内容搜索（`SearchWorker` QThread + 流式回传）
 - 健康检查（`HealthProbe` QThread）
-- **Git 网络操作**：`GitFetchWorker`（`src/core/git_worker.py`）只做静默 `git fetch`；pull / push / merge / checkout 不在 GUI 里做
+- **Git 网络操作**：`_GitPullWorker` / `_GitFetchWorker`（在 `project_tab.py` 内）—— `git pull` / `git fetch` 都是同步阻塞、可达数十秒
 
 ### 5. 日志批量刷新
 
@@ -134,7 +135,7 @@ proc.setCreateProcessArgumentsModifier(lambda a: setattr(a, 'flags', a.flags | 0
 
 ### 7. 后台 fetch + 静默提示（不弹系统通知）
 
-每个 `ProjectTab` 启动后 8 秒 + 每 5 分钟跑一次 `git fetch`（`GitFetchWorker`），完成后清 `git_info._CACHE` 重读 ahead/behind。`behind > 0` 时**只**把分支按钮染橙（`COLOR_WARN` token）+ 改 tooltip 提示远程有新提交；分支菜单只提供复制分支名，拉取/合并/切分支交给外部 AI / 终端处理。
+每个 `ProjectTab` 启动后 8 秒 + 每 5 分钟跑一次 `git fetch`（`_GitFetchWorker`），完成后清 `git_info._CACHE` 重读 ahead/behind。`behind > 0` 时**只**把分支按钮染橙（`COLOR_WARN` token）+ 改 tooltip 提示"远程有 N 个新提交，点击菜单 → 「⬇ 从远程拉取」"——**不弹系统通知**，不打扰用户。`git pull` 完成后下一次 `_refresh_status_row` 自然把橙色清掉。
 
 **不要加回系统通知**：弹窗会在用户专注写代码时打断，分支按钮染色已经足够显眼。
 
@@ -191,7 +192,7 @@ Spring Cloud 这种"一个父 Gradle 仓库 + N 个 `@SpringBootApplication` 子
 - Python 系：`python` / `python-poetry` / `django` / `fastapi` / `flask`
 - 兜底：`generic`
 
-`project_type` 决定项目图标、默认启动配置、前端 build 按钮等。多模块 Gradle 自动识别 `settings.gradle` 里的 `include`，找带 `@SpringBootApplication` 的模块，默认启用第一个，其他作为备选启动按钮（命令面板里能看到）。
+`project_type` 决定文件树右键菜单里弹哪个 JetBrains IDE（见 `src/util/jetbrains.py`）。多模块 Gradle 自动识别 `settings.gradle` 里的 `include`，找带 `@SpringBootApplication` 的模块，默认启用第一个，其他作为备选启动按钮（命令面板里能看到）。
 
 ## 日志分类（`log_classifier.py`）
 
@@ -213,13 +214,25 @@ Spring Cloud 这种"一个父 Gradle 仓库 + N 个 `@SpringBootApplication` 子
 | Node.js | 🟨 | JS 黄 |
 | Python / Django / FastAPI / Flask | 🐍 | Python = 蛇 |
 
+## JetBrains 集成（`src/util/jetbrains.py`）
+
+文件树右键菜单根据 `project_type` 动态选 IDE：
+
+| 项目类型 | IDE |
+|---|---|
+| vue / react / next / nuxt / svelte / node | **WebStorm** |
+| python / python-poetry / django / fastapi / flask | **PyCharm** |
+| 其他（Java 系、generic、未知） | **IDEA** |
+
+优先在 `G:\Program Files\JetBrains\` 下用 `glob("XXX*")` 找最新版本（兼容版本号变化），找不到 fallback 到 PATH 里的 `idea64` / `webstorm` / `pycharm`（IDEA 安装器叫 `idea64`，WebStorm/PyCharm 的 launcher 不带 64 后缀；见 `jetbrains.py:41,44,47`）。`@lru_cache` 避免每次右键都扫文件系统。
+
 ## 行为规范（用户反馈驱动）
 
 - **默认 `file_open_mode = "preview"`**：点文件树里的文件**永远**在中心 Tab 容器里开一个 `FilePreviewPane`（语法高亮、自动保存、默认编辑模式），不弹"用什么软件打开"；同一文件再次点击只聚焦已有 tab
-- **工具栏极简**：项目 Tab 顶部 toolbar 只有 `[启动 ↔ 停止 切换]` + `[⌘ 命令面板]`；前端项目（vue/react/next/nuxt/svelte/node）且 `package.json` 带 `build` script 时多一个「🔒 打包」按钮。重启 / 编译 / Clean / Git 改动 / 端口查询 / 环境文件 / 项目信息等次级命令**全部**进命令面板（`Ctrl+Shift+P`）；文件树 / 内容搜索 / 打开项目目录这类也全在命令面板里
+- **工具栏极简**：项目 Tab 顶部 toolbar 只有 `[启动 ↔ 停止 切换]` + `[⌘ 命令面板]`；前端项目（vue/react/next/nuxt/svelte/node）且 `package.json` 带 `build` script 时多一个「🔒 打包」按钮。重启 / 编译 / Clean / Git 查看器 / 端口查询 / 环境文件 / 项目信息等次级命令**全部**进命令面板（`Ctrl+Shift+P`）；文件树 / 内容搜索 / 打开目录这类也全在命令面板里
 - **状态栏内容**：`● 状态` `已运行 N` `✓ 启动完成` `🌿 分支 ▾` `📝 N 处改动` —— 端口监听显示已移除（用户认为各项目自定义端口，无需统一显示）
-- **分支按钮**：点击弹下拉菜单，只提供当前分支 / 本地分支 / 远程分支的复制；不做拉取、合并、切分支
-- **改动按钮**：dirty 时橙色，干净时灰色，点击打开实时 `GitViewer`
+- **分支按钮**：点击弹下拉菜单，顶部「⬇ 从远程拉取」+ 本地分支列表 + 远程分支（无同名本地的）。当前分支 `●` 标记并禁用。脏工作区/项目运行中切分支会弹确认
+- **改动按钮**：dirty 时橙色 `#ffb454`，干净时灰色，点击打开 `GitViewer`
 - **首次启动默认最大化**：无 `window_geometry` 记录时 `showMaximized()`；之后按上次状态恢复（最大化也记得）
 - **Ctrl+Shift+N 聚焦左侧过滤框**（不是弹独立窗口）
 - **Ctrl+W**：关闭中心 Tab 里当前的文件 tab（日志 tab 忽略）
@@ -229,14 +242,13 @@ Spring Cloud 这种"一个父 Gradle 仓库 + N 个 `@SpringBootApplication` 子
 ## 文件树右键菜单（按从上到下顺序）
 
 1. ▶ 运行（仅 .bat/.cmd/.ps1/.exe 文件显示，置顶）
-2. 复制 / 剪切 / 粘贴（支持文件和目录；可接收资源管理器复制进来的路径）
-3. ✏ 重命名（文件和目录都支持；根目录不可重命名；目标已存在拒绝；Windows 大小写改名放行）
-4. 📄 新建 Markdown 文件 / 新建文件 / 新建目录（目录上 → 该目录；文件上 → 同级目录）
-5. 在 Alacritty 打开
-6. 在 codex 中打开
-7. 在资源管理器中显示
-8. 复制：文件名 / 不含扩展名 / 绝对路径 / 相对路径
-9. 🗑 删除到回收站（`QFile.moveToTrash`，根目录不可删）
+2. 📄 新建 Markdown 文件 / 新建文件（目录上 → 该目录；文件上 → 同级目录）
+3. 在 Alacritty 打开（可直接 Codex）— `subprocess.Popen alacritty --working-directory <dir>`
+4. 用 IDEA / WebStorm / PyCharm 打开（按项目类型动态切换）
+5. 在资源管理器中显示（目录额外多一项"打开目录"）
+6. 复制：文件名 / 不含扩展名 / 绝对路径 / 相对路径
+7. ✏ 重命名（`Path.rename`，根目录不可重命名；目标已存在拒绝；Windows 大小写改名放行）
+8. 🗑 删除到回收站（`QFile.moveToTrash`，根目录不可删）
 
 刷新时**保留展开状态 + 滚动位置**（`_collect_expanded` / `_apply_expanded`），整树刷新和单节点刷新都用同一套机制。
 
@@ -259,10 +271,10 @@ Spring Cloud 这种"一个父 Gradle 仓库 + N 个 `@SpringBootApplication` 子
 2. **不要**让默认工具栏按钮变多（用户反复要求精简）。当前 toolbar 只有「启动/停止」+「⌘ 命令面板」，前端项目有 build 时多「🔒 打包」；此外已删除过 🌲 文件树开关 / 🔍 文件搜索 / 📁 打开目录 / ⚙ 设置面板开关，都不要加回来
 3. **不要**给 stdout/stderr 日志加 ANSI 颜色（强制 NO_COLOR=1 + client 侧 `_strip_ansi` 双保险）
 4. **不要**在 ProjectTab 构造里同步扫文件（FileIndexer 是 async 的 QThread）
-5. **不要**在 `git fetch` 上偷懒走主线程（必须 QThread，否则点一下卡几秒）；不要把 pull / push / merge / checkout 重新做成 GUI 按钮
+5. **不要**在 `git pull` / `git fetch` 上偷懒走主线程（必须 QThread，否则点一下卡几秒）
 6. **不要**给 `FramelessWindowHint` 的 dialog 用 `show()` 后不主动 `activateWindow()`（Windows 上拿不到键盘焦点，ESC 关不掉）—— `quick_open.PickerDialog` 用 `showEvent` 抢焦点 + `changeEvent` 失焦自动关
 7. 改 config 字段：**新增**加 default、**删除**靠 `load()` 里 `dataclass.fields()` 过滤未知 key（见硬约束 6）
-8. **不要**重新加上"发到 AI / Codex"按钮：用户已明确放弃这个方向。AI 协作走外部 Codex（用户自己在终端开），mini-ide 不主动推送也不暴露 MCP / HTTP 接口。只保留复制分支名 / 路径 / diff / 当前异常这类剪贴板辅助能力
+8. **不要**重新加上"发到 AI / Codex"按钮：用户已明确放弃这个方向。AI 协作走外部 Codex（用户自己在终端开），mini-ide 不主动推送也不暴露 MCP / HTTP 接口。日志栏「📋 复制错误给 AI」是剪贴板操作，不算"推送"
 9. **不要**做链路追踪 / APM / 服务网格 / 配置中心可视化等"全功能 IDE"功能：定位是指挥台，不是 IDEA 替代品。功能完整度是无底洞，要拼的是 AI 时代下的差异化体验
 10. **不要**重新引入 MCP / HTTP server：当前 mini-ide 启动后**不监听任何端口**。如果以后真要做"AI 看运行时"，先选定方案再加
 11. **不要**把 `FilePreviewPane` 改回 `QDialog` 弹窗形式。文件预览走中心 Tab 容器内嵌（同文件去重聚焦、Ctrl+W 关、关 tab 前自动 flush_save），用户要的是 IDE 风格而非到处弹窗

@@ -4,7 +4,7 @@
 '   wscript mini-ide.vbs "C:\path\to\project"
 Option Explicit
 
-Dim shell, fso, here, args, extra, i
+Dim shell, fso, here, args, extra, i, pythonw, entry, cmd
 Set shell = CreateObject("WScript.Shell")
 Set fso = CreateObject("Scripting.FileSystemObject")
 here = fso.GetParentFolderName(WScript.ScriptFullName)
@@ -17,4 +17,13 @@ For i = 0 To args.Count - 1
 Next
 
 shell.CurrentDirectory = here
-shell.Run ".venv\Scripts\mini-ide.exe main.py" & extra, 0, False
+pythonw = fso.BuildPath(here, ".venv\Scripts\pythonw.exe")
+entry = fso.BuildPath(here, "main.py")
+
+If Not fso.FileExists(pythonw) Then
+    MsgBox "Cannot find Python launcher: " & pythonw, vbCritical, "mini-ide"
+    WScript.Quit 1
+End If
+
+cmd = """" & pythonw & """ """ & entry & """" & extra
+shell.Run cmd, 0, False
