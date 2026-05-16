@@ -11,70 +11,70 @@
 - **watchdog**（FileIndexer 增量更新）
 - **sqlparse**（日志里的 Hibernate SQL 美化）
 
-打包用 PyInstaller（不在 pyproject.toml 依赖里，按需手动 `pip install pyinstaller` 即可，避免污染运行依赖）。`scripts/make_icon.py` 用 Pillow 生成图标，作为 dev 依赖。
+打包用 PyInstaller（不在 pyproject.toml 依赖里，按需手动 `pip install pyinstaller` 即可，避免污染运行依赖）。`_build/scripts/make_icon.py` 用 Pillow 生成图标，作为 dev 依赖。
 
 Poetry 管理依赖。Python 版本范围 `>=3.11,<3.14`。
 
-主题（Tokyo Night 风格）由 `src/ui/theme.py` 自写，**不依赖 qdarkstyle**（上游 QSS 用 `background-color` 长写覆盖简写规则，调主题反复出诡异 bug）。颜色 / 圆角 / 间距全部走 token，违反者冒烟会挂（见硬约束 15）。
+主题（Tokyo Night 风格）由 `_build/src/ui/theme.py` 自写，**不依赖 qdarkstyle**（上游 QSS 用 `background-color` 长写覆盖简写规则，调主题反复出诡异 bug）。颜色 / 圆角 / 间距全部走 token，违反者冒烟会挂（见硬约束 15）。
 
 ## 启动方式
 
 | 场景 | 命令 |
 |---|---|
-| 开发 | `run.bat`（保留 cmd 窗口看启动日志） |
-| 日常使用 | 双击 `mini-ide.vbs`（静默启动，无黑框） |
-| 带初始项目启动 | `mini-ide.vbs "D:\path\to\project"` 或 `python main.py <path>` —— 窗口起来后自动打开该项目 |
-| 冒烟测试 | `poetry run python scripts/_smoke.py`（28 个模块 import + 全项目 hex 颜色硬扫描） |
+| 开发（保留 cmd 窗口看启动日志） | `_build\scripts\run.bat` |
+| 日常使用（静默启动，无黑框） | 双击 `_build\scripts\mini-ide.vbs` |
+| 打包后使用 | 双击根目录 `mini-ide.exe`（生产推荐） |
+| 带初始项目启动 | `_build\scripts\mini-ide.vbs "D:\path\to\project"` 或 `python _build\main.py <path>` |
+| 一键打包成 exe | 双击 `_build\scripts\build.bat` —— 自动建 venv、装依赖（清华镜像）、调 PyInstaller，产物输出到根目录 `mini-ide.exe` |
+| 冒烟测试 | `cd _build && poetry run python scripts/_smoke.py`（28 个模块 import + 全项目 hex 颜色硬扫描） |
 
 **单实例**：已有 mini-ide 在跑时，再次启动不会开第二个窗口——新进程通过 `QLocalServer` 把 `sys.argv[1]` 转发给老实例后立刻退出；老实例 `activate_and_open()` 把自己拉到前台并打开该路径。适合配合资源管理器右键菜单「用 mini-ide 打开」之类的外部入口。
 
 ## 目录结构
 
+仓库根目录尽量保持干净——只放打包产物 + 给 AI 看的文档；所有源码与构建中间产物全部归并到 `_build/` 子目录。
+
 ```
 mini-ide/
-├── main.py                     # 入口：单实例检查 + QApplication → MainWindow；可接 sys.argv[1] 作初始项目路径
-├── mini-ide.vbs                # Windows 无黑框启动脚本（支持透传路径参数）
-├── run.bat                     # 开发用：保留 cmd 窗口看实时日志
-├── scripts/
-│   ├── _smoke.py              # 导入冒烟测试（28 个模块）+ 全项目 hex 颜色硬扫描
-│   └── make_icon.py           # 用 Pillow 生成 .ico 图标（dev 依赖才用得到）
+├── mini-ide.exe                # 打包产物（根目录唯一可见 exe，git 不入库）
+├── AGENTS.md                   # 本文件，给 AI 协作看的项目说明
+├── CLAUDE.md                   # 给 Claude 看的项目说明（指向 AGENTS.md）
 │
-├── src/core/                   # 无 Qt 依赖的纯逻辑层
-│   ├── config.py              # AppConfig（%APPDATA%/mini-ide/config.json 持久化）
-│   ├── project_detector.py    # 项目类型识别 → RunProfile 列表 + Spring Boot 多模块列表
-│   ├── process_runner.py      # QProcess 封装 + 端口扫描 + env 清洗
-│   ├── log_classifier.py      # 日志行分类（error/warn/stack/sql/spring boot 阶段 + 端口占用诊断）
-│   ├── file_index.py          # 后台扫描项目文件 + watchdog 增量更新
-│   ├── git_ops.py             # git 命令封装（status/log/diff/fetch/pull/branch、还原到 @{u}）
-│   ├── port_scanner.py        # psutil 查指定端口占用进程 + kill（必须 QThread 调用）
-│   ├── env_scanner.py         # 扫项目 .env* / application*.yml / bootstrap* 等配置文件
-│   └── git_worker.py          # GitPullWorker / GitFetchWorker（QThread 包装的网络操作）
-│
-├── src/ui/                     # Qt UI 组件
-│   ├── theme.py               # 主题 SSoT：颜色/形状/间距/字号 token + apply_theme（自写 QSS，不依赖 qdarkstyle）
-│   ├── main_window.py         # 主窗口（菜单、Tab 容器、Tab 会话恢复、首次最大化、单实例 IPC 响应）
-│   ├── styles.py              # 兼容外壳：from src.ui.theme import *（旧 import 不会立刻断）
-│   ├── empty_state.py         # 没开任何项目时的引导页
-│   ├── project_tab.py         # 单项目面板（工具栏 + 左侧 [服务面板?+文件树] + 右侧中心 Tab[日志+模块日志+文件 tab]）
-│   ├── service_panel.py       # 多模块 Spring Boot 的左上侧服务面板（启停 + 状态 + 切日志）
-│   ├── log_widget.py          # 智能日志（批量刷新、ANSI 剥离、堆栈折叠、级别过滤、复制错误给 AI、端口诊断按钮）
-│   ├── file_tree.py           # 左侧目录树（懒加载 + 全项目搜索 + 新建/重命名/删除/Alacritty/JetBrains 右键）
-│   ├── file_preview.py        # FilePreviewPane：tab 内嵌的文件编辑面板（行号、语法高亮、字号、3s 自动保存）
-│   ├── syntax_highlighter.py  # Pygments → QSyntaxHighlighter 适配
-│   ├── quick_open.py          # PickerDialog 基类 + 最近文件 + 命令面板（FramelessDialog + 失焦关闭）
-│   ├── content_search.py      # Ctrl+Shift+F 全项目内容搜索
-│   ├── git_viewer.py          # Git 改动 + 历史查看器；右键支持「↗ 跳转到文件」「↺ 还原到远程版本」
-│   ├── port_dialog.py         # 🔌 端口占用查询对话框（查询 / kill，异步 QThread）
-│   ├── env_panel.py           # 📋 环境/配置文件集中面板（列出 .env*/application*.yml 点开走 FilePreviewPane）
-│   └── settings_panel.py      # 项目信息面板（只读：路径/类型/包管理/主类）；不再常驻，通过命令面板弹窗
-│
-└── src/util/
-    ├── app_log.py             # 自己的运行日志 + 崩溃捕获 + 主线程卡死 watchdog
-    ├── editor.py              # 外部编辑器探测 + 打开文件到指定行（fallback 路径） + search_in_project
-    ├── jetbrains.py           # 按项目类型选 JetBrains IDE（IDEA / WebStorm / PyCharm）
-    ├── git_info.py            # 状态栏用的轻量 git 信息（branch/dirty/ahead/behind/changed，缓存 30s + invalidate API）
-    └── notify.py              # Windows 系统通知（QSystemTrayIcon.showMessage）
+└── _build/                     # 所有源码 + 构建相关都放这里
+    ├── main.py                 # 入口：单实例检查 + QApplication → MainWindow；可接 sys.argv[1] 作初始项目路径
+    ├── pyproject.toml          # Poetry 依赖声明（Python >=3.11,<3.14）
+    ├── poetry.lock
+    ├── .venv/                  # 虚拟环境（git 忽略；build.bat 自动创建）
+    ├── pyinstaller-work/       # PyInstaller 工作目录（git 忽略）
+    ├── mini-ide.spec           # PyInstaller 生成（git 忽略）
+    │
+    ├── scripts/
+    │   ├── build.bat           # 一键打包脚本：自包含，自动建 venv + 装依赖（清华镜像） + 出 exe（输出到根目录）
+    │   ├── run.bat             # 开发用：保留 cmd 窗口看实时日志
+    │   ├── mini-ide.vbs        # Windows 无黑框启动脚本（支持透传路径参数）
+    │   ├── stop.vbs            # 用 taskkill /T 级联杀 mini-ide.exe 及其子进程
+    │   ├── _smoke.py           # 导入冒烟测试（28 个模块）+ 全项目 hex 颜色硬扫描
+    │   └── make_icon.py        # 用 Pillow 生成 .ico 图标（dev 依赖才用得到）
+    │
+    ├── src/core/               # 无 Qt 依赖的纯逻辑层
+    │   ├── config.py           # AppConfig（%APPDATA%/mini-ide/config.json 持久化）
+    │   ├── project_detector.py # 项目类型识别 → RunProfile 列表 + Spring Boot 多模块列表
+    │   ├── process_runner.py   # QProcess 封装 + 端口扫描 + env 清洗
+    │   ├── log_classifier.py   # 日志行分类（error/warn/stack/sql/spring boot 阶段 + 端口占用诊断）
+    │   ├── file_index.py       # 后台扫描项目文件 + watchdog 增量更新
+    │   ├── git_ops.py           # git 命令封装（status/log/diff/fetch/pull/branch、还原到 @{u}）
+    │   ├── port_scanner.py     # psutil 查指定端口占用进程 + kill（必须 QThread 调用）
+    │   ├── env_scanner.py      # 扫项目 .env* / application*.yml / bootstrap* 等配置文件
+    │   └── git_worker.py       # GitPullWorker / GitFetchWorker（QThread 包装的网络操作）
+    │
+    ├── src/ui/                 # Qt UI 组件（结构同前）
+    ├── src/util/               # 工具层（结构同前）
+    └── src/resources/          # 图标等资源（icon.ico / icon.png）
 ```
+
+**为什么把所有东西塞进 `_build/`**：用户希望仓库根目录干净，资源管理器一眼只见 `mini-ide.exe`。源码、依赖、构建中间产物全归并到一个子目录里，配合 `.gitignore` 和 dot 开头隐藏目录，根目录默认视图只剩 exe + 两个 md 文档。`_build/` 这个名字模仿 `D:\me\project\tools\clipnote` 的约定。
+
+`src/ui/` 和 `src/util/` 详细成员见 git ls-files——为避免文档与代码漂移，不再在此罗列。改代码时直接看目录树。
 
 ## 关键设计 / 硬约束（改代码前必读）
 
@@ -143,11 +143,11 @@ proc.setCreateProcessArgumentsModifier(lambda a: setattr(a, 'flags', a.flags | 0
 
 `FilePreviewPane`（tab 内嵌面板，不是对话框）每次 `textChanged` 重启 3 秒 `_autosave_timer`（debounce）。`_autosave` 用临时文件 + rename 原子替换，**失败不弹框**只在状态条（`lbl_status`）显示"自动保存失败"。外层（`ProjectTab._on_tab_close_requested` 关 tab、`request_close` 关项目）必须调 `pane.flush_save()`——它会停掉 pending 定时器并立刻触发一次落盘。`Ctrl+S` 仍可手动立即保存。**没有保存按钮**（已被自动保存替代），也**没有"编辑/预览"模式切换**（默认就是编辑），只有二进制 / >2MB / 读取失败时切只读。
 
-### 9. 单实例 + IPC 转发（`main.py`）
+### 9. 单实例 + IPC 转发（`_build/main.py`）
 
 mini-ide 只允许一个进程运行。启动流程：
 
-1. `main.py` 先用 `QLocalSocket` 尝试连 `SERVER_NAME = "mini-ide-single-instance"`
+1. `_build/main.py` 先用 `QLocalSocket` 尝试连 `SERVER_NAME = "mini-ide-single-instance"`
 2. **连上了**（说明已有实例在跑）→ 把 `sys.argv[1]`（命令行传入的项目路径，可能为空）写过去 → **立刻退出本进程**
 3. **连不上** → 本进程是第一个，正常建 `MainWindow` + `QLocalServer.listen(SERVER_NAME)` 接后续连接
 4. `MainWindow.__init__` 在 `_startup_finalize` 里**先恢复会话，再打开 pending 初始项目**——顺序不能换（否则初始项目会被会话覆盖到不显眼位置）
@@ -192,7 +192,7 @@ Spring Cloud 这种"一个父 Gradle 仓库 + N 个 `@SpringBootApplication` 子
 - Python 系：`python` / `python-poetry` / `django` / `fastapi` / `flask`
 - 兜底：`generic`
 
-`project_type` 决定文件树右键菜单里弹哪个 JetBrains IDE（见 `src/util/jetbrains.py`）。多模块 Gradle 自动识别 `settings.gradle` 里的 `include`，找带 `@SpringBootApplication` 的模块，默认启用第一个，其他作为备选启动按钮（命令面板里能看到）。
+`project_type` 决定文件树右键菜单里弹哪个 JetBrains IDE（见 `_build/src/util/jetbrains.py`）。多模块 Gradle 自动识别 `settings.gradle` 里的 `include`，找带 `@SpringBootApplication` 的模块，默认启用第一个，其他作为备选启动按钮（命令面板里能看到）。
 
 ## 日志分类（`log_classifier.py`）
 
@@ -214,7 +214,7 @@ Spring Cloud 这种"一个父 Gradle 仓库 + N 个 `@SpringBootApplication` 子
 | Node.js | 🟨 | JS 黄 |
 | Python / Django / FastAPI / Flask | 🐍 | Python = 蛇 |
 
-## JetBrains 集成（`src/util/jetbrains.py`）
+## JetBrains 集成（`_build/src/util/jetbrains.py`）
 
 文件树右键菜单根据 `project_type` 动态选 IDE：
 
@@ -282,7 +282,7 @@ Spring Cloud 这种"一个父 Gradle 仓库 + N 个 `@SpringBootApplication` 子
 13. **不要**重新引入 Workspace / 跨项目编排概念：典型的过度抽象。多服务并行启动的需求已由"多模块 Spring Boot → ProjectTab 内部的 ServicePanel + 多 runner"满足（见硬约束 11）；跨项目场景用户自己开多个顶级 tab 就够。未来再冒出"统一管理 N 个不同目录项目"的需求，也**不要**用"容器/集合/工作区"这种抽象概念去包它
 14. **关窗口必须显式 `QApplication.quit()`**：`notify.py` 第一次 `QSystemTrayIcon.show()` 后 tray 成为持久 UI 引用，Qt 不会因 MainWindow 关闭自动退出事件循环——进程变成 pythonw.exe 僵尸留在后台，单实例 IPC 检测到僵尸后又把新启动转发给它，表现成"代码改了没生效"。`MainWindow.closeEvent` 末尾必须 `QApplication.quit()`，不要删这行
 
-15. **禁止 hardcode 任何颜色 / 圆角 / 间距 / 字号**——必须从 `src/ui/theme.py` 的 token 拿。
+15. **禁止 hardcode 任何颜色 / 圆角 / 间距 / 字号**——必须从 `_build/src/ui/theme.py` 的 token 拿。
 
    `theme.py` 是主题 SSoT（Single Source of Truth），定义了：
    - 颜色：`BG_L0..L5` / `BG_CODE` / `BG_DIAGNOSIS`、`FG_PRIMARY` / `FG_SECONDARY` / `FG_DIM` / `FG_BRIGHT`、`ACCENT*`、`COLOR_SUCCESS/WARN/ERROR/INFO/SQL/BANNER/LINK/DEBUG`、`DOT_*`、`GIT_*`、`BG_BTN_*`
@@ -291,7 +291,7 @@ Spring Cloud 这种"一个父 Gradle 仓库 + N 个 `@SpringBootApplication` 子
    - QSS 入口：`apply_theme(app)` —— 全自写 base QSS，不再依赖 qdarkstyle
 
    写 widget QSS 必须用 f-string 把 token 拼进去：`f"color:{FG_SECONDARY};"`。
-   `scripts/_smoke.py` 会扫描 `src/` 下所有 .py，命中 `#[0-9a-fA-F]{6}` 字面量就让冒烟挂掉
+   `_build/scripts/_smoke.py` 会扫描 `_build/src/` 下所有 .py，命中 `#[0-9a-fA-F]{6}` 字面量就让冒烟挂掉
    （白名单：`theme.py` / `styles.py`（兼容外壳）/ `syntax_highlighter.py`（Pygments 代码色板，语义独立））。
 
    想改主题就改 `theme.py` 一个文件。**绝对不要**在 widget 里写 hex——hardcode 散落各处会反复出"改了没生效""一处一种灰"的 bug。
@@ -299,8 +299,8 @@ Spring Cloud 这种"一个父 Gradle 仓库 + N 个 `@SpringBootApplication` 子
 ## 修 bug 流程
 
 1. 打开 `%APPDATA%\mini-ide\logs\mini-ide-YYYYMMDD.log` 看启动 / 进程 / 崩溃记录（崩溃栈完整）
-2. `poetry run python scripts/_smoke.py` 跑一遍：① 28/28 模块 import 通过 ② 0 hex hits（违反硬约束 15 会列出文件:行号）
-3. 改完用 `run.bat` 启动，看控制台输出实时日志
+2. `cd _build && poetry run python scripts/_smoke.py` 跑一遍：① 28/28 模块 import 通过 ② 0 hex hits（违反硬约束 15 会列出文件:行号）
+3. 改完用 `_build\scripts\run.bat` 启动，看控制台输出实时日志
 4. 打开 `G:\whaty\project\race\server`（多模块 Spring Boot）测 Java 路径
 5. 打开 `G:\whaty\project\race\webapp` 测 Vue 路径
 6. 打开 `G:\whaty\project\race\py-prediction` 测 Python / Poetry 路径
