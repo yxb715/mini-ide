@@ -18,23 +18,27 @@
 """
 from __future__ import annotations
 
+import math
 import time
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QFileSystemWatcher, QRect, QSize, QTimer, Signal
+from PySide6.QtCore import (
+    Qt, QBuffer, QByteArray, QFileSystemWatcher, QIODevice, QRect, QSize, QTimer,
+    Signal,
+)
 from PySide6.QtGui import (
-    QAction, QColor, QFont, QKeySequence, QPainter, QTextCursor, QTextDocument,
-    QTextFormat,
+    QAction, QColor, QFont, QImageReader, QKeySequence, QMovie, QPainter, QPixmap,
+    QTextCursor, QTextDocument, QTextFormat,
 )
 from PySide6.QtWidgets import (
     QCheckBox, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPlainTextEdit,
-    QPushButton, QTextEdit, QToolButton, QVBoxLayout, QWidget,
+    QPushButton, QScrollArea, QTextEdit, QToolButton, QVBoxLayout, QWidget,
 )
 
 from src.ui.syntax_highlighter import PygmentsHighlighter, get_lexer_for
 from src.ui.theme import (
-    BG_L2, BG_L4, COLOR_ERROR, COLOR_SUCCESS, COLOR_WARN,
-    FG_DIM, FG_SECONDARY, apply_search_style,
+    BG_CODE, BG_L2, BG_L4, BORDER_SUBTLE, COLOR_ERROR, COLOR_SUCCESS, COLOR_WARN,
+    FG_DIM, FG_SECONDARY, RADIUS_SM, apply_search_style,
 )
 from src.util import app_log
 from src.util.editor import open_in_editor, reveal_in_explorer
@@ -45,8 +49,11 @@ _MAX_READ_BYTES = 2 * 1024 * 1024   # 2MB 以上只读头部
 _AUTOSAVE_DELAY_MS = 3000
 _EXTRELOAD_DEBOUNCE_MS = 200   # 外部修改 debounce：避免 VSCode "删除-重命名" 写盘瞬间读到空文件
 _FONT_PT = 13   # 固定字号；用户反馈"调了不生效"反复出 bug，砍掉调节功能
+_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".jfif", ".gif", ".bmp", ".ico", ".webp",
+               ".svg", ".svgz", ".tif", ".tiff", ".tga", ".cur", ".xbm", ".xpm",
+               ".pbm", ".pgm", ".ppm"}
+_MOVIE_EXTS = {".gif", ".webp"}
 _BINARY_EXTS = {".class", ".jar", ".war", ".zip", ".7z", ".tar", ".gz",
-                ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".webp",
                 ".pdf", ".doc", ".docx", ".xls", ".xlsx",
                 ".so", ".dll", ".exe", ".dylib", ".bin"}
 # 文本类文件按窗口宽度软换行（行号不变，视觉折行跟随 viewport）；
@@ -102,6 +109,57 @@ def _line_comment_prefix(path: str) -> str | None:
     if name in _LINE_COMMENT_BY_NAME:
         return _LINE_COMMENT_BY_NAME[name]
     return _LINE_COMMENT_BY_EXT.get(p.suffix.lower())
+
+
+def _image_format_for(path: Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix in _IMAGE_EXTS:
+        return suffix.lstrip(".")
+    try:
+        fmt = QImageReader.imageFormat(str(path))
+    except RuntimeError:
+        return ""
+    if not fmt:
+        return ""
+    return bytes(fmt).decode("ascii", errors="ignore").lower()
+
+
+def _device_independent_size(size: QSize, dpr: float) -> QSize:
+    if dpr <= 1.0:
+        return size
+    return QSize(
+        max(1, math.ceil(size.width() / dpr)),
+        max(1, math.ceil(size.height() / dpr)),
+    )
+
+
+def _load_pil_image(path: Path):
+    try:
+        from PIL import Image, ImageOps
+    except ImportError:
+        return None
+    try:
+        with Image.open(path) as img:
+            return ImageOps.exif_transpose(img).convert("RGBA")
+    except OSError:
+        return None
+
+
+def _scale_with_pillow(source, target_size: QSize) -> QPixmap:
+    if source is None or not target_size.isValid() or target_size.isEmpty():
+        return QPixmap()
+    try:
+        from PIL import Image, ImageFilter
+        from PIL.ImageQt import ImageQt
+
+        resized = source.resize(
+            (target_size.width(), target_size.height()),
+            Image.Resampling.LANCZOS,
+        )
+        resized = resized.filter(ImageFilter.UnsharpMask(radius=0.6, percent=160, threshold=2))
+        return QPixmap.fromImage(ImageQt(resized))
+    except Exception:
+        return QPixmap()
 
 
 class LineNumberArea(QWidget):
@@ -323,6 +381,15 @@ class FilePreviewPane(QWidget):
         self._dirty = False
         self._read_only = False
         self._highlighter: PygmentsHighlighter | None = None
+        self._image_scroll: QScrollArea | None = None
+        self._image_label: QLabel | None = None
+        self._image_pixmap: QPixmap | None = None
+        self._image_movie: QMovie | None = None
+        self._image_movie_data: QByteArray | None = None
+        self._image_movie_buffer: QBuffer | None = None
+        self._image_pil = None
+        self._image_scaled_cache: tuple[tuple[int, int, float], QPixmap] | None = None
+        self._image_source_size = QSize()
 
         root = QVBoxLayout(self)
         root.setContentsMargins(6, 6, 6, 6)
@@ -353,7 +420,9 @@ class FilePreviewPane(QWidget):
         root.addLayout(top)
 
         # 搜索栏
-        search_row = QHBoxLayout()
+        self.search_widget = QWidget()
+        search_row = QHBoxLayout(self.search_widget)
+        search_row.setContentsMargins(0, 0, 0, 0)
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("搜索（Ctrl+F）")
         apply_search_style(self.search_input)
@@ -369,7 +438,7 @@ class FilePreviewPane(QWidget):
         btn_prev = QToolButton(); btn_prev.setText("↑"); btn_prev.clicked.connect(self._find_prev)
         btn_next = QToolButton(); btn_next.setText("↓"); btn_next.clicked.connect(self._find_next)
         search_row.addWidget(btn_prev); search_row.addWidget(btn_next)
-        root.addLayout(search_row)
+        root.addWidget(self.search_widget)
 
         # 编辑器
         self.view = CodeView()
@@ -438,6 +507,10 @@ class FilePreviewPane(QWidget):
             self._not_found = True
             self._set_readonly_reason(f"(文件不存在) {self.path}", f"文件不存在\n\n{self.path}")
             return
+        image_format = _image_format_for(p)
+        if image_format:
+            self._load_image(p, image_format)
+            return
         if p.suffix.lower() in _BINARY_EXTS:
             self._binary = True
             self._set_readonly_reason(
@@ -483,6 +556,150 @@ class FilePreviewPane(QWidget):
         if not self._not_found and not self._binary:
             if self.path not in self._watcher.files():
                 self._watcher.addPath(self.path)
+
+    def _load_image(self, p: Path, image_format: str) -> None:
+        self._binary = True
+
+        size = p.stat().st_size
+        reader = QImageReader(str(p))
+        reader.setAutoTransform(True)
+        source_size = reader.size()
+        if source_size.isValid():
+            self._image_source_size = source_size
+
+        self.lbl_path.setText(f"{self._display_path()}  ({_human_size(size)})")
+
+        if p.suffix.lower() in _MOVIE_EXTS:
+            try:
+                movie = self._make_movie_from_memory(p, image_format)
+            except OSError as e:
+                movie = QMovie(self)
+                log.warning("动图读取失败: %s | %s", self.path, e)
+            if movie.isValid():
+                self._read_only = True
+                self.search_widget.setVisible(False)
+                self.view.setVisible(False)
+                self._build_image_area()
+                self._image_movie = movie
+                self._image_label.setMovie(movie)
+                movie.start()
+                if self._image_source_size.isEmpty():
+                    self._image_source_size = movie.currentImage().size()
+                self._set_image_status("动图预览", image_format)
+                QTimer.singleShot(0, self._fit_image_to_view)
+                return
+            self._image_movie_buffer = None
+            self._image_movie_data = None
+
+        image = reader.read()
+        if image.isNull():
+            self._set_readonly_reason(
+                f"图片预览失败：{reader.errorString()}",
+                f"(图片预览失败)\n\n{p.name}\n{reader.errorString()}",
+            )
+            log.warning("图片预览失败: %s | %s", self.path, reader.errorString())
+            return
+
+        self._read_only = True
+        self.search_widget.setVisible(False)
+        self.view.setVisible(False)
+        self._build_image_area()
+        self._image_pixmap = QPixmap.fromImage(image)
+        self._image_source_size = self._image_pixmap.size()
+        self._image_pil = _load_pil_image(p)
+        self._set_image_status("图片预览", image_format)
+        QTimer.singleShot(0, self._fit_image_to_view)
+
+    def _make_movie_from_memory(self, p: Path, image_format: str) -> QMovie:
+        self._image_movie_data = QByteArray(p.read_bytes())
+        self._image_movie_buffer = QBuffer(self)
+        self._image_movie_buffer.setData(self._image_movie_data)
+        self._image_movie_buffer.open(QIODevice.OpenModeFlag.ReadOnly)
+        return QMovie(self._image_movie_buffer, image_format.encode("ascii"), self)
+
+    def _build_image_area(self) -> None:
+        self._image_label = QLabel()
+        self._image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._image_label.setStyleSheet(f"background:{BG_CODE}; color:{FG_SECONDARY};")
+
+        self._image_scroll = QScrollArea()
+        self._image_scroll.setWidgetResizable(False)
+        self._image_scroll.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._image_scroll.setWidget(self._image_label)
+        self._image_scroll.setStyleSheet(
+            f"QScrollArea {{ background:{BG_CODE}; border:1px solid {BORDER_SUBTLE}; "
+            f"border-radius:{RADIUS_SM}px; }}"
+        )
+        self.layout().addWidget(self._image_scroll, 1)
+
+    def _set_image_status(self, prefix: str, image_format: str) -> None:
+        if self._image_source_size.isValid() and not self._image_source_size.isEmpty():
+            detail = f"{self._image_source_size.width()}x{self._image_source_size.height()}"
+            self.lbl_status.setText(f"{prefix} {detail} {image_format.upper()}")
+        else:
+            self.lbl_status.setText(f"{prefix} {image_format.upper()}")
+        self.lbl_status.setStyleSheet(f"color:{FG_SECONDARY}; padding:0 8px;")
+
+    def _fit_image_to_view(self) -> None:
+        if self._image_label is None or self._image_scroll is None:
+            return
+        if not self._image_source_size.isValid() or self._image_source_size.isEmpty():
+            return
+
+        dpr = self._image_device_pixel_ratio()
+        viewport = self._image_scroll.viewport().size()
+        if not viewport.isValid() or viewport.isEmpty():
+            return
+
+        max_physical = QSize(
+            max(1, math.floor(viewport.width() * dpr)),
+            max(1, math.floor(viewport.height() * dpr)),
+        )
+        target_physical = self._image_source_size.scaled(
+            max_physical, Qt.AspectRatioMode.KeepAspectRatio
+        )
+        if self._image_pixmap is not None:
+            display_pixmap = self._scaled_preview_pixmap(target_physical, dpr)
+            display_pixmap.setDevicePixelRatio(dpr)
+            self._image_label.setPixmap(display_pixmap)
+            self._image_label.setFixedSize(_device_independent_size(display_pixmap.size(), dpr))
+            return
+        if self._image_movie is not None and self._image_source_size.isValid():
+            target_logical = _device_independent_size(target_physical, dpr)
+            if self._image_movie.scaledSize() != target_logical:
+                self._image_movie.setScaledSize(target_logical)
+            self._image_label.setFixedSize(target_logical)
+
+    def _image_device_pixel_ratio(self) -> float:
+        handle = self.window().windowHandle() if self.window() else None
+        screen = handle.screen() if handle is not None else self.screen()
+        if screen is not None:
+            return max(1.0, float(screen.devicePixelRatio()))
+        return max(1.0, float(self.devicePixelRatioF()))
+
+    def _scaled_preview_pixmap(self, target_physical: QSize, dpr: float) -> QPixmap:
+        if self._image_pixmap is None:
+            return QPixmap()
+        if target_physical == self._image_pixmap.size():
+            return QPixmap(self._image_pixmap)
+
+        key = (target_physical.width(), target_physical.height(), dpr)
+        if self._image_scaled_cache is not None and self._image_scaled_cache[0] == key:
+            return QPixmap(self._image_scaled_cache[1])
+
+        pixmap = _scale_with_pillow(self._image_pil, target_physical)
+        if pixmap.isNull():
+            pixmap = self._image_pixmap.scaled(
+                target_physical,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        self._image_scaled_cache = (key, QPixmap(pixmap))
+        return pixmap
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._fit_image_to_view()
 
     def _set_readonly_reason(self, reason: str, body_text: str | None) -> None:
         self._read_only = True

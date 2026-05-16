@@ -86,6 +86,32 @@ def get_file_diff(cwd: str, path: str, staged: bool = False) -> str:
     return out
 
 
+def diff_numstat(cwd: str) -> dict[str, tuple[int, int]]:
+    """返回 {path: (additions, deletions)}，合并 staged + unstaged。"""
+    result: dict[str, tuple[int, int]] = {}
+    for extra in ([], ["--staged"]):
+        rc, out, _ = _run(["diff", "--numstat"] + extra, cwd, timeout=10)
+        if rc != 0:
+            continue
+        for ln in out.splitlines():
+            parts = ln.split("\t", 2)
+            if len(parts) < 3:
+                continue
+            add_s, del_s, path = parts
+            if add_s == "-":
+                continue
+            try:
+                adds, dels = int(add_s), int(del_s)
+            except ValueError:
+                continue
+            if path in result:
+                old = result[path]
+                result[path] = (old[0] + adds, old[1] + dels)
+            else:
+                result[path] = (adds, dels)
+    return result
+
+
 def get_untracked_preview(cwd: str, path: str, max_lines: int = 200) -> str:
     """对未跟踪的新文件展示「全部添加」的伪 diff，方便看"""
     p = Path(cwd) / path
@@ -157,3 +183,69 @@ def has_upstream(cwd: str) -> bool:
     """当前分支是否配置了上游（@{u}）—— 没有上游 pull 会失败，菜单上用它来灰化按钮"""
     rc, _, _ = _run(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"], cwd, timeout=3)
     return rc == 0
+
+
+def is_dirty(cwd: str) -> bool:
+    rc, out, _ = _run(["status", "--porcelain"], cwd, timeout=5)
+    return rc == 0 and bool(out.strip())
+
+
+def git_checkout(cwd: str, branch: str) -> tuple[bool, str]:
+    """切换分支。返回 (成功, 错误信息)。"""
+    rc, out, err = _run(["checkout", branch], cwd, timeout=30)
+    if rc == 0:
+        return True, ""
+    return False, (err or out).strip()
+
+
+def git_merge_remote_branch(cwd: str, remote_branch: str) -> tuple[bool, str]:
+    """fetch + merge 远程分支到当前分支 + push。返回 (成功, 结果信息)。
+    remote_branch 格式如 'origin/main'。
+    """
+    # fetch
+    rc, _, err = _run(["fetch", "--quiet", "--all"], cwd, timeout=60)
+    if rc != 0:
+        return False, f"fetch 失败：{err.strip()}"
+
+    # 记录 merge 前的 HEAD，用于统计变更
+    _, head_before, _ = _run(["rev-parse", "HEAD"], cwd, timeout=3)
+    head_before = head_before.strip()
+
+    # merge
+    rc, out, err = _run(["merge", remote_branch, "--no-edit"], cwd, timeout=60)
+    if rc != 0:
+        _run(["merge", "--abort"], cwd, timeout=10)
+        msg = (err or out).strip()
+        return False, f"合并冲突，已自动 abort：\n{msg}"
+
+    # 统计变更
+    _, head_after, _ = _run(["rev-parse", "HEAD"], cwd, timeout=3)
+    head_after = head_after.strip()
+    if head_before == head_after:
+        summary = "已是最新，无需合并。"
+    else:
+        _, stat, _ = _run(["diff", "--stat", head_before, head_after], cwd, timeout=10)
+        # stat 最后一行类似 "3 files changed, 10 insertions(+), 2 deletions(-)"
+        lines = stat.strip().splitlines()
+        summary = lines[-1].strip() if lines else "合并完成"
+
+    # push
+    rc, out, err = _run(["push"], cwd, timeout=60)
+    if rc != 0:
+        return False, f"合并成功但 push 失败：{(err or out).strip()}\n\n{summary}"
+
+    return True, summary
+
+
+def list_remote_branches(cwd: str) -> list[str]:
+    """列出所有远程分支（含 origin/ 前缀），过滤 HEAD。"""
+    rc, out, _ = _run(["branch", "-r", "--format=%(refname:short)"], cwd, timeout=5)
+    if rc != 0:
+        return []
+    results = []
+    for ln in out.splitlines():
+        name = ln.strip()
+        if not name or "->" in name:
+            continue
+        results.append(name)
+    return results

@@ -26,7 +26,7 @@ WORKER_CLOSE_WAIT_MS = 16000
 
 
 class _OverviewWorker(QThread):
-    done = Signal(str, list)  # branch, changed files
+    done = Signal(str, list, dict)  # branch, changed files, numstat
 
     def __init__(self, root: str, parent=None):
         super().__init__(parent)
@@ -35,7 +35,8 @@ class _OverviewWorker(QThread):
     def run(self) -> None:
         branch = git_ops.current_branch(self.root)
         files = git_ops.list_changed_files(self.root)
-        self.done.emit(branch, files)
+        stats = git_ops.diff_numstat(self.root)
+        self.done.emit(branch, files, stats)
 
 
 class _FileDiffWorker(QThread):
@@ -109,6 +110,7 @@ class GitViewer(QDialog):
         self.resize(1120, 720)
         self._overview_worker: _OverviewWorker | None = None
         self._diff_worker: _FileDiffWorker | None = None
+        self._numstat: dict[str, tuple[int, int]] = {}
         self._last_signature = ""
         self._selected_path = ""
         self._current_branch = ""
@@ -245,7 +247,12 @@ class GitViewer(QDialog):
         target_row = 0
         for f in files:
             label = self._status_label(f)
-            item = QListWidgetItem(f"[{label}]  {f.path}")
+            stat = self._numstat.get(f.path)
+            if stat:
+                stat_text = f"  +{stat[0]} -{stat[1]}"
+            else:
+                stat_text = ""
+            item = QListWidgetItem(f"[{label}]  {f.path}{stat_text}")
             item.setData(Qt.ItemDataRole.UserRole, f)
             item.setToolTip(f"{f.status}  {f.path}")
             item.setForeground(QColor(self._status_color(f)))
@@ -329,12 +336,13 @@ class GitViewer(QDialog):
         self._track_worker(worker)
         worker.start()
 
-    def _on_overview_loaded(self, branch: str, files: list[git_ops.ChangedFile]) -> None:
+    def _on_overview_loaded(self, branch: str, files: list[git_ops.ChangedFile], stats: dict) -> None:
         if self._closing:
             return
         if self.sender() is not self._overview_worker:
             return
         self._overview_worker = None
+        self._numstat = stats
         self._update_header(branch, files)
         signature = self._signature(branch, files)
         if signature != self._last_signature:

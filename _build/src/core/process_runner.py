@@ -280,7 +280,10 @@ def _build_child_env(ctx: "RunContext") -> dict[str, str]:
         # 其他工具用的激活标记
         env.pop("PYTHONHOME", None)
 
-    # 2. 用户自定义 env 覆盖
+    # 2. 读取项目根目录的 .env 文件（KEY=VALUE 格式，# 注释，不展开变量引用）
+    _load_dotenv(ctx.cwd, env)
+
+    # 3. 用户自定义 env 覆盖（优先级高于 .env）
     env.update(ctx.env or {})
 
     # 3. 强制子进程用 UTF-8 输出
@@ -314,6 +317,26 @@ def _build_child_env(ctx: "RunContext") -> dict[str, str]:
     env.setdefault("TERM", "dumb")
 
     return env
+
+
+def _load_dotenv(cwd: str, env: dict[str, str]) -> None:
+    """读取 cwd/.env，把 KEY=VALUE 注入到 env（已有的 key 不覆盖）。"""
+    dotenv = os.path.join(cwd, ".env")
+    try:
+        with open(dotenv, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                key = key.strip()
+                value = value.strip().strip('"').strip("'")
+                if key:
+                    env.setdefault(key, value)
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
 
 
 def _is_mini_ide_venv(venv_path: str) -> bool:

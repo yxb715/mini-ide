@@ -11,8 +11,13 @@ import subprocess
 import sys
 from pathlib import Path
 
+if sys.platform == "win32":
+    import winreg
+else:
+    winreg = None
+
 from PySide6.QtCore import Qt, QFile, QMimeData, QThread, QTimer, QUrl, Signal
-from PySide6.QtGui import QKeySequence, QShortcut
+from PySide6.QtGui import QColor, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QFrame, QHBoxLayout, QInputDialog, QLabel,
     QLineEdit, QListWidget, QListWidgetItem, QMenu, QMessageBox, QStackedWidget,
@@ -20,7 +25,8 @@ from PySide6.QtWidgets import (
 )
 
 from src.ui.theme import (
-    ACCENT_SUBTLE, BG_L2, BG_L4, FG_BRIGHT, FG_PRIMARY, apply_search_style,
+    ACCENT_SUBTLE, BG_L2, BG_L4, FG_BRIGHT, FG_PRIMARY, GIT_ADD, GIT_MODIFY,
+    apply_search_style,
 )
 from src.util.editor import reveal_in_explorer
 
@@ -63,6 +69,13 @@ QTreeWidget::branch:closed:has-children:has-siblings {{
 _RUNNABLE_SCRIPT_EXTS = {".bat", ".cmd", ".ps1", ".exe"}
 _CUT_MIME = "application/x-mini-ide-cut"
 _NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
+
+_CC_REGISTRY_COMMANDS = [] if winreg is None else [
+    (winreg.HKEY_CURRENT_USER, r"Software\Classes\Directory\shell\Claude Code\command"),
+    (winreg.HKEY_CURRENT_USER, r"Software\Classes\Directory\Background\shell\Claude Code\command"),
+    (winreg.HKEY_CLASSES_ROOT, r"Directory\shell\Claude Code\command"),
+    (winreg.HKEY_CLASSES_ROOT, r"Directory\Background\shell\Claude Code\command"),
+]
 
 
 def _is_same_or_child(path: Path, parent: Path) -> bool:
@@ -119,6 +132,33 @@ def _open_in_codex_args(target_dir: Path) -> list[str]:
     if ps:
         return [cmd, "/c", "start", "", "/D", target, ps, "-NoExit", "-NoLogo", "-Command", "codex"]
     return [cmd, "/c", "start", "", "/D", target, cmd, "/k", "codex"]
+
+
+def _open_in_cc_command(target_dir: Path) -> str:
+    target = str(target_dir)
+    if winreg is not None:
+        for hive, subkey in _CC_REGISTRY_COMMANDS:
+            try:
+                with winreg.OpenKey(hive, subkey) as key:
+                    command, _kind = winreg.QueryValueEx(key, "")
+            except OSError:
+                continue
+            if command:
+                return command.replace("%1", target).replace("%V", target)
+
+    wt = shutil.which("wt.exe") or shutil.which("wt")
+    pwsh = shutil.which("pwsh.exe") or shutil.which("pwsh")
+    if wt and pwsh:
+        return f'"{wt}" -d "{target}" "{pwsh}" -NoExit -Command claude'
+    ps = shutil.which("powershell.exe") or shutil.which("powershell")
+    if ps:
+        target_literal = "'" + target.replace("'", "''") + "'"
+        ps_command = f"Set-Location -LiteralPath {target_literal}; claude"
+        return (
+            f'"{ps}" -NoExit -NoLogo -NoProfile '
+            f'-ExecutionPolicy Bypass -Command "{ps_command}"'
+        )
+    return ""
 
 
 class _PasteWorker(QThread):
@@ -222,6 +262,8 @@ class FileTree(QWidget):
         self.indexer = indexer
         self.project_type = project_type
         self._paste_workers: list[_PasteWorker] = []
+        self._git_modified: set[str] = set()
+        self._git_untracked: set[str] = set()
         self.setMinimumWidth(240)
         self._build()
         self._reload()
@@ -230,6 +272,57 @@ class FileTree(QWidget):
         """供外部（如 Ctrl+Shift+N）调用：聚焦过滤框并全选"""
         self.filter_input.setFocus()
         self.filter_input.selectAll()
+
+    def update_git_status(self, modified: set[str], untracked: set[str]) -> None:
+        """更新 git 改动文件集合并刷新树节点颜色。路径为相对仓库根的正斜杠路径。"""
+        self._git_modified = modified
+        self._git_untracked = untracked
+        root_node = self.tree.topLevelItem(0)
+        if root_node is not None:
+            self._apply_git_colors(root_node)
+
+    def reveal_path(self, file_path: str) -> None:
+        """展开目录树并选中指定文件，滚动到可见位置。"""
+        # 统一用小写比较（Windows 不区分大小写）
+        norm_file = file_path.replace("/", "\\").lower()
+        norm_root = str(self.root_path).replace("/", "\\").lower()
+        if not norm_file.startswith(norm_root):
+            return
+        remainder = file_path[len(str(self.root_path)):]
+        if remainder.startswith(("\\", "/")):
+            remainder = remainder[1:]
+        if not remainder:
+            return
+        rel_parts = Path(remainder).parts
+        # 确保显示的是树视图而非搜索列表
+        if self.stack.currentWidget() is not self.tree:
+            self.filter_input.clear()
+        # 树结构：invisibleRootItem → 项目根节点 → 子目录/文件
+        # 从项目根节点开始搜索
+        root_node = self.tree.topLevelItem(0)
+        if root_node is None:
+            return
+        self.tree.expandItem(root_node)
+        node = root_node
+        for part in rel_parts:
+            found = None
+            part_lower = part.lower()
+            for i in range(node.childCount()):
+                child = node.child(i)
+                child_path = child.data(0, Qt.ItemDataRole.UserRole)
+                if child_path and Path(child_path).name.lower() == part_lower:
+                    found = child
+                    break
+            if found is None:
+                return
+            # 触发懒加载
+            if found.childCount() == 1 and found.child(0).text(0) == "(loading...)":
+                found.removeChild(found.child(0))
+                self._populate_children(found, Path(found.data(0, Qt.ItemDataRole.UserRole)))
+            self.tree.expandItem(found)
+            node = found
+        self.tree.setCurrentItem(node)
+        self.tree.scrollToItem(node)
 
     def _build(self) -> None:
         root = QVBoxLayout(self)
@@ -386,11 +479,13 @@ class FileTree(QWidget):
             node.setData(0, Qt.ItemDataRole.UserRole, str(d))
             node.setData(0, Qt.ItemDataRole.UserRole + 1, "dir")
             node.addChild(QTreeWidgetItem(["(loading...)"]))
+            self._apply_git_color_to_node(node, d)
             parent_item.addChild(node)
         for f in files:
             node = QTreeWidgetItem(["  " + f.name])
             node.setData(0, Qt.ItemDataRole.UserRole, str(f))
             node.setData(0, Qt.ItemDataRole.UserRole + 1, "file")
+            self._apply_git_color_to_node(node, f)
             parent_item.addChild(node)
 
     def _on_item_expanded(self, item: QTreeWidgetItem) -> None:
@@ -398,6 +493,43 @@ class FileTree(QWidget):
             item.removeChild(item.child(0))
             path = Path(item.data(0, Qt.ItemDataRole.UserRole))
             self._populate_children(item, path)
+
+    def _apply_git_color_to_node(self, node: QTreeWidgetItem, path: Path) -> None:
+        """根据 git 状态给节点染色。"""
+        if not self._git_modified and not self._git_untracked:
+            return
+        try:
+            rel = str(path.relative_to(self.root_path)).replace("\\", "/")
+        except ValueError:
+            return
+        if rel in self._git_untracked:
+            node.setForeground(0, QColor(GIT_ADD))
+        elif rel in self._git_modified:
+            node.setForeground(0, QColor(GIT_MODIFY))
+        elif path.is_dir():
+            rel_prefix = rel + "/"
+            for p in self._git_modified:
+                if p.startswith(rel_prefix):
+                    node.setForeground(0, QColor(GIT_MODIFY))
+                    return
+            for p in self._git_untracked:
+                if p.startswith(rel_prefix):
+                    node.setForeground(0, QColor(GIT_ADD))
+                    return
+
+    def _apply_git_colors(self, root_item: QTreeWidgetItem) -> None:
+        """递归刷新已加载节点的 git 颜色。"""
+        for i in range(root_item.childCount()):
+            child = root_item.child(i)
+            raw = child.data(0, Qt.ItemDataRole.UserRole)
+            if not raw:
+                continue
+            path = Path(raw)
+            # 重置颜色
+            child.setForeground(0, QColor(FG_PRIMARY))
+            self._apply_git_color_to_node(child, path)
+            if child.childCount() > 0 and child.child(0).text(0) != "(loading...)":
+                self._apply_git_colors(child)
 
     def _expand_all_safe(self) -> None:
         """展开全部前先把所有懒加载节点都加载一遍"""
@@ -564,6 +696,7 @@ class FileTree(QWidget):
         menu.addSeparator()
 
         # 外部工具 / 系统定位
+        menu.addAction("在 cc 中打开", lambda d=target_dir: self._open_cc(d))
         menu.addAction("在 codex 中打开", lambda d=target_dir: self._open_codex(d))
         menu.addAction("在资源管理器中显示", lambda: reveal_in_explorer(path))
         menu.addSeparator()
@@ -835,6 +968,23 @@ class FileTree(QWidget):
             )
         except OSError as e:
             QMessageBox.warning(self, "启动 codex 失败", f"{e}")
+
+    def _open_cc(self, target_dir: Path) -> None:
+        """在终端中打开 Claude Code (cc)。"""
+        command = _open_in_cc_command(target_dir)
+        if not command:
+            QMessageBox.warning(
+                self, "未找到 PowerShell",
+                "没有找到系统右键菜单的 Claude Code 命令，也未找到 PowerShell。",
+            )
+            return
+        try:
+            subprocess.Popen(
+                command,
+                close_fds=True,
+            )
+        except OSError as e:
+            QMessageBox.warning(self, "启动 Claude Code 失败", f"{e}")
 
     def _create_new_file(self, target_dir: Path, default_ext: str = "") -> None:
         """在指定目录下新建文件。用户输入文件名，自动补 default_ext 后缀。"""
