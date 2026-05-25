@@ -17,16 +17,20 @@ else:
     winreg = None
 
 from PySide6.QtCore import Qt, QFile, QMimeData, QThread, QTimer, QUrl, Signal
-from PySide6.QtGui import QColor, QKeySequence, QShortcut
+from PySide6.QtGui import QColor, QFont, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QFrame, QHBoxLayout, QInputDialog, QLabel,
     QLineEdit, QListWidget, QListWidgetItem, QMenu, QMessageBox, QStackedWidget,
     QToolButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
+from src.core.git_ops import (
+    GIT_STATUS_ADDED, GIT_STATUS_CONFLICT, GIT_STATUS_DELETED,
+    GIT_STATUS_MODIFIED, GIT_STATUS_UNTRACKED,
+)
 from src.ui.theme import (
-    ACCENT_SUBTLE, BG_L2, BG_L4, FG_BRIGHT, FG_PRIMARY, GIT_ADD, GIT_MODIFY,
-    apply_search_style,
+    ACCENT_SUBTLE, BG_L2, BG_L4, FG_BRIGHT, FG_PRIMARY, GIT_ADD, GIT_CONFLICT,
+    GIT_DEL, GIT_IGNORED, GIT_MODIFY, apply_search_style,
 )
 from src.util.editor import reveal_in_explorer
 
@@ -40,10 +44,12 @@ _ALWAYS_HIDDEN = {
 
 
 # QTreeView 的箭头/行样式：更大的分支指示器 + 稍高的行，点起来不费眼
+# 注意：不要在 QTreeWidget::item 里写 color——QSS 的 ::item color 会覆盖
+# QTreeWidgetItem.setForeground()，导致 git 染色无效。默认色由外层
+# QTreeWidget { color } 兜底（theme.py 全局已设）。
 _TREE_STYLE = f"""
 QTreeWidget {{
     background:{BG_L2};
-    color:{FG_PRIMARY};
     border:none;
     outline:none;
 }}
@@ -69,6 +75,10 @@ QTreeWidget::branch:closed:has-children:has-siblings {{
 _RUNNABLE_SCRIPT_EXTS = {".bat", ".cmd", ".ps1", ".exe"}
 _CUT_MIME = "application/x-mini-ide-cut"
 _NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
+
+# 节点级 git 染色缓存：(color_hex, strikethrough, tooltip)，
+# 染色函数对比缓存值，相同则不调 setForeground/setFont/setToolTip，避免 viewport 误重绘
+_RENDER_CACHE_ROLE = Qt.ItemDataRole.UserRole + 2
 
 _CC_REGISTRY_COMMANDS = [] if winreg is None else [
     (winreg.HKEY_CURRENT_USER, r"Software\Classes\Directory\shell\Claude Code\command"),
@@ -262,8 +272,15 @@ class FileTree(QWidget):
         self.indexer = indexer
         self.project_type = project_type
         self._paste_workers: list[_PasteWorker] = []
-        self._git_modified: set[str] = set()
-        self._git_untracked: set[str] = set()
+        # git 状态：{rel_posix_path: status_kind}，status_kind 为 GIT_STATUS_* 之一
+        self._git_status: dict[str, str] = {}
+        self._git_ignored: set[str] = set()
+        # ignored 前缀缓存：精确匹配走 set；前缀匹配按 rel 缓存"是否被某 ignored 目录覆盖"
+        self._ignored_prefix_cache: dict[str, bool] = {}
+        # 已删除文件按父目录分组：{parent_rel_posix: [filename, ...]}，"" 表示项目根
+        self._git_deleted_by_parent: dict[str, list[str]] = {}
+        # 预计算的「目录相对路径 → 冒泡状态」表，避免染色时反复扫 status dict
+        self._git_dir_bubble: dict[str, str] = {}
         self.setMinimumWidth(240)
         self._build()
         self._reload()
@@ -273,13 +290,93 @@ class FileTree(QWidget):
         self.filter_input.setFocus()
         self.filter_input.selectAll()
 
-    def update_git_status(self, modified: set[str], untracked: set[str]) -> None:
-        """更新 git 改动文件集合并刷新树节点颜色。路径为相对仓库根的正斜杠路径。"""
-        self._git_modified = modified
-        self._git_untracked = untracked
-        root_node = self.tree.topLevelItem(0)
-        if root_node is not None:
-            self._apply_git_colors(root_node)
+    def update_git_status(
+        self,
+        statuses: dict[str, str],
+        ignored: set[str],
+        deleted_by_parent: dict[str, list[str]],
+    ) -> None:
+        """更新 git 状态并增量刷新颜色 / 已删除文件占位。
+
+        statuses: {rel_posix_path: GIT_STATUS_*}
+        ignored: 被 .gitignore 忽略的相对路径集合（含目录）
+        deleted_by_parent: {parent_rel_posix: [filename, ...]}，已删除文件按父目录归组
+
+        增量策略：
+        - dict 直接比对（==），无变化则 short-circuit
+        - 状态变了才一次性预计算 dir_bubble 表，染色时 O(1) 查表
+        - 仅当"已删除文件清单"变化时刷受影响父目录（增删占位行）
+        - 染色走节点级 _RENDER_CACHE_ROLE 缓存，值不变就 skip set 调用
+        """
+        # 1) 直接 dict 比对：状态没变就 short-circuit（绝大多数 3s 轮询命中这条）
+        if (statuses == self._git_status
+                and ignored == self._git_ignored
+                and deleted_by_parent == self._git_deleted_by_parent):
+            return
+
+        old_deleted = self._git_deleted_by_parent
+        ignored_changed = (ignored != self._git_ignored)
+        self._git_status = statuses
+        self._git_ignored = ignored
+        self._git_deleted_by_parent = deleted_by_parent
+
+        # 2) 预计算 dir_bubble + 清前缀缓存（只有 ignored 变了才需要清）
+        self._git_dir_bubble = self._compute_dir_bubble(statuses)
+        if ignored_changed:
+            self._ignored_prefix_cache.clear()
+
+        # 3) 已删除文件清单变化的父目录：只刷这些
+        affected_parents: set[str] = set()
+        for parent, names in deleted_by_parent.items():
+            if old_deleted.get(parent) != names:
+                affected_parents.add(parent)
+        for parent in old_deleted:
+            if parent not in deleted_by_parent:
+                affected_parents.add(parent)
+
+        for parent_rel in affected_parents:
+            parent_path = self.root_path if not parent_rel else self.root_path / parent_rel
+            node = self._find_node_by_path(self.tree.invisibleRootItem(), str(parent_path))
+            if node is not None:
+                if not (node.childCount() == 1
+                        and node.child(0).text(0) == "(loading...)"):
+                    self._refresh_dir_node(parent_path)
+
+        # 4) 颜色：迭代刷整棵已加载子树（栈替代递归，避免 Python 函数调用开销）
+        self._refresh_all_colors()
+
+    @staticmethod
+    def _compute_dir_bubble(statuses: dict[str, str]) -> dict[str, str]:
+        """预计算每个祖先目录的冒泡状态。
+
+        遍历每个改动文件，沿 path 一路往上爬给所有祖先打标，
+        按 _BUBBLE_PRIORITY 取优先级最高的。返回 {dir_rel_posix: status_kind}。
+        总耗时 O(改动数 × 平均路径深度)，远小于"每个目录扫整个 statuses 字典"。
+        """
+        # 优先级数字：越小越优先
+        priority = {
+            GIT_STATUS_CONFLICT: 0,
+            GIT_STATUS_DELETED: 1,
+            GIT_STATUS_MODIFIED: 2,
+            GIT_STATUS_ADDED: 3,
+            GIT_STATUS_UNTRACKED: 4,
+        }
+        out: dict[str, str] = {}
+        for path, kind in statuses.items():
+            kind_pri = priority.get(kind, 99)
+            # 沿 path 往上拆出每一级祖先目录
+            parts = path.split("/")
+            # 不包括 path 本身，最后一段是文件名
+            for i in range(1, len(parts)):
+                ancestor = "/".join(parts[:i])
+                old = out.get(ancestor)
+                if old is None or priority.get(old, 99) > kind_pri:
+                    out[ancestor] = kind
+            # 项目根（"" 路径）也作为一个特殊键
+            old_root = out.get("")
+            if old_root is None or priority.get(old_root, 99) > kind_pri:
+                out[""] = kind
+        return out
 
     def reveal_path(self, file_path: str) -> None:
         """展开目录树并选中指定文件，滚动到可见位置。"""
@@ -474,18 +571,47 @@ class FileTree(QWidget):
             [p for p in entries if p.is_file() and p.name not in _ALWAYS_HIDDEN],
             key=lambda p: p.name.lower(),
         )
+        # 预算 parent rel：避免对每个子项重复 relative_to
+        try:
+            parent_rel = str(parent_path.relative_to(self.root_path)).replace("\\", "/")
+        except ValueError:
+            parent_rel = ""
+        if parent_rel == ".":
+            parent_rel = ""
+        prefix = (parent_rel + "/") if parent_rel else ""
+
         for d in dirs:
             node = QTreeWidgetItem(["📁  " + d.name])
             node.setData(0, Qt.ItemDataRole.UserRole, str(d))
             node.setData(0, Qt.ItemDataRole.UserRole + 1, "dir")
             node.addChild(QTreeWidgetItem(["(loading...)"]))
-            self._apply_git_color_to_node(node, d)
+            self._apply_git_color_to_node(node, d, rel=prefix + d.name)
             parent_item.addChild(node)
         for f in files:
             node = QTreeWidgetItem(["  " + f.name])
             node.setData(0, Qt.ItemDataRole.UserRole, str(f))
             node.setData(0, Qt.ItemDataRole.UserRole + 1, "file")
-            self._apply_git_color_to_node(node, f)
+            self._apply_git_color_to_node(node, f, rel=prefix + f.name)
+            parent_item.addChild(node)
+        # git 已删除文件：磁盘上读不到，需要在父目录下补占位行
+        existing_names = {d.name.lower() for d in dirs} | {f.name.lower() for f in files}
+        for name in self._git_deleted_by_parent.get(parent_rel, []):
+            # 避免与磁盘上同名条目重复（理论上不会，但 rename 等极端情况兜底）
+            if name.lower() in existing_names:
+                continue
+            node = QTreeWidgetItem(["  " + name])
+            # 占位节点没有真实路径，但记下"原本应该在哪"以便 tooltip
+            virtual_path = (parent_path / name)
+            node.setData(0, Qt.ItemDataRole.UserRole, str(virtual_path))
+            node.setData(0, Qt.ItemDataRole.UserRole + 1, "deleted")
+            node.setForeground(0, QColor(GIT_DEL))
+            self._set_strikethrough(node, True)
+            node.setToolTip(0, self._STATUS_TOOLTIPS[GIT_STATUS_DELETED])
+            # 占位节点不可拖、不可改
+            flags = node.flags()
+            flags &= ~Qt.ItemFlag.ItemIsDragEnabled
+            flags &= ~Qt.ItemFlag.ItemIsEditable
+            node.setFlags(flags)
             parent_item.addChild(node)
 
     def _on_item_expanded(self, item: QTreeWidgetItem) -> None:
@@ -494,42 +620,136 @@ class FileTree(QWidget):
             path = Path(item.data(0, Qt.ItemDataRole.UserRole))
             self._populate_children(item, path)
 
-    def _apply_git_color_to_node(self, node: QTreeWidgetItem, path: Path) -> None:
-        """根据 git 状态给节点染色。"""
-        if not self._git_modified and not self._git_untracked:
-            return
-        try:
-            rel = str(path.relative_to(self.root_path)).replace("\\", "/")
-        except ValueError:
-            return
-        if rel in self._git_untracked:
-            node.setForeground(0, QColor(GIT_ADD))
-        elif rel in self._git_modified:
-            node.setForeground(0, QColor(GIT_MODIFY))
-        elif path.is_dir():
-            rel_prefix = rel + "/"
-            for p in self._git_modified:
-                if p.startswith(rel_prefix):
-                    node.setForeground(0, QColor(GIT_MODIFY))
-                    return
-            for p in self._git_untracked:
-                if p.startswith(rel_prefix):
-                    node.setForeground(0, QColor(GIT_ADD))
-                    return
+    _STATUS_COLORS = {
+        GIT_STATUS_CONFLICT: GIT_CONFLICT,
+        GIT_STATUS_DELETED: GIT_DEL,
+        GIT_STATUS_ADDED: GIT_ADD,
+        GIT_STATUS_UNTRACKED: GIT_ADD,
+        GIT_STATUS_MODIFIED: GIT_MODIFY,
+    }
+    # 目录冒泡颜色优先级：冲突 > 删除 > 修改 > 新增/未跟踪
+    _BUBBLE_PRIORITY = (
+        GIT_STATUS_CONFLICT,
+        GIT_STATUS_DELETED,
+        GIT_STATUS_MODIFIED,
+        GIT_STATUS_ADDED,
+        GIT_STATUS_UNTRACKED,
+    )
+    _STATUS_TOOLTIPS = {
+        GIT_STATUS_CONFLICT: "git: 合并冲突",
+        GIT_STATUS_DELETED: "git: 已删除",
+        GIT_STATUS_ADDED: "git: 已添加（staged）",
+        GIT_STATUS_UNTRACKED: "git: 未跟踪",
+        GIT_STATUS_MODIFIED: "git: 已修改",
+    }
 
-    def _apply_git_colors(self, root_item: QTreeWidgetItem) -> None:
-        """递归刷新已加载节点的 git 颜色。"""
-        for i in range(root_item.childCount()):
-            child = root_item.child(i)
-            raw = child.data(0, Qt.ItemDataRole.UserRole)
-            if not raw:
+    def _apply_git_color_to_node(self, node: QTreeWidgetItem, path: Path,
+                                  rel: str | None = None) -> None:
+        """根据 git 状态给节点染色 + 设置 tooltip。
+        节点级缓存：上次染色后的 (color, strikethrough, tooltip) 存在 item.data，
+        本轮值不变就完全 skip set 调用，避免 Qt 误判 dirty 触发 viewport 重绘。
+
+        rel 由调用方预先算好可以省一次 relative_to。
+        """
+        if rel is None:
+            try:
+                rel = str(path.relative_to(self.root_path)).replace("\\", "/")
+            except ValueError:
+                return
+            if rel == ".":
+                rel = ""
+        # 计算目标渲染态
+        if self._is_ignored(rel):
+            color, strike, tip = GIT_IGNORED, False, "被 .gitignore 忽略"
+        else:
+            own = self._git_status.get(rel)
+            bubble = self._git_dir_bubble.get(rel) if path.is_dir() else None
+            if own is not None and own in self._STATUS_COLORS:
+                color = self._STATUS_COLORS[own]
+                strike = (own == GIT_STATUS_DELETED)
+                tip = self._STATUS_TOOLTIPS.get(own, "")
+            elif bubble is not None and bubble in self._STATUS_COLORS:
+                color = self._STATUS_COLORS[bubble]
+                strike = False
+                tip = f"包含 {self._STATUS_TOOLTIPS.get(bubble, '')} 的子项"
+            else:
+                color, strike, tip = FG_PRIMARY, False, ""
+        # 与缓存比对：完全相同就 skip
+        cache = node.data(0, _RENDER_CACHE_ROLE)
+        target = (color, strike, tip)
+        if cache == target:
+            return
+        node.setData(0, _RENDER_CACHE_ROLE, target)
+        node.setForeground(0, QColor(color))
+        self._set_strikethrough(node, strike)
+        node.setToolTip(0, tip)
+
+    def _is_ignored(self, rel: str) -> bool:
+        """rel 是否被 .gitignore 命中。带前缀缓存：每个 rel 第一次扫，后续 O(1)。"""
+        if not self._git_ignored:
+            return False
+        cached = self._ignored_prefix_cache.get(rel)
+        if cached is not None:
+            return cached
+        if rel in self._git_ignored:
+            self._ignored_prefix_cache[rel] = True
+            return True
+        # 父目录被 ignored → 子节点也算
+        for ig in self._git_ignored:
+            if rel.startswith(ig + "/"):
+                self._ignored_prefix_cache[rel] = True
+                return True
+        self._ignored_prefix_cache[rel] = False
+        return False
+
+    @staticmethod
+    def _set_strikethrough(node: QTreeWidgetItem, enabled: bool) -> None:
+        font = node.font(0)
+        if font.strikeOut() == enabled:
+            return
+        font.setStrikeOut(enabled)
+        node.setFont(0, font)
+
+    def _refresh_all_colors(self) -> None:
+        """迭代刷新整棵已加载子树的颜色。
+        用栈替代递归减小 Python 函数调用开销；命中节点级缓存的节点 setForeground 等
+        都不会触发，对 Qt 是零开销，整轮在大项目里稳定 < 5ms。
+        """
+        root_path_str = str(self.root_path)
+        root_path_len = len(root_path_str)
+        # 栈元素 (item, abs_path_str)，根节点先入栈
+        top = self.tree.topLevelItem(0)
+        if top is None:
+            return
+        stack: list[tuple[QTreeWidgetItem, str]] = [(top, root_path_str)]
+        while stack:
+            item, abs_str = stack.pop()
+            kind = item.data(0, Qt.ItemDataRole.UserRole + 1)
+            if kind == "deleted":
+                # 删除占位节点的颜色在 _populate_children 时已经设好，无需刷
                 continue
-            path = Path(raw)
-            # 重置颜色
-            child.setForeground(0, QColor(FG_PRIMARY))
-            self._apply_git_color_to_node(child, path)
-            if child.childCount() > 0 and child.child(0).text(0) != "(loading...)":
-                self._apply_git_colors(child)
+            # 计算 rel：剥离 root 前缀，比 Path.relative_to 快得多
+            if abs_str == root_path_str:
+                rel = ""
+            elif abs_str.startswith(root_path_str):
+                rel = abs_str[root_path_len:].lstrip("\\/").replace("\\", "/")
+            else:
+                continue
+            self._apply_git_color_to_node(item, Path(abs_str), rel=rel)
+            # 仅递归到已加载（非懒加载占位）的目录里
+            cc = item.childCount()
+            if cc == 0:
+                continue
+            if cc == 1 and item.child(0).text(0) == "(loading...)":
+                continue
+            for i in range(cc):
+                child = item.child(i)
+                child_kind = child.data(0, Qt.ItemDataRole.UserRole + 1)
+                if child_kind not in ("dir", "file"):
+                    continue
+                child_abs = child.data(0, Qt.ItemDataRole.UserRole)
+                if child_abs:
+                    stack.append((child, child_abs))
 
     def _expand_all_safe(self) -> None:
         """展开全部前先把所有懒加载节点都加载一遍"""
@@ -625,10 +845,16 @@ class FileTree(QWidget):
             return
         path = item.data(0, Qt.ItemDataRole.UserRole)
         kind = item.data(0, Qt.ItemDataRole.UserRole + 1)
+        # 已删除占位节点：磁盘上无文件，所有文件操作都不适用——直接屏蔽右键
+        if kind == "deleted":
+            return
         # 多选场景：优先用 mousePressEvent 抓的快照（避免 super 改 selection 影响判断）；
         # 快照为空时回退到 selectedItems()。判断走 path 字符串，不依赖对象身份。
         snapshot = self.tree.take_right_press_snapshot()
         selected = snapshot if snapshot else self.tree.selectedItems()
+        # 多选里若混入 deleted 占位节点，过滤掉——下面的批量操作只针对真实存在的项
+        selected = [it for it in selected
+                    if it.data(0, Qt.ItemDataRole.UserRole + 1) != "deleted"]
         selected_paths = {it.data(0, Qt.ItemDataRole.UserRole) for it in selected}
         if path in selected_paths and len(selected) > 1:
             batch = [(Path(it.data(0, Qt.ItemDataRole.UserRole)),

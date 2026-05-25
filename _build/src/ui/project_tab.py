@@ -16,7 +16,9 @@ from PySide6.QtWidgets import (
 
 from src.core.config import AppConfig, ProjectEntry
 from src.core.file_index import FileIndexer
-from src.core.git_worker import GitCheckoutWorker, GitFetchWorker, GitMergePushWorker
+from src.core.git_worker import (
+    GitCheckoutWorker, GitFetchWorker, GitMergePushWorker, GitStatusWorker,
+)
 from src.core.process_runner import ProcessRunner, RunContext
 from src.core.project_detector import ProjectMeta, RunProfile
 from src.ui.content_search import ContentSearchDialog
@@ -143,6 +145,7 @@ class ProjectTab(QWidget):
         self._git_fetch_worker: GitFetchWorker | None = None
         self._git_checkout_worker: GitCheckoutWorker | None = None
         self._git_merge_worker: GitMergePushWorker | None = None
+        self._git_status_worker: GitStatusWorker | None = None
         self._git_viewer = None
         # 启动完成标记：日志里看到 Started / ready in 等 marker 后，只给状态栏贴一次"✓ 启动完成"
         self._startup_phase_marked = False
@@ -879,19 +882,25 @@ class ProjectTab(QWidget):
             self.btn_changes.setVisible(False)
 
     def _update_file_tree_git_colors(self) -> None:
-        from src.core.git_ops import list_changed_files
+        # 防抖：上一轮 worker 还在跑就跳过这一轮（避免堆积）
+        if self._git_status_worker and self._git_status_worker.isRunning():
+            return
+        worker = GitStatusWorker(self.project_meta.path, parent=self)
+        worker.done.connect(self._on_git_status_done)
+        worker.finished.connect(worker.deleteLater)
+        self._git_status_worker = worker
+        worker.start()
+
+    def _on_git_status_done(
+        self, statuses: dict, ignored: set, deleted_by_parent: dict,
+    ) -> None:
         import logging
         log = logging.getLogger("mini-ide")
-        files = list_changed_files(self.project_meta.path)
-        modified: set[str] = set()
-        untracked: set[str] = set()
-        for f in files:
-            if f.status.startswith("?"):
-                untracked.add(f.path)
-            else:
-                modified.add(f.path)
-        log.debug(f"[git_colors] modified={len(modified)}, untracked={len(untracked)}")
-        self.file_tree.update_git_status(modified, untracked)
+        log.debug(
+            f"[git_colors] statuses={len(statuses)}, "
+            f"ignored={len(ignored)}, deleted_groups={len(deleted_by_parent)}"
+        )
+        self.file_tree.update_git_status(statuses, ignored, deleted_by_parent)
 
     # ---- 文件跳转 ----
 

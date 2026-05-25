@@ -74,6 +74,86 @@ def list_changed_files(cwd: str) -> list[ChangedFile]:
     return results
 
 
+# 文件 git 状态枚举（给 file_tree 染色用）
+GIT_STATUS_MODIFIED = "modified"   # 已被跟踪且有改动（含 staged + unstaged）
+GIT_STATUS_ADDED = "added"         # staged 新增（A 状态）
+GIT_STATUS_DELETED = "deleted"     # 删除（含 staged 和 unstaged）
+GIT_STATUS_UNTRACKED = "untracked" # 新建但未 add（??）
+GIT_STATUS_CONFLICT = "conflict"   # 合并冲突（U/AA/DD/AU/UA/DU/UD）
+
+
+def file_status_map(cwd: str) -> dict[str, str]:
+    """返回 {相对仓库根的正斜杠路径: GIT_STATUS_*}。
+
+    优先级：conflict > deleted > added > modified > untracked。
+    rename 取目标路径的状态。
+    """
+    files = list_changed_files(cwd)
+    out: dict[str, str] = {}
+    for f in files:
+        s = f.status  # 两字符 XY
+        # 冲突：任一字符为 U，或 AA/DD
+        if "U" in s or s in ("AA", "DD"):
+            kind = GIT_STATUS_CONFLICT
+        elif "D" in s:
+            kind = GIT_STATUS_DELETED
+        elif s == "??":
+            kind = GIT_STATUS_UNTRACKED
+        elif "A" in s:
+            kind = GIT_STATUS_ADDED
+        else:
+            kind = GIT_STATUS_MODIFIED
+        # 路径用正斜杠（与 file_tree 内部约定一致）
+        path = f.path.replace("\\", "/")
+        out[path] = kind
+    return out
+
+
+def list_ignored_files(cwd: str) -> set[str]:
+    """返回 .gitignore 命中的文件 / 目录相对路径集合（正斜杠）。
+
+    用 git ls-files --others --ignored --exclude-standard --directory：
+    --directory 让被整体忽略的目录折成单条（如 node_modules/），不展开里面 N 万个文件。
+    """
+    rc, out, _ = _run(
+        ["ls-files", "--others", "--ignored", "--exclude-standard", "--directory"],
+        cwd, timeout=15,
+    )
+    if rc != 0:
+        return set()
+    result: set[str] = set()
+    for ln in out.splitlines():
+        path = ln.strip()
+        if not path:
+            continue
+        if path.startswith('"') and path.endswith('"'):
+            path = path[1:-1]
+        # 目录条目末尾带 /，去掉好与 file_tree 的 rel 字符串一致
+        path = path.rstrip("/")
+        result.add(path.replace("\\", "/"))
+    return result
+
+
+def list_deleted_paths(cwd: str) -> dict[str, list[str]]:
+    """返回被删除（磁盘已无）的文件，按父目录归组。
+
+    返回 {parent_rel_posix: [filename, ...]}；parent_rel 为 "" 表示项目根。
+    用来给 file_tree 在父目录下补"已删除"占位行——磁盘上 iterdir 看不到这些文件。
+    """
+    files = list_changed_files(cwd)
+    out: dict[str, list[str]] = {}
+    for f in files:
+        if "D" not in f.status:
+            continue
+        path = f.path.replace("\\", "/")
+        if "/" in path:
+            parent, name = path.rsplit("/", 1)
+        else:
+            parent, name = "", path
+        out.setdefault(parent, []).append(name)
+    return out
+
+
 def get_file_diff(cwd: str, path: str, staged: bool = False) -> str:
     """获取单个文件的 diff。staged=True 时显示已暂存的改动，否则显示未暂存的"""
     args = ["diff", "--no-color", "-U3"]

@@ -5,6 +5,17 @@ from pathlib import Path
 ROOT = Path(__file__).parent
 sys.path.insert(0, str(ROOT))
 
+
+def _is_cli_mode() -> bool:
+    """sys.argv[1] 以 '--' 开头时走 CLI 模式。"""
+    return len(sys.argv) > 1 and sys.argv[1].startswith("--")
+
+
+if _is_cli_mode():
+    from src.core.cli_client import run_cli
+    sys.exit(run_cli(sys.argv))
+
+
 from PySide6.QtWidgets import QApplication
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QIcon
@@ -45,6 +56,9 @@ def _start_local_server(window: MainWindow) -> QLocalServer | None:
         return None
 
     def _on_new_connection():
+        from src.core.cli_server import handle_cli_request, handle_async_cli_request
+        import json
+
         sock = server.nextPendingConnection()
         if sock is None:
             return
@@ -52,6 +66,22 @@ def _start_local_server(window: MainWindow) -> QLocalServer | None:
             data = bytes(sock.readAll()).decode("utf-8", errors="replace").strip()
         else:
             data = ""
+
+        # 尝试作为 CLI JSON 命令处理
+        if data.startswith("{"):
+            try:
+                cmd = json.loads(data)
+                if "cmd" in cmd:
+                    # 异步命令（health / compile）需要保持连接
+                    if handle_async_cli_request(cmd, sock, window):
+                        return
+                    # 同步命令
+                    if handle_cli_request(data, sock, window):
+                        return
+            except json.JSONDecodeError:
+                pass
+
+        # 老协议：打开项目路径
         window.activate_and_open(data or None)
         sock.disconnectFromServer()
 

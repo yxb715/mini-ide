@@ -53,3 +53,28 @@ class GitMergePushWorker(QThread):
         from src.core.git_ops import git_merge_remote_branch
         ok, msg = git_merge_remote_branch(self.cwd, self.remote_branch)
         self.done.emit(ok, msg)
+
+
+class GitStatusWorker(QThread):
+    """后台拉 git status / ignored / deleted 三件套，给文件树染色用。
+
+    主线程跑这三个命令在大仓库上 200ms~1s+，每 3s 跑一次会让目录树滚动很卡。
+    打包成一个 worker 后台跑，结果信号一次性回主线程刷颜色。
+
+    done(statuses, ignored, deleted_by_parent)
+    """
+
+    done = Signal(dict, set, dict)
+
+    def __init__(self, cwd: str, parent=None):
+        super().__init__(parent)
+        self.cwd = cwd
+
+    def run(self) -> None:
+        from src.core.git_ops import (
+            file_status_map, list_deleted_paths, list_ignored_files,
+        )
+        statuses = file_status_map(self.cwd)
+        ignored = list_ignored_files(self.cwd)
+        deleted = list_deleted_paths(self.cwd)
+        self.done.emit(statuses, ignored, deleted)

@@ -76,6 +76,8 @@ GIT_MODIFY = "#BBB529"
 GIT_HUNK = "#4B6EAF"
 GIT_FILE_HEAD = "#9876AA"
 GIT_META = "#808080"
+GIT_CONFLICT = "#CC7832"   # IDEA 冲突文件名橙
+GIT_IGNORED = "#6E6E6E"    # 灰：被 .gitignore 忽略，看得见但弱化
 
 # 诊断条（醒目的"出问题了"通知背景）
 BG_DIAGNOSIS = "#4D3A1F"
@@ -292,7 +294,6 @@ QTreeView, QTreeWidget, QListView, QListWidget {{
 QTreeView::item, QTreeWidget::item, QListView::item, QListWidget::item {{
     padding: 3px 4px;
     border: none;
-    color: {FG_PRIMARY};
 }}
 QTreeView::item:hover, QTreeWidget::item:hover, QListView::item:hover, QListWidget::item:hover {{
     background: {BG_L4};
