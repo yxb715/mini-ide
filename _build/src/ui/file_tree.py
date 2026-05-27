@@ -159,7 +159,8 @@ def _open_in_cc_command(target_dir: Path) -> str:
     wt = shutil.which("wt.exe") or shutil.which("wt")
     pwsh = shutil.which("pwsh.exe") or shutil.which("pwsh")
     if wt and pwsh:
-        return f'"{wt}" -d "{target}" "{pwsh}" -NoExit -Command claude'
+        pwsh_name = Path(pwsh).name
+        return f'"{wt}" -d "{target}" {pwsh_name} -NoExit -Command claude'
     ps = shutil.which("powershell.exe") or shutil.which("powershell")
     if ps:
         target_literal = "'" + target.replace("'", "''") + "'"
