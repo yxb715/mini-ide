@@ -556,12 +556,14 @@ class ProjectTab(QWidget):
             m = _RE_BOOT_LISTEN_PORT.search(line)
             if m:
                 self._module_ports[module] = int(m.group(1))
-                if self.service_panel:
+                r = self.module_runners.get(module)
+                # 必须确认 runner 仍在跑——_on_finished 里 flush 残留日志会
+                # 在切 idle 前 emit 这行，没这层守卫会把 panel 刷回 RUNNING
+                if r and r.is_running() and self.service_panel:
                     self.service_panel.update_state(
                         module, STATE_RUNNING,
                         port=self._module_ports[module],
-                        elapsed_seconds=self.module_runners[module].elapsed_seconds()
-                            if module in self.module_runners else 0.0,
+                        elapsed_seconds=r.elapsed_seconds(),
                     )
 
     def _on_module_state(self, module: str, state: str) -> None:
@@ -572,7 +574,13 @@ class ProjectTab(QWidget):
                 "stopping": STATE_STOPPING,
             }
             panel_state = mapping.get(state, STATE_IDLE)
-            self.service_panel.update_state(module, panel_state)
+            r = self.module_runners.get(module)
+            elapsed = r.elapsed_seconds() if r else 0.0
+            self.service_panel.update_state(
+                module, panel_state,
+                port=self._module_ports.get(module),
+                elapsed_seconds=elapsed,
+            )
         self._refresh_aggregate_state()
         self.statusChanged.emit()
 
@@ -838,6 +846,13 @@ class ProjectTab(QWidget):
                             port=self._module_ports.get(mod_name),
                             elapsed_seconds=r.elapsed_seconds(),
                         )
+                elif r.state() == "idle" and self.service_panel:
+                    # 兜底：runner 已停但 panel 还在 RUNNING（信号被覆盖时会发生），
+                    # 强制刷成 IDLE，否则停止按钮会因为 runner._state == idle 直接 return
+                    row = self.service_panel._rows.get(mod_name)
+                    if row and row.current_state() in (STATE_RUNNING, STATE_STARTING):
+                        self._module_ports.pop(mod_name, None)
+                        self.service_panel.update_state(mod_name, STATE_IDLE)
             total = len(self.project_meta.spring_boot_modules)
             self.lbl_elapsed.setText(f"已运行 {running}/{total}" if running else "")
         elif self.runner.is_running():

@@ -102,25 +102,6 @@ class LogWidget(QWidget):
         self.lbl_counts.setProperty("role", "subtitle")
         tb.addWidget(self.lbl_counts, 1)
 
-        self._filter_btns: dict[str, QToolButton] = {}
-        for label, kinds, tooltip in [
-            ("E", {"error", "caused_by"}, "显示/隐藏 Error"),
-            ("W", {"warn"}, "显示/隐藏 Warn"),
-            ("I", {"info", "plain", "startup_banner", "startup_ready", "meta"}, "显示/隐藏 Info"),
-            ("D", {"debug", "trace"}, "显示/隐藏 Debug"),
-        ]:
-            btn = QToolButton()
-            btn.setText(label)
-            btn.setCheckable(True)
-            btn.setChecked(True)
-            btn.setToolTip(tooltip)
-            btn.setProperty("_kinds", kinds)
-            btn.toggled.connect(self._on_level_filter_toggled)
-            tb.addWidget(btn)
-            self._filter_btns[label] = btn
-
-        self._hidden_kinds: set[str] = set()
-
         self.btn_clear = QToolButton()
         self.btn_clear.setText("🗑")
         self.btn_clear.setToolTip("清空日志")
@@ -387,28 +368,8 @@ class LogWidget(QWidget):
         # 块用户数据
         block = cursor.block()
         block.setUserState(_kind_to_state(meta.kind))
-        if meta.kind in self._hidden_kinds:
-            block.setVisible(False)
         # 用 list 索引关联
         self._lines.append(meta)
-
-    def _on_level_filter_toggled(self, checked: bool) -> None:
-        btn = self.sender()
-        kinds = btn.property("_kinds")
-        if checked:
-            self._hidden_kinds -= kinds
-        else:
-            self._hidden_kinds |= kinds
-        doc = self.edit.document()
-        self.edit.setUpdatesEnabled(False)
-        block = doc.begin()
-        while block.isValid():
-            state = block.userState()
-            kind = _state_to_kind(state)
-            block.setVisible(kind not in self._hidden_kinds)
-            block = block.next()
-        self.edit.setUpdatesEnabled(True)
-        self.edit.viewport().update()
 
     def _update_counts(self, cls: lc.Classification | None) -> None:
         # 计数已在 _flush_pending 里累加，这里只更新 UI 标签
@@ -543,17 +504,6 @@ def _kind_to_state(kind: str) -> int:
         "plain": 0,
     }
     return mapping.get(kind, 0)
-
-
-_STATE_TO_KIND: dict[int, str] = {
-    0: "plain", 1: "error", 2: "warn", 3: "info",
-    4: "stack", 5: "debug", 6: "sql",
-    7: "startup_ready", 8: "startup_banner", 9: "meta",
-}
-
-
-def _state_to_kind(state: int) -> str:
-    return _STATE_TO_KIND.get(state, "plain")
 
 
 def _format_sql(line: str) -> str:
