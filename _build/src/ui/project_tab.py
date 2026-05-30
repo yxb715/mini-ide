@@ -118,6 +118,11 @@ class ProjectTab(QWidget):
         # 单模块项目这里就是 False，走 self.runner 的传统路径，行为 100% 不变。
         self._is_multi_module = len(meta.spring_boot_modules) >= 2
 
+        # 是否 git 仓库：启动时判一次缓存住。非 git 项目不起染色/状态栏 worker，
+        # 省得每 3s 白跑一堆注定失败的 git 子进程。
+        from src.core.git_ops import is_git_repo
+        self._is_git_repo = is_git_repo(meta.path)
+
         # 项目级 runner：单模块项目的启动用它；多模块项目用它跑编译/Clean 等全局 profile
         self.runner = ProcessRunner(self)
         self.runner.outputLine.connect(self._on_output)
@@ -863,7 +868,13 @@ class ProjectTab(QWidget):
         else:
             self.lbl_elapsed.setText("")
 
-        info = git_info.get_info(self.project_meta.path)
+        # git 分支 / 改动数 / 文件树染色：全部交给后台 worker 查，
+        # 主线程不再同步跑 git 命令（否则大仓库每 3s 冻 UI 几百 ms）。
+        # worker 回来后在 _on_git_status_done 里一次性渲染状态栏 + 刷染色。
+        self._update_file_tree_git_colors()
+
+    def _render_git_status_row(self, info) -> None:
+        """用后台查到的 GitInfo 渲染分支按钮 + 改动数按钮（在主线程回调里调）。"""
         text = git_info.format_status(info)
         if text:
             self.btn_branch.setText(text + "  ▾")
@@ -892,22 +903,34 @@ class ProjectTab(QWidget):
                 self.btn_changes.setText("📝 无改动")
                 self.btn_changes.setStyleSheet(base + f"QToolButton {{ color:{FG_DIM}; }}")
             self.btn_changes.setVisible(True)
-            self._update_file_tree_git_colors()
         else:
             self.btn_changes.setVisible(False)
 
     def _update_file_tree_git_colors(self) -> None:
-        # 防抖：上一轮 worker 还在跑就跳过这一轮（避免堆积）
-        if self._git_status_worker and self._git_status_worker.isRunning():
+        # 非 git 项目：状态栏隐藏分支/改动按钮，不起 worker
+        if not self._is_git_repo:
+            self.btn_branch.setVisible(False)
+            self.btn_changes.setVisible(False)
             return
+        # 防抖：上一轮 worker 还在跑就跳过这一轮（避免堆积）。
+        # 注意：worker 跑完后绝不能 deleteLater——否则 self._git_status_worker
+        # 会变成已删除 C++ 对象的空壳，下一轮 isRunning() 抛 RuntimeError，
+        # 刷新循环从此永久卡死（提交后颜色不再变）。这里用 try 兜底 + 跑完置 None。
+        w = self._git_status_worker
+        if w is not None:
+            try:
+                if w.isRunning():
+                    return
+            except RuntimeError:
+                # 极端情况下对象已被回收，直接当作空闲，重新起一轮
+                self._git_status_worker = None
         worker = GitStatusWorker(self.project_meta.path, parent=self)
         worker.done.connect(self._on_git_status_done)
-        worker.finished.connect(worker.deleteLater)
         self._git_status_worker = worker
         worker.start()
 
     def _on_git_status_done(
-        self, statuses: dict, ignored: set, deleted_by_parent: dict,
+        self, statuses: dict, ignored: set, deleted_by_parent: dict, info,
     ) -> None:
         import logging
         log = logging.getLogger("mini-ide")
@@ -915,7 +938,11 @@ class ProjectTab(QWidget):
             f"[git_colors] statuses={len(statuses)}, "
             f"ignored={len(ignored)}, deleted_groups={len(deleted_by_parent)}"
         )
+        self._render_git_status_row(info)
         self.file_tree.update_git_status(statuses, ignored, deleted_by_parent)
+        # 本轮结束：清引用，让下一轮 _update_file_tree_git_colors 能正常起新 worker。
+        # worker 由 parent=self 持有，Qt 事件循环空闲时自然回收，无需 deleteLater。
+        self._git_status_worker = None
 
     # ---- 文件跳转 ----
 

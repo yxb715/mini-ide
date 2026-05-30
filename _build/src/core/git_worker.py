@@ -56,15 +56,18 @@ class GitMergePushWorker(QThread):
 
 
 class GitStatusWorker(QThread):
-    """后台拉 git status / ignored / deleted 三件套，给文件树染色用。
+    """后台拉 git status / ignored / deleted + 分支信息，给文件树染色和状态栏用。
 
-    主线程跑这三个命令在大仓库上 200ms~1s+，每 3s 跑一次会让目录树滚动很卡。
-    打包成一个 worker 后台跑，结果信号一次性回主线程刷颜色。
+    主线程跑这些命令在大仓库上 200ms~1s+，每 3s 跑一次会让目录树滚动很卡。
+    打包成一个 worker 后台跑，结果信号一次性回主线程刷颜色和状态栏分支/改动数。
 
-    done(statuses, ignored, deleted_by_parent)
+    info 用 object 承载 GitInfo | None（非 git 仓库为 None），让状态栏的
+    分支按钮、改动数按钮也由后台数据驱动，主线程不再同步调 git。
+
+    done(statuses, ignored, deleted_by_parent, info)
     """
 
-    done = Signal(dict, set, dict)
+    done = Signal(dict, set, dict, object)
 
     def __init__(self, cwd: str, parent=None):
         super().__init__(parent)
@@ -74,7 +77,9 @@ class GitStatusWorker(QThread):
         from src.core.git_ops import (
             file_status_map, list_deleted_paths, list_ignored_files,
         )
+        from src.util import git_info
         statuses = file_status_map(self.cwd)
         ignored = list_ignored_files(self.cwd)
         deleted = list_deleted_paths(self.cwd)
-        self.done.emit(statuses, ignored, deleted)
+        info = git_info.get_info(self.cwd)
+        self.done.emit(statuses, ignored, deleted, info)

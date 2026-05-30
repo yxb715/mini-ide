@@ -663,7 +663,10 @@ class FileTree(QWidget):
             color, strike, tip = GIT_IGNORED, False, "被 .gitignore 忽略"
         else:
             own = self._git_status.get(rel)
-            bubble = self._git_dir_bubble.get(rel) if path.is_dir() else None
+            # 是否目录：读节点上已存的类型标记，不再 path.is_dir() 碰磁盘
+            # （每个节点查一次磁盘在 Windows 大树上很拖，染色一轮可能上千次）
+            is_dir = node.data(0, Qt.ItemDataRole.UserRole + 1) == "dir"
+            bubble = self._git_dir_bubble.get(rel) if is_dir else None
             if own is not None and own in self._STATUS_COLORS:
                 color = self._STATUS_COLORS[own]
                 strike = (own == GIT_STATUS_DELETED)
