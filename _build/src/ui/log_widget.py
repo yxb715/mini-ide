@@ -26,14 +26,14 @@ _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\].*?(?:\x07|\x1b\\)|\x1b[=>]
 def _strip_ansi(text: str) -> str:
     return _ANSI_RE.sub("", text)
 
-from PySide6.QtCore import Qt, QTimer, Signal, QUrl
+from PySide6.QtCore import Qt, QTimer, Signal, QUrl, QRegularExpression
 from PySide6.QtGui import (
     QAction, QColor, QDesktopServices, QFont, QTextCharFormat,
     QTextCursor, QTextDocument, QKeySequence, QMouseEvent,
 )
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QHBoxLayout, QLabel, QLineEdit, QMenu,
-    QPushButton, QPlainTextEdit, QVBoxLayout, QWidget, QToolButton,
+    QPushButton, QPlainTextEdit, QToolTip, QVBoxLayout, QWidget, QToolButton,
 )
 
 from src.core import log_classifier as lc
@@ -63,6 +63,7 @@ class LogWidget(QWidget):
 
     fileJumpRequested = Signal(str, int, int)       # path, line, col
     portDiagnosisRequested = Signal(int)            # 诊断到端口占用，要求打开 PortDialog
+    contentAdded = Signal()                         # 有新内容写入（多模块时用来把隐藏的日志 tab 显示回来）
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -204,6 +205,7 @@ class LogWidget(QWidget):
 
     def begin_run(self, label: str) -> None:
         """一次运行开始：重置堆栈上下文并打开日志文件"""
+        self.contentAdded.emit()
         self._ctx = lc.LineContext()
         self._last_diagnosis = ""
         self._diagnosis_port = 0
@@ -231,6 +233,7 @@ class LogWidget(QWidget):
 
     def append_line(self, stream: str, line: str) -> None:
         """追加一行日志。实际写入由 _flush_pending 批量完成，避免高频抖动"""
+        self.contentAdded.emit()
         if "\x1b" in line:
             line = _strip_ansi(line)
         self._pending.append((stream, line))
@@ -465,6 +468,10 @@ class LogWidget(QWidget):
     def _find_prev(self) -> None:
         self._find(forward=False)
 
+    def _set_search_status(self, msg: str) -> None:
+        """在搜索框旁弹个气泡提示（如正则语法错误），不打断输入。"""
+        QToolTip.showText(self.search_input.mapToGlobal(self.search_input.rect().bottomLeft()), msg, self.search_input)
+
     def _find(self, forward: bool) -> None:
         q = self.search_input.text()
         if not q:
@@ -474,10 +481,23 @@ class LogWidget(QWidget):
             flags |= QTextDocument.FindFlag.FindBackward
         if self.chk_case.isChecked():
             flags |= QTextDocument.FindFlag.FindCaseSensitively
+
+        # 正则模式用 QRegularExpression（QPlainTextEdit.find 不接受 Python 的 re.Pattern）；
+        # 大小写靠 QRegularExpression 的 option 控制，flags 里的 FindCaseSensitively 对正则无效。
+        needle: "str | QRegularExpression"
         if self.chk_regex.isChecked():
-            found = self.edit.find(re.compile(q, 0 if self.chk_case.isChecked() else re.IGNORECASE), flags)  # type: ignore[arg-type]
+            opts = QRegularExpression.PatternOption.NoPatternOption
+            if not self.chk_case.isChecked():
+                opts = QRegularExpression.PatternOption.CaseInsensitiveOption
+            rx = QRegularExpression(q, opts)
+            if not rx.isValid():
+                self._set_search_status(f"正则语法错误：{rx.errorString()}")
+                return
+            needle = rx
         else:
-            found = self.edit.find(q, flags)
+            needle = q
+
+        found = self.edit.find(needle, flags)
         if not found:
             # 回绕一次
             cur = self.edit.textCursor()
@@ -485,7 +505,7 @@ class LogWidget(QWidget):
                 QTextCursor.MoveOperation.End if not forward else QTextCursor.MoveOperation.Start
             )
             self.edit.setTextCursor(cur)
-            self.edit.find(q, flags)
+            self.edit.find(needle, flags)
 
 
 # ---- 工具函数 ----

@@ -112,6 +112,19 @@ def _parse_args(argv: list[str]) -> dict | None:
         if not rest:
             return None
         result["project"] = rest[0]
+        i = 1
+        while i < len(rest):
+            if rest[i] == "--timeout" and i + 1 < len(rest):
+                try:
+                    result["timeout"] = int(rest[i + 1])
+                except ValueError:
+                    return None
+                i += 2
+            else:
+                i += 1
+        if "timeout" not in result:
+            # 冷编译 Gradle/Maven 动辄数十秒到几分钟，给宽松默认值
+            result["timeout"] = 300
         return result
 
     if cmd_name == "log":
@@ -159,8 +172,11 @@ def run_cli(argv: list[str]) -> int:
     sock.write(payload.encode("utf-8"))
     sock.flush()
 
-    # 等待响应（--health 可能等很久）
-    timeout_ms = (cmd.get("timeout", 60) + 5) * 1000 if cmd["cmd"] == "health" else 30000
+    # 等待响应（--health / --compile 可能等很久，按命令携带的 timeout 放宽）
+    if cmd["cmd"] in ("health", "compile"):
+        timeout_ms = (cmd.get("timeout", 60) + 5) * 1000
+    else:
+        timeout_ms = 30000
     response_buf = b""
     deadline = time.time() + timeout_ms / 1000.0
 

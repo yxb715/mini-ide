@@ -132,10 +132,35 @@ def _run_editor(cmd: str, target: str, line: int, column: int) -> bool:
         args = [parts[0], *extra, target]
 
     try:
-        subprocess.Popen(args, close_fds=True, **_POPEN_KW)
+        prog_args = _resolve_launch(args)
+        subprocess.Popen(prog_args, close_fds=True, **_POPEN_KW)
         return True
     except OSError:
         return False
+
+
+def _resolve_launch(args: list[str]) -> list[str]:
+    """把命令名解析成可被 CreateProcess 直接启动的形式。
+
+    Windows 下 subprocess.Popen 不走 shell，CreateProcess 既不查 PATHEXT、
+    也不能直接执行 .cmd/.bat（VS Code 的 `code` 实际是 code.cmd 包装器）。
+    所以这里用 shutil.which 解析全路径，遇到批处理就改走 `cmd /c`。
+    """
+    if sys.platform != "win32" or not args:
+        return args
+    prog = args[0]
+    rest = args[1:]
+    lower = prog.lower()
+    if lower.endswith((".bat", ".cmd")):
+        return ["cmd", "/c", prog, *rest]
+    if lower.endswith(".exe") or os.path.isabs(prog):
+        return args
+    resolved = shutil.which(prog)
+    if resolved:
+        if resolved.lower().endswith((".bat", ".cmd")):
+            return ["cmd", "/c", resolved, *rest]
+        return [resolved, *rest]
+    return args
 
 
 def search_in_project(root: Path, filename: str) -> Path | None:

@@ -30,6 +30,7 @@ from src.ui.theme import (
 STATE_IDLE = "idle"
 STATE_STARTING = "starting"
 STATE_RUNNING = "running"
+STATE_RUNNING_EXTERNAL = "running_external"   # 非 mini-ide 启动、靠端口/命令行感知到的运行中
 STATE_STOPPING = "stopping"
 
 
@@ -94,7 +95,7 @@ class _ServiceRow(QFrame):
         super().mousePressEvent(event)
 
     def _on_btn(self):
-        if self._state == STATE_RUNNING:
+        if self._state in (STATE_RUNNING, STATE_RUNNING_EXTERNAL):
             self.stopRequested.emit(self.module_name)
         elif self._state == STATE_IDLE:
             self.startRequested.emit(self.module_name)
@@ -133,6 +134,16 @@ class _ServiceRow(QFrame):
             self.lbl_info.setText("  ".join(parts) if parts else "运行中")
             self.btn.setText("⏹")
             self.btn.setToolTip(f"停止 {self.module_name}")
+            self.btn.setEnabled(True)
+            self.btn.setStyleSheet(_row_btn_qss(COLOR_SUCCESS, COLOR_SUCCESS))
+        elif state == STATE_RUNNING_EXTERNAL:
+            # 外部进程：图标用空心方块区分，文案标「(外部)」，仍可点停止（走 kill pid）
+            self.lbl_icon.setText("◻")
+            self.lbl_icon.setStyleSheet(f"color:{COLOR_SUCCESS}; font-size:{FONT_PT_UI}pt;")
+            label = f"{port_str}  运行中(外部)".strip() if port_str else "运行中(外部)"
+            self.lbl_info.setText(label)
+            self.btn.setText("⏹")
+            self.btn.setToolTip(f"停止 {self.module_name}（外部进程，将按端口结束 PID）")
             self.btn.setEnabled(True)
             self.btn.setStyleSheet(_row_btn_qss(COLOR_SUCCESS, COLOR_SUCCESS))
         elif state == STATE_STOPPING:
@@ -230,15 +241,18 @@ class ServicePanel(QWidget):
         row = self._rows.get(module)
         if row:
             row.set_state(state, port, elapsed_seconds)
-        # 任意模块在 RUNNING/STARTING 就允许「全部停止」
+        # 任意模块在 RUNNING/STARTING/外部运行 就允许「全部停止」
         any_active = any(
-            r.current_state() in (STATE_RUNNING, STATE_STARTING)
+            r.current_state() in (STATE_RUNNING, STATE_RUNNING_EXTERNAL, STATE_STARTING)
             for r in self._rows.values()
         )
         self.btn_stop_all.setEnabled(any_active)
 
     def running_count(self) -> int:
-        return sum(1 for r in self._rows.values() if r.current_state() == STATE_RUNNING)
+        return sum(
+            1 for r in self._rows.values()
+            if r.current_state() in (STATE_RUNNING, STATE_RUNNING_EXTERNAL)
+        )
 
     def total(self) -> int:
         return len(self._rows)

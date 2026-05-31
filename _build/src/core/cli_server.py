@@ -111,7 +111,7 @@ def handle_async_cli_request(
         _cmd_health_async(tab, cmd.get("module"), cmd.get("timeout", 60), sock)
         return True
     elif action == "compile":
-        _cmd_compile_async(tab, sock)
+        _cmd_compile_async(tab, sock, cmd.get("timeout", 300))
         return True
     return False
 
@@ -156,15 +156,23 @@ def _cmd_list_modules(tab) -> list:
     from src.ui.project_tab import ProjectTab
     tab: ProjectTab
     modules = []
+    external = getattr(tab, "_module_external_pids", {})
     for mod_name, _path, _port in tab.project_meta.spring_boot_modules:
         runner = tab.module_runners.get(mod_name)
         state = runner.state() if runner else "stopped"
         pid = None
+        running = False
         if runner and runner.is_running() and runner._proc:
             pid = runner._proc.processId()
+            running = True
+        elif mod_name in external:
+            # 外部启动（AI / 终端 / IDE）的进程，按命令行感知到
+            pid = external[mod_name]
+            running = True
         modules.append({
             "name": mod_name,
-            "state": "running" if state == "running" else "stopped",
+            "state": "running" if running else "stopped",
+            "external": mod_name in external and not (runner and runner.is_running()),
             "pid": pid if pid and pid > 0 else None,
         })
     # 单模块项目没有 spring_boot_modules，返回主 runner 状态
@@ -194,6 +202,8 @@ def _cmd_start(tab, module: str | None) -> dict:
             runner = tab.module_runners.get(module)
             if runner and runner.is_running():
                 return {"ok": False, "error": "already running"}
+            if module in getattr(tab, "_module_external_pids", {}):
+                return {"ok": False, "error": "already running (external process)"}
             tab._start_module(module)
             return {"ok": True}
         else:
@@ -336,6 +346,7 @@ def _get_health_markers(project_type: str) -> tuple[str, ...]:
 def _cmd_health_async(tab, module: str | None, timeout: int, sock: QLocalSocket) -> None:
     """异步等待模块启动完成，检测日志中的启动标记或端口监听。"""
     from src.ui.project_tab import ProjectTab
+    from src.core.process_runner import find_port_holder
     tab: ProjectTab
 
     start_time = time.time()
@@ -345,6 +356,11 @@ def _cmd_health_async(tab, module: str | None, timeout: int, sock: QLocalSocket)
 
     def _check():
         now = time.time()
+        # 客户端已断开就别再空转 / 往死 socket 写
+        if sock.state() != QLocalSocket.LocalSocketState.ConnectedState:
+            timer.stop()
+            timer.deleteLater()
+            return
         if now >= deadline:
             _send_response(sock, {"ok": False, "error": "timeout"})
             timer.stop()
@@ -383,9 +399,21 @@ def _cmd_health_async(tab, module: str | None, timeout: int, sock: QLocalSocket)
                 timer.stop()
                 timer.deleteLater()
                 return
+            # 外部启动的进程：靠命令行匹配感知到也算健康
+            try:
+                external = tab._detect_external_modules()
+            except Exception:
+                external = {}
+            if module in external:
+                elapsed_ms = int((time.time() - start_time) * 1000)
+                _send_response(sock, {"ok": True, "elapsed_ms": elapsed_ms, "external": True})
+                timer.stop()
+                timer.deleteLater()
+                return
         elif not tab._is_multi_module:
-            # 单模块：检查 runner 的端口快照
-            if hasattr(tab.runner, '_port_snapshot') and tab.runner._port_snapshot:
+            # 单模块：查端口快照（后台扫描器维护的全局快照，不阻塞）
+            default_port = tab.project_meta.default_port
+            if default_port and find_port_holder(default_port):
                 elapsed_ms = int((time.time() - start_time) * 1000)
                 _send_response(sock, {"ok": True, "elapsed_ms": elapsed_ms})
                 timer.stop()
@@ -400,7 +428,7 @@ def _cmd_health_async(tab, module: str | None, timeout: int, sock: QLocalSocket)
     _check()
 
 
-def _cmd_compile_async(tab, sock: QLocalSocket) -> None:
+def _cmd_compile_async(tab, sock: QLocalSocket, timeout: int = 300) -> None:
     """触发编译并等待完成。"""
     from src.ui.project_tab import ProjectTab
     tab: ProjectTab
@@ -420,9 +448,10 @@ def _cmd_compile_async(tab, sock: QLocalSocket) -> None:
 
     tab._start_profile(compile_prof)
 
-    def _on_finished(exit_code: int):
-        tab.runner.finished.disconnect(_on_finished)
-        # 收集编译输出
+    # 状态用 list 装，方便闭包改写；done 防止 finished 与超时重复响应
+    state = {"done": False}
+
+    def _collect_output() -> str:
         end_block = doc.blockCount()
         output_lines = []
         block = doc.findBlockByNumber(start_block)
@@ -433,11 +462,34 @@ def _cmd_compile_async(tab, sock: QLocalSocket) -> None:
                 output_lines.append(text)
             block = block.next()
             count += 1
-        output = "\n".join(output_lines[-200:])  # 最多 200 行
+        return "\n".join(output_lines[-200:])  # 最多 200 行
 
-        if exit_code == 0:
-            _send_response(sock, {"ok": True, "exit_code": 0, "output": output})
-        else:
-            _send_response(sock, {"ok": False, "exit_code": exit_code, "output": output})
+    def _finish(payload: dict) -> None:
+        if state["done"]:
+            return
+        state["done"] = True
+        deadline_timer.stop()
+        deadline_timer.deleteLater()
+        try:
+            tab.runner.finished.disconnect(_on_finished)
+        except (RuntimeError, TypeError):
+            pass
+        if sock.state() == QLocalSocket.LocalSocketState.ConnectedState:
+            _send_response(sock, payload)
+
+    def _on_finished(exit_code: int):
+        output = _collect_output()
+        ok = exit_code == 0
+        _finish({"ok": ok, "exit_code": exit_code, "output": output})
+
+    def _on_deadline():
+        # 超时：编译还在跑，返回超时（不强停编译，让它在 GUI 里继续）
+        _finish({"ok": False, "error": "compile timeout", "output": _collect_output()})
 
     tab.runner.finished.connect(_on_finished)
+
+    deadline_timer = QTimer()
+    deadline_timer.setSingleShot(True)
+    deadline_timer.setInterval(max(1, timeout) * 1000)
+    deadline_timer.timeout.connect(_on_deadline)
+    deadline_timer.start()

@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import logging
 import re
 import time
 from pathlib import Path
@@ -29,7 +30,8 @@ from src.ui.quick_open import (
     PickerItem, show_command_palette, show_recent_files,
 )
 from src.ui.service_panel import (
-    STATE_IDLE, STATE_RUNNING, STATE_STARTING, STATE_STOPPING, ServicePanel,
+    STATE_IDLE, STATE_RUNNING, STATE_RUNNING_EXTERNAL, STATE_STARTING,
+    STATE_STOPPING, ServicePanel,
 )
 from src.ui.settings_panel import SettingsPanel
 from src.ui.theme import (
@@ -49,6 +51,8 @@ GIT_FETCH_INITIAL_DELAY_MS = 8000
 MODULE_STOP_TIMEOUT_MS = 10000
 RESTART_GAP_MS = 1800
 COMPILE_THEN_RUN_GAP_MS = 300
+
+log = logging.getLogger("mini-ide")
 
 
 # 状态栏分支/改动按钮的 base QSS（透明、hover 高亮 BG_L4）
@@ -137,6 +141,9 @@ class ProjectTab(QWidget):
         self._module_ports: dict[str, int] = {}
         # 用户关 tab 触发 stop 的模块集合；finished 时自动清理 tab
         self._closing_modules: set[str] = set()
+        # 「外部启动感知」：非 mini-ide 拉起、但端口快照里按 cmdline 匹配到的模块 → pid。
+        # 这些模块面板显示「运行中(外部)」，停止按钮走 kill_pid 而非 runner.stop()。
+        self._module_external_pids: dict[str, int] = {}
 
         # 文件树「▶ 运行脚本」启动的脚本：每个脚本绝对路径一个独立 runner + log tab。
         # 与 module_runners 完全解耦，不进 ServicePanel，不影响多模块聚合状态。
@@ -152,6 +159,10 @@ class ProjectTab(QWidget):
         self._git_merge_worker: GitMergePushWorker | None = None
         self._git_status_worker: GitStatusWorker | None = None
         self._git_viewer = None
+        self._merge_dialog = None
+        # 手动「刷新远程分支」才给反馈；后台 5 分钟轮询保持静默
+        self._fetch_manual = False
+        self._fetch_behind_before = 0
         # 启动完成标记：日志里看到 Started / ready in 等 marker 后，只给状态栏贴一次"✓ 启动完成"
         self._startup_phase_marked = False
         self._recent_files: list[str] = []     # 最近在预览里打开的文件
@@ -236,6 +247,12 @@ class ProjectTab(QWidget):
         _bar = self.center_tabs.tabBar()
         _bar.setTabButton(0, QTabBar.ButtonPosition.RightSide, None)
         _bar.setTabButton(0, QTabBar.ButtonPosition.LeftSide, None)
+        # 多模块（微服务）项目：项目级日志平时是空的（各模块输出进各自 tab），
+        # 默认隐藏这个常驻 tab；一旦有全局消息（整体编译输出 / 告警）写入就自动显示回来。
+        # tab 始终留在 index 0，只切 visible，不动结构，避免别处「index 0 即日志」的假设错位。
+        if self._is_multi_module:
+            self.center_tabs.setTabVisible(0, False)
+            self.log.contentAdded.connect(self._reveal_log_tab)
         # tab 右键菜单：关闭 / 关闭其它 / 关闭右侧 / 关闭左侧
         _bar.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         _bar.customContextMenuRequested.connect(self._on_tab_bar_context_menu)
@@ -503,6 +520,19 @@ class ProjectTab(QWidget):
         runner = self._ensure_module_runner(module)
         if runner.is_running():
             return
+        # 已有外部进程占着该模块：避免重复拉起导致端口冲突，先让用户确认
+        if module in self._module_external_pids:
+            pid = self._module_external_pids[module]
+            ret = QMessageBox.question(
+                self, "模块已在外部运行",
+                f"模块「{module}」似乎已在 mini-ide 之外运行（PID {pid}）。\n"
+                f"仍要再启动一个实例吗？（可能端口冲突）",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if ret != QMessageBox.StandardButton.Yes:
+                return
+            self._module_external_pids.pop(module, None)
         log_w = self._ensure_module_log_tab(module)
         log_w.begin_run(f"{self.project_meta.name}-{module}")
         ctx = RunContext(
@@ -519,15 +549,44 @@ class ProjectTab(QWidget):
 
     def _stop_module(self, module: str) -> None:
         runner = self.module_runners.get(module)
-        if not runner or not runner.is_running():
+        if runner and runner.is_running():
+            runner.stop()
             return
-        runner.stop()
+        # 外部进程（非 mini-ide 拉起）：按感知到的 pid 结束。需用户确认，避免误杀。
+        pid = self._module_external_pids.get(module)
+        if pid is not None:
+            ret = QMessageBox.question(
+                self, "停止外部进程",
+                f"模块「{module}」是在 mini-ide 之外启动的（PID {pid}）。\n"
+                f"确定要结束该进程及其子进程吗？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if ret != QMessageBox.StandardButton.Yes:
+                return
+            from src.core.process_runner import kill_pid
+            if self.service_panel:
+                self.service_panel.update_state(module, STATE_STOPPING)
+            ok = kill_pid(pid)
+            if ok:
+                self._module_external_pids.pop(module, None)
+                if self.service_panel:
+                    self.service_panel.update_state(module, STATE_IDLE)
+            else:
+                self.log.append_line("stderr", f"[停止失败] 无法结束 {module} (PID {pid})")
+                # 刷新会重新感知真实状态
+                self._refresh_status_row()
 
     def _start_all_modules(self) -> None:
         """并行启动所有未运行的模块（无依赖编排——用户砍掉 Workspace 时已认可）"""
+        # 先刷新一次外部感知，避免对已在外部运行的模块重复拉起
+        self._detect_and_apply_external()
         for mod_name, _path, _port in self.project_meta.spring_boot_modules:
             r = self.module_runners.get(mod_name)
             if r and r.is_running():
+                continue
+            if mod_name in self._module_external_pids:
+                # 已在外部运行，跳过（不弹确认框）
                 continue
             self._start_module(mod_name)
 
@@ -759,11 +818,16 @@ class ProjectTab(QWidget):
         return any(r.is_running() for r in self._script_runners.values())
 
     def _refresh_aggregate_state(self) -> None:
-        """多模块项目：根据所有 runner 汇总状态更新状态栏 dot / lbl_state"""
+        """多模块项目：根据所有 runner + 外部感知汇总状态更新状态栏 dot / lbl_state"""
         if not self._is_multi_module:
             return
         total = len(self.project_meta.spring_boot_modules)
         running = sum(1 for r in self.module_runners.values() if r.is_running())
+        # 外部感知到、且不是自管理 runner 在跑的模块也计入
+        running += sum(
+            1 for m in self._module_external_pids
+            if not (self.module_runners.get(m) and self.module_runners[m].is_running())
+        )
         stopping = any(r.state() == "stopping" for r in self.module_runners.values())
         if running == 0 and not stopping:
             self.dot.setStyleSheet(f"color: {DOT_IDLE};")
@@ -838,25 +902,112 @@ class ProjectTab(QWidget):
             )
         self._startup_phase_marked = False
 
+    def _detect_external_modules(self) -> dict[str, tuple[int, int]]:
+        """从后台端口快照里按命令行匹配各模块，返回 {module: (pid, port)}。
+
+        感知非 mini-ide 启动的进程（AI / 终端 / IDE 起的）。匹配信号：
+        监听进程的 cmdline 含模块绝对路径（normalize 后），或含 /模块名/ 这类
+        明确的模块标识。匹配不到端口的模块（如 timing-service）也能被认出来。
+
+        只读后台快照，不阻塞主线程。
+        """
+        from src.core.process_runner import port_snapshot
+
+        snap = port_snapshot()
+        if not snap:
+            return {}
+
+        # 候选：(module, 归一化匹配键列表)
+        result: dict[str, tuple[int, int]] = {}
+        used_pids: set[int] = set()
+        for mod_name, mod_path, _port in self.project_meta.spring_boot_modules:
+            keys = self._module_match_keys(mod_name, mod_path)
+            best: tuple[int, int] | None = None
+            for port, holders in snap.items():
+                for h in holders:
+                    pid = h.get("pid")
+                    if pid is None or pid in used_pids:
+                        continue
+                    cmd = (h.get("cmdline") or "").replace("\\", "/").lower()
+                    if not cmd:
+                        continue
+                    if any(k in cmd for k in keys):
+                        best = (pid, port)
+                        break
+                if best:
+                    break
+            if best:
+                result[mod_name] = best
+                used_pids.add(best[0])
+        return result
+
+    def _module_match_keys(self, mod_name: str, mod_path: str) -> list[str]:
+        """生成用于匹配进程命令行的关键字（已归一化为正斜杠小写）。"""
+        keys: list[str] = []
+        norm_path = mod_path.replace("\\", "/").lower().rstrip("/")
+        if norm_path:
+            keys.append(norm_path)
+        # gradle 模块名 a:b → 路径片段 a/b；普通模块名直接作为路径片段
+        seg = mod_name.replace(":", "/").lower().strip("/")
+        if seg:
+            keys.append(f"/{seg}/")
+            keys.append(f"/{seg}.jar")
+            keys.append(f"/{seg}-")  # 带版本号的 jar：timing-service-1.0.jar
+        return keys
+
+    def _detect_and_apply_external(self) -> None:
+        """刷新 _module_external_pids（不碰面板，仅供批量启动前去重用）。"""
+        external = self._detect_external_modules()
+        for mod_name, _path, _port in self.project_meta.spring_boot_modules:
+            r = self.module_runners.get(mod_name)
+            if r and r.is_running():
+                self._module_external_pids.pop(mod_name, None)
+            elif mod_name in external:
+                self._module_external_pids[mod_name] = external[mod_name][0]
+            else:
+                self._module_external_pids.pop(mod_name, None)
+
     def _refresh_status_row(self) -> None:
         if self._is_multi_module:
             # 多模块：顶部只显示 "N/M 运行中"；每行运行时长更新到 ServicePanel
+            external = self._detect_external_modules()
             running = 0
-            for mod_name, r in self.module_runners.items():
-                if r.is_running():
+            for mod_name, _path, _port in self.project_meta.spring_boot_modules:
+                r = self.module_runners.get(mod_name)
+                if r and r.is_running():
+                    # mini-ide 亲手拉起的进程优先，覆盖外部感知
                     running += 1
+                    self._module_external_pids.pop(mod_name, None)
                     if self.service_panel:
                         self.service_panel.update_state(
                             mod_name, STATE_RUNNING,
                             port=self._module_ports.get(mod_name),
                             elapsed_seconds=r.elapsed_seconds(),
                         )
-                elif r.state() == "idle" and self.service_panel:
-                    # 兜底：runner 已停但 panel 还在 RUNNING（信号被覆盖时会发生），
-                    # 强制刷成 IDLE，否则停止按钮会因为 runner._state == idle 直接 return
+                    continue
+                # 非自管理：runner 处于 stopping 时不抢状态，交给状态机回调
+                if r and r.state() == "stopping":
+                    continue
+                if mod_name in external:
+                    # 外部进程（AI 或终端启动）——靠端口快照按命令行匹配到
+                    running += 1
+                    pid, port = external[mod_name]
+                    self._module_external_pids[mod_name] = pid
+                    if self.service_panel:
+                        self.service_panel.update_state(
+                            mod_name, STATE_RUNNING_EXTERNAL, port=port,
+                        )
+                    continue
+                # 既非自管理也无外部进程：清掉外部标记，刷成 IDLE
+                self._module_external_pids.pop(mod_name, None)
+                if self.service_panel:
                     row = self.service_panel._rows.get(mod_name)
-                    if row and row.current_state() in (STATE_RUNNING, STATE_STARTING):
-                        self._module_ports.pop(mod_name, None)
+                    if row and row.current_state() in (
+                        STATE_RUNNING, STATE_RUNNING_EXTERNAL, STATE_STARTING,
+                    ):
+                        # 自管理 runner 已停时一并清掉抓到的端口
+                        if not r or r.state() == "idle":
+                            self._module_ports.pop(mod_name, None)
                         self.service_panel.update_state(mod_name, STATE_IDLE)
             total = len(self.project_meta.spring_boot_modules)
             self.lbl_elapsed.setText(f"已运行 {running}/{total}" if running else "")
@@ -913,9 +1064,10 @@ class ProjectTab(QWidget):
             self.btn_changes.setVisible(False)
             return
         # 防抖：上一轮 worker 还在跑就跳过这一轮（避免堆积）。
-        # 注意：worker 跑完后绝不能 deleteLater——否则 self._git_status_worker
-        # 会变成已删除 C++ 对象的空壳，下一轮 isRunning() 抛 RuntimeError，
-        # 刷新循环从此永久卡死（提交后颜色不再变）。这里用 try 兜底 + 跑完置 None。
+        # 回收策略：finished→deleteLater 负责销毁 C++ 对象，done 回调里只把
+        # self._git_status_worker 置 None。下一轮看到 None 起新 worker，永远不再
+        # 通过该引用访问已被 deleteLater 的旧对象，因此既不泄漏也不会空壳崩溃。
+        # （旧实现为怕空壳崩溃而完全不回收，结果每 3s 漏一个 QThread，长开会耗尽句柄。）
         w = self._git_status_worker
         if w is not None:
             try:
@@ -926,23 +1078,23 @@ class ProjectTab(QWidget):
                 self._git_status_worker = None
         worker = GitStatusWorker(self.project_meta.path, parent=self)
         worker.done.connect(self._on_git_status_done)
+        worker.finished.connect(worker.deleteLater)
         self._git_status_worker = worker
         worker.start()
 
     def _on_git_status_done(
         self, statuses: dict, ignored: set, deleted_by_parent: dict, info,
     ) -> None:
-        import logging
-        log = logging.getLogger("mini-ide")
         log.debug(
             f"[git_colors] statuses={len(statuses)}, "
             f"ignored={len(ignored)}, deleted_groups={len(deleted_by_parent)}"
         )
         self._render_git_status_row(info)
         self.file_tree.update_git_status(statuses, ignored, deleted_by_parent)
-        # 本轮结束：清引用，让下一轮 _update_file_tree_git_colors 能正常起新 worker。
-        # worker 由 parent=self 持有，Qt 事件循环空闲时自然回收，无需 deleteLater。
-        self._git_status_worker = None
+        # 本轮结束：只在仍是当前 worker 时清引用（避免极端时序下把刚起的新 worker 误置空）。
+        # 对象本身由 finished→deleteLater 回收，这里不碰 C++ 生命周期。
+        if self.sender() is self._git_status_worker:
+            self._git_status_worker = None
 
     # ---- 文件跳转 ----
 
@@ -1110,6 +1262,11 @@ class ProjectTab(QWidget):
             return
         self._on_tab_close_requested(idx)
 
+    def _reveal_log_tab(self) -> None:
+        """多模块项目里日志 tab 默认隐藏；有全局消息写入时显示回来（不抢焦点）。"""
+        if not self.center_tabs.isTabVisible(0):
+            self.center_tabs.setTabVisible(0, True)
+
     def _on_tab_bar_context_menu(self, pos) -> None:
         """tabBar 右键菜单：关闭 / 关闭其它 / 关闭右侧 / 关闭左侧。
 
@@ -1187,7 +1344,7 @@ class ProjectTab(QWidget):
         remote = data["remote"]
         menu.set_current_branch(cur)
 
-        menu.addAction("🔄 刷新远程分支", self._start_remote_fetch)
+        menu.addAction("🔄 刷新远程分支", lambda: self._start_remote_fetch(manual=True))
         menu.addAction("🔀 合并远程分支到当前", self._show_merge_dialog)
         menu.addSeparator()
 
@@ -1216,23 +1373,56 @@ class ProjectTab(QWidget):
                 act.setData(b)
                 act.triggered.connect(lambda _=False, br=b: QApplication.clipboard().setText(br))
 
-    def _start_remote_fetch(self) -> None:
-        """后台 git fetch；不弹窗、不打扰，结果通过状态栏体现"""
+    def _start_remote_fetch(self, manual: bool = False) -> None:
+        """后台 git fetch。后台轮询时静默；手动点菜单（manual=True）给托盘反馈。"""
         if self._git_fetch_worker and self._git_fetch_worker.isRunning():
+            if manual:
+                notify.notify_info("刷新远程分支", "正在刷新，请稍候…")
             return
         from src.core.git_ops import has_upstream, is_git_repo
         path = self.project_meta.path
-        if not is_git_repo(path) or not has_upstream(path):
+        if not is_git_repo(path):
+            if manual:
+                notify.notify_warn("刷新远程分支", "当前项目不是 git 仓库。")
             return
+        if not has_upstream(path):
+            if manual:
+                notify.notify_warn("刷新远程分支", "当前分支没有配置远程上游，无法刷新。")
+            return
+        self._fetch_manual = manual
+        info_before = git_info.get_info(path)
+        self._fetch_behind_before = info_before.behind if info_before else 0
+        if manual:
+            notify.notify_info("刷新远程分支", "正在拉取远程更新…")
         self._git_fetch_worker = GitFetchWorker(path, parent=self)
         self._git_fetch_worker.done.connect(self._on_remote_fetch_done)
+        self._git_fetch_worker.finished.connect(self._git_fetch_worker.deleteLater)
         self._git_fetch_worker.start()
 
     def _on_remote_fetch_done(self, ok: bool) -> None:
+        if self.sender() is self._git_fetch_worker:
+            self._git_fetch_worker = None
+        manual = self._fetch_manual
+        self._fetch_manual = False
         if not ok:
+            if manual:
+                notify.notify_error("刷新远程分支", "拉取失败，请检查网络或远程仓库权限。")
             return
         git_info.invalidate(self.project_meta.path)
         self._refresh_status_row()
+        if not manual:
+            return
+        info = git_info.get_info(self.project_meta.path)
+        behind = info.behind if info else 0
+        new_commits = behind - self._fetch_behind_before
+        if behind > 0:
+            extra = f"，其中本次新增 {new_commits} 个" if new_commits > 0 else ""
+            notify.notify_success(
+                "刷新远程分支",
+                f"远程领先当前分支 {behind} 个提交{extra}，可用「合并远程分支」拉取。",
+            )
+        else:
+            notify.notify_success("刷新远程分支", "已是最新，没有需要合并的远程提交。")
 
     def _do_checkout(self, branch: str) -> None:
         from src.core.git_ops import is_dirty
@@ -1250,13 +1440,18 @@ class ProjectTab(QWidget):
             return
         self._git_checkout_worker = GitCheckoutWorker(path, branch, parent=self)
         self._git_checkout_worker.done.connect(self._on_checkout_done)
+        self._git_checkout_worker.finished.connect(self._git_checkout_worker.deleteLater)
         self._git_checkout_worker.start()
 
     def _on_checkout_done(self, ok: bool, msg: str) -> None:
+        if self.sender() is self._git_checkout_worker:
+            self._git_checkout_worker = None
         git_info.invalidate(self.project_meta.path)
         self._refresh_status_row()
         if ok:
-            notify.show("分支已切换", f"当前分支：{git_info.get(self.project_meta.path).branch}")
+            info = git_info.get_info(self.project_meta.path)
+            branch = info.branch if info else ""
+            notify.notify_success("分支已切换", f"当前分支：{branch}")
         else:
             QMessageBox.warning(self, "切换失败", msg)
 
@@ -1273,17 +1468,24 @@ class ProjectTab(QWidget):
         dlg = PickerDialog(f"合并远程分支到当前（{cur}）", self)
         dlg.set_static_items(items)
         dlg.picked.connect(self._do_merge_push)
-        dlg.show()
+        # 持有引用，避免局部变量回收；菜单关闭瞬间会抢焦点导致浮窗"失焦自动关闭"，
+        # 用 singleShot 等菜单彻底关掉后再弹，浮窗才能拿到焦点不被立即关闭。
+        self._merge_dialog = dlg
+        QTimer.singleShot(0, dlg.show)
 
     def _do_merge_push(self, remote_branch: str) -> None:
         if self._git_merge_worker and self._git_merge_worker.isRunning():
             return
         path = self.project_meta.path
+        notify.notify_info("合并远程分支", f"正在合并 {remote_branch} 并推送…")
         self._git_merge_worker = GitMergePushWorker(path, remote_branch, parent=self)
         self._git_merge_worker.done.connect(self._on_merge_push_done)
+        self._git_merge_worker.finished.connect(self._git_merge_worker.deleteLater)
         self._git_merge_worker.start()
 
     def _on_merge_push_done(self, ok: bool, msg: str) -> None:
+        if self.sender() is self._git_merge_worker:
+            self._git_merge_worker = None
         git_info.invalidate(self.project_meta.path)
         self._refresh_status_row()
         if ok:

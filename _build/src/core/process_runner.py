@@ -400,7 +400,9 @@ def _scan_once() -> dict[int, list[dict]]:
         try:
             proc = psutil.Process(pid)
             name = proc.name()
-            cmdline = " ".join(proc.cmdline()[:5])
+            # 全量 cmdline（截断到 2000 字符）：模块路径 / classpath / jar 名通常在靠后的参数里，
+            # 只取前 5 段会丢掉用于匹配模块的关键信息（外部启动感知依赖它）。
+            cmdline = " ".join(proc.cmdline())[:2000]
         except psutil.Error:
             name, cmdline = "?", ""
         holder = {"pid": pid, "name": name, "cmdline": cmdline}
@@ -435,6 +437,18 @@ def find_port_holder(port: int) -> list[dict]:
     _ensure_port_scanner()
     with _port_lock:
         return list(_port_snapshot.get(port, []))
+
+
+def port_snapshot() -> dict[int, list[dict]]:
+    """返回完整端口→监听进程快照的浅拷贝（不阻塞）。
+
+    给服务面板做「命令行匹配感知外部启动」用：一次拿到所有监听进程，
+    在主线程里按 cmdline 匹配各模块，避免逐端口反复加锁。
+    """
+    _ensure_port_scanner()
+    with _port_lock:
+        # 值是 list[dict]，dict 本身只读不改，浅拷贝足够避免迭代时被后台线程整体替换
+        return {p: list(holders) for p, holders in _port_snapshot.items()}
 
 
 def invalidate_port_cache() -> None:

@@ -26,7 +26,6 @@ class _ScanWorker(QThread):
 
     def __init__(self, project_root: str, parent=None):
         super().__init__(parent)
-        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self.project_root = project_root
 
     def run(self) -> None:
