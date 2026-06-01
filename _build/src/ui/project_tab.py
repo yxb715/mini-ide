@@ -917,6 +917,9 @@ class ProjectTab(QWidget):
         if not snap:
             return {}
 
+        # 项目根路径（归一化）——用于排除与本项目无关的同名进程
+        proj = (self.project_meta.path or "").replace("\\", "/").lower().rstrip("/")
+
         # 候选：(module, 归一化匹配键列表)
         result: dict[str, tuple[int, int]] = {}
         used_pids: set[int] = set()
@@ -930,6 +933,11 @@ class ProjectTab(QWidget):
                         continue
                     cmd = (h.get("cmdline") or "").replace("\\", "/").lower()
                     if not cmd:
+                        continue
+                    # 闸门：命令行必须含本项目根路径才算本项目的进程。否则像 Chrome
+                    # 的安装路径 (...\Chrome\Application\chrome.exe) 会用 "application"
+                    # 误撞模块名；别的项目里的同名模块也会被错认。
+                    if proj and proj not in cmd:
                         continue
                     if any(k in cmd for k in keys):
                         best = (pid, port)
