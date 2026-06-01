@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import shlex
 import shutil
 import subprocess
 import sys
@@ -32,7 +33,7 @@ from src.ui.theme import (
     ACCENT_SUBTLE, BG_L2, BG_L4, FG_BRIGHT, FG_PRIMARY, GIT_ADD, GIT_CONFLICT,
     GIT_DEL, GIT_IGNORED, GIT_MODIFY, apply_search_style,
 )
-from src.util.editor import reveal_in_explorer
+from src.util.editor import REVEAL_LABEL, reveal_in_explorer
 
 
 # 永远隐藏：只藏操作系统垃圾文件。构建产物/依赖目录（build/dist/node_modules/.git 等）
@@ -71,8 +72,11 @@ QTreeWidget::branch:closed:has-children:has-siblings {{
 """
 
 
-# 右键菜单"▶ 运行"显示的可执行脚本类型（按用户场景：bat/cmd/ps1/exe）
-_RUNNABLE_SCRIPT_EXTS = {".bat", ".cmd", ".ps1", ".exe"}
+# 右键菜单"▶ 运行"显示的可执行脚本类型（Windows: bat/cmd/ps1/exe；类 Unix: sh）
+if sys.platform == "win32":
+    _RUNNABLE_SCRIPT_EXTS = {".bat", ".cmd", ".ps1", ".exe"}
+else:
+    _RUNNABLE_SCRIPT_EXTS = {".sh", ".command", ".ps1"}
 _CUT_MIME = "application/x-mini-ide-cut"
 _NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 
@@ -129,6 +133,49 @@ def _find_powershell() -> str:
     return ""
 
 
+def _unix_terminal_launch_args(target_dir: Path, run_cmd: str) -> list[str]:
+    """类 Unix（macOS/Linux）下打开终端、cd 到目录并执行命令的 argv。
+
+    macOS：用 osascript 驱动终端——装了 iTerm 优先 iTerm，否则用系统 Terminal.app。
+    Linux：探测常见终端模拟器，回落到 x-terminal-emulator。
+    返回空 list 表示当前平台找不到可用终端。
+    """
+    cd_part = f"cd {shlex.quote(str(target_dir))}"
+    full = f"{cd_part} && {run_cmd}" if run_cmd else cd_part
+
+    if sys.platform == "darwin":
+        if shutil.which("osascript") is None:
+            return []
+        inner = full.replace("\\", "\\\\").replace('"', '\\"')
+        if Path("/Applications/iTerm.app").exists():
+            script = (
+                'tell application "iTerm"\n'
+                "  activate\n"
+                "  set newWindow to (create window with default profile)\n"
+                '  tell current session of newWindow to write text "%s"\n'
+                "end tell"
+            ) % inner
+        else:
+            script = (
+                'tell application "Terminal"\n'
+                "  activate\n"
+                '  do script "%s"\n'
+                "end tell"
+            ) % inner
+        return ["osascript", "-e", script]
+
+    # Linux：bash -lc 保持终端常驻，跑完命令后落到交互 shell
+    keep = f'{full}; exec "$SHELL"'
+    for term in ("x-terminal-emulator", "gnome-terminal", "konsole", "xterm"):
+        found = shutil.which(term)
+        if not found:
+            continue
+        if term == "gnome-terminal":
+            return [found, "--", "bash", "-lc", keep]
+        return [found, "-e", f"bash -lc {shlex.quote(keep)}"]
+    return []
+
+
 def _open_in_codex_args(target_dir: Path) -> list[str]:
     """Build a portable Codex launcher for the current machine.
 
@@ -136,6 +183,8 @@ def _open_in_codex_args(target_dir: Path) -> list[str]:
     a machine-local PowerShell path, which breaks when this project is copied to
     another computer.
     """
+    if sys.platform != "win32":
+        return _unix_terminal_launch_args(target_dir, "codex")
     target = str(target_dir)
     cmd = shutil.which("cmd.exe") or "cmd.exe"
     ps = _find_powershell()
@@ -144,7 +193,15 @@ def _open_in_codex_args(target_dir: Path) -> list[str]:
     return [cmd, "/c", "start", "", "/D", target, cmd, "/k", "codex"]
 
 
-def _open_in_cc_command(target_dir: Path) -> str:
+def _open_in_cc_command(target_dir: Path) -> str | list[str]:
+    """返回打开 Claude Code 的启动命令。
+
+    Windows 返回字符串（沿用注册表里现成的右键命令 / PowerShell 命令行）；
+    类 Unix 返回 argv list（osascript / 终端模拟器）。
+    """
+    if sys.platform != "win32":
+        return _unix_terminal_launch_args(target_dir, "claude")
+
     target = str(target_dir)
     if winreg is not None:
         for hive, subkey in _CC_REGISTRY_COMMANDS:
@@ -928,7 +985,7 @@ class FileTree(QWidget):
         # 外部工具 / 系统定位
         menu.addAction("在 cc 中打开", lambda d=target_dir: self._open_cc(d))
         menu.addAction("在 codex 中打开", lambda d=target_dir: self._open_codex(d))
-        menu.addAction("在资源管理器中显示", lambda: reveal_in_explorer(path))
+        menu.addAction(REVEAL_LABEL, lambda: reveal_in_explorer(path))
         menu.addSeparator()
 
         # 复制文本形式的路径信息
@@ -1189,6 +1246,12 @@ class FileTree(QWidget):
     def _open_codex(self, target_dir: Path) -> None:
         """在当前目录打开 Codex，按当前电脑环境动态选择终端。"""
         command = _open_in_codex_args(target_dir)
+        if not command:
+            QMessageBox.warning(
+                self, "启动 codex 失败",
+                "没有找到可用的终端来启动 codex。",
+            )
+            return
         try:
             subprocess.Popen(
                 command,
@@ -1204,8 +1267,8 @@ class FileTree(QWidget):
         command = _open_in_cc_command(target_dir)
         if not command:
             QMessageBox.warning(
-                self, "未找到 PowerShell",
-                "没有找到系统右键菜单的 Claude Code 命令，也未找到 PowerShell。",
+                self, "启动 Claude Code 失败",
+                "没有找到可用的终端来启动 Claude Code。",
             )
             return
         try:

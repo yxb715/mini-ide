@@ -17,6 +17,14 @@ from PySide6.QtGui import QDesktopServices
 _NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 _POPEN_KW = {"creationflags": _NO_WINDOW} if _NO_WINDOW else {}
 
+# 文件管理器在各平台的名字（菜单/按钮文案用）
+if sys.platform == "win32":
+    REVEAL_LABEL = "在资源管理器中显示"
+elif sys.platform == "darwin":
+    REVEAL_LABEL = "在访达中显示"
+else:
+    REVEAL_LABEL = "在文件管理器中显示"
+
 
 def open_in_editor(path: str, line: int = 0, column: int = 0,
                    editor_cmd: str = "", project_root: str = "") -> bool:
@@ -82,12 +90,15 @@ def open_folder(path: str) -> None:
 
 
 def reveal_in_explorer(path: str) -> None:
-    """在资源管理器中选中文件"""
+    """在系统文件管理器中选中文件（Windows 资源管理器 / macOS 访达 / Linux 文件管理器）"""
     p = Path(path)
     if not p.exists():
         return
-    if os.name == "nt":
+    if sys.platform == "win32":
         subprocess.Popen(["explorer", "/select,", str(p)], **_POPEN_KW)
+    elif sys.platform == "darwin":
+        # macOS：open -R 在访达里高亮选中该文件
+        subprocess.Popen(["open", "-R", str(p)])
     else:
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(p.parent)))
 

@@ -41,7 +41,7 @@ from src.ui.theme import (
     FG_DIM, FG_SECONDARY, RADIUS_SM, apply_search_style,
 )
 from src.util import app_log
-from src.util.editor import open_in_editor, reveal_in_explorer
+from src.util.editor import REVEAL_LABEL, open_in_editor, reveal_in_explorer
 
 log = app_log.get_logger("preview")
 
@@ -413,7 +413,7 @@ class FilePreviewPane(QWidget):
 
         btn_reveal = QToolButton()
         btn_reveal.setText("📁")
-        btn_reveal.setToolTip("在资源管理器中显示")
+        btn_reveal.setToolTip(REVEAL_LABEL)
         btn_reveal.clicked.connect(lambda: reveal_in_explorer(self.path))
         top.addWidget(btn_reveal)
 

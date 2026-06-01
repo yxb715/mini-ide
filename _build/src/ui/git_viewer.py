@@ -20,7 +20,7 @@ from src.ui.theme import (
     FG_SECONDARY, GIT_ADD, GIT_DEL, GIT_FILE_HEAD, GIT_HUNK, GIT_META,
     GIT_MODIFY,
 )
-from src.util.editor import reveal_in_explorer
+from src.util.editor import REVEAL_LABEL, reveal_in_explorer
 
 WORKER_CLOSE_WAIT_MS = 16000
 
@@ -301,7 +301,7 @@ class GitViewer(QDialog):
         if not file_exists:
             act_jump.setEnabled(False)
             act_jump.setText("打开文件（已删除）")
-        act_reveal = menu.addAction("在资源管理器中显示", lambda: reveal_in_explorer(str(abs_path)))
+        act_reveal = menu.addAction(REVEAL_LABEL, lambda: reveal_in_explorer(str(abs_path)))
         act_reveal.setEnabled(abs_path.exists())
         menu.addSeparator()
         menu.addAction("复制相对路径", lambda: QApplication.clipboard().setText(f.path))
