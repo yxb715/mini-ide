@@ -8,22 +8,16 @@ import os
 import shlex
 import shutil
 import subprocess
-import sys
 from pathlib import Path
 
 from PySide6.QtCore import QUrl
 from PySide6.QtGui import QDesktopServices
 
-_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
-_POPEN_KW = {"creationflags": _NO_WINDOW} if _NO_WINDOW else {}
+_NO_WINDOW = 0x08000000  # CREATE_NO_WINDOW
+_POPEN_KW = {"creationflags": _NO_WINDOW}
 
-# 文件管理器在各平台的名字（菜单/按钮文案用）
-if sys.platform == "win32":
-    REVEAL_LABEL = "在资源管理器中显示"
-elif sys.platform == "darwin":
-    REVEAL_LABEL = "在访达中显示"
-else:
-    REVEAL_LABEL = "在文件管理器中显示"
+# 文件管理器菜单/按钮文案
+REVEAL_LABEL = "在资源管理器中显示"
 
 
 def open_in_editor(path: str, line: int = 0, column: int = 0,
@@ -90,17 +84,11 @@ def open_folder(path: str) -> None:
 
 
 def reveal_in_explorer(path: str) -> None:
-    """在系统文件管理器中选中文件（Windows 资源管理器 / macOS 访达 / Linux 文件管理器）"""
+    """在资源管理器中选中文件"""
     p = Path(path)
     if not p.exists():
         return
-    if sys.platform == "win32":
-        subprocess.Popen(["explorer", "/select,", str(p)], **_POPEN_KW)
-    elif sys.platform == "darwin":
-        # macOS：open -R 在访达里高亮选中该文件
-        subprocess.Popen(["open", "-R", str(p)])
-    else:
-        QDesktopServices.openUrl(QUrl.fromLocalFile(str(p.parent)))
+    subprocess.Popen(["explorer", "/select,", str(p)], **_POPEN_KW)
 
 
 # ---- 内部 ----
@@ -157,7 +145,7 @@ def _resolve_launch(args: list[str]) -> list[str]:
     也不能直接执行 .cmd/.bat（VS Code 的 `code` 实际是 code.cmd 包装器）。
     所以这里用 shutil.which 解析全路径，遇到批处理就改走 `cmd /c`。
     """
-    if sys.platform != "win32" or not args:
+    if not args:
         return args
     prog = args[0]
     rest = args[1:]

@@ -12,7 +12,6 @@ from __future__ import annotations
 import json
 import re
 import shutil
-import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -71,26 +70,20 @@ def _file_exists(root: Path, *names: str) -> Path | None:
 
 
 def _gradle_cmd(root: Path) -> str:
-    """返回 Windows 下可用的 gradle 调用命令"""
-    if sys.platform == "win32":
-        wrapper = root / "gradlew.bat"
-        if wrapper.exists():
-            return str(wrapper)
-        if shutil.which("gradle"):
-            return "gradle"
-        return "gradlew.bat"
-    wrapper = root / "gradlew"
-    return str(wrapper) if wrapper.exists() else "gradle"
+    """返回可用的 gradle 调用命令（优先项目自带 gradlew.bat）"""
+    wrapper = root / "gradlew.bat"
+    if wrapper.exists():
+        return str(wrapper)
+    if shutil.which("gradle"):
+        return "gradle"
+    return "gradlew.bat"
 
 
 def _mvn_cmd(root: Path) -> str:
-    if sys.platform == "win32":
-        wrapper = root / "mvnw.cmd"
-        if wrapper.exists():
-            return str(wrapper)
-        return "mvn.cmd" if shutil.which("mvn.cmd") else "mvn"
-    wrapper = root / "mvnw"
-    return str(wrapper) if wrapper.exists() else "mvn"
+    wrapper = root / "mvnw.cmd"
+    if wrapper.exists():
+        return str(wrapper)
+    return "mvn.cmd" if shutil.which("mvn.cmd") else "mvn"
 
 
 def _scan_spring_profiles(root: Path) -> tuple[list[str], int | None, str]:
@@ -202,7 +195,14 @@ def _detect_gradle(root: Path) -> ProjectMeta | None:
     )
 
     gcmd = _gradle_cmd(root)
-    project_flag = ["-p", str(root)]
+    # --no-daemon：禁用 Gradle 常驻守护进程。
+    # 守护进程是独立于客户端长期驻留的进程，不挂在 mini-ide 启动的进程树下；
+    # bootRun 真正 fork 出的服务进程由守护进程托管，于是「停止」顺着自己启动的
+    # 进程线递归杀树时漏掉它——界面立刻显示「未启动」，但服务仍活着占着端口。
+    # 下次启动撞端口、残留逐轮堆积，根因即此。改为 --no-daemon 后服务直接挂在
+    # mini-ide 能管到的进程树下，停止即可连根清理。代价：每次启动少了守护进程
+    # 预热复用，慢几秒，开发态可接受。
+    project_flag = ["-p", str(root), "--no-daemon"]
     ignored = ["build", ".gradle", "out", ".idea"]
 
     if is_spring:

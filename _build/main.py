@@ -92,8 +92,6 @@ def _start_local_server(window: MainWindow) -> QLocalServer | None:
 def _set_windows_app_id():
     """让 Windows 任务栏按 mini-ide 自己的 AppUserModelID 分组并显示我们的图标，
     而不是 pythonw.exe 的默认蓝色 logo。必须在任何 window 显示前调用。"""
-    if sys.platform != "win32":
-        return
     try:
         import ctypes
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("whaty.mini-ide")

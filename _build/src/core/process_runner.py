@@ -8,7 +8,6 @@ from __future__ import annotations
 import os
 import shlex
 import shutil
-import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -200,8 +199,6 @@ def _suppress_console(proc: QProcess) -> None:
     QProcess 默认会继承父进程的 console 设置，GUI 程序（pythonw/打包后的 exe）
     启动 cmd.exe 时会弹一个黑框。用 CREATE_NO_WINDOW 标志压掉。
     """
-    if sys.platform != "win32":
-        return
     try:
         CREATE_NO_WINDOW = 0x08000000
 
@@ -229,8 +226,6 @@ def _split_program(cmd: list[str], env: dict[str, str] | None = None) -> tuple[s
         return "", []
     program = cmd[0]
     args = cmd[1:]
-    if sys.platform != "win32":
-        return program, args
 
     lower = program.lower()
     if lower.endswith((".bat", ".cmd")):

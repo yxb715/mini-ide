@@ -1,29 +1,19 @@
 """应用配置持久化
 
-跨会话保持，存储位置按平台自适应：
-- Windows: %APPDATA%/mini-ide/
-- macOS:   ~/Library/Application Support/mini-ide/
-- 其他:    $XDG_CONFIG_HOME/mini-ide/ 或 ~/.config/mini-ide/
+跨会话保持，存储在 %APPDATA%/mini-ide/。
 """
 from __future__ import annotations
 
 import json
 import os
-import sys
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any
 
 
 def _config_dir() -> Path:
-    if sys.platform == "darwin":
-        base = Path.home() / "Library" / "Application Support"
-    elif sys.platform == "win32":
-        appdata = os.environ.get("APPDATA")
-        base = Path(appdata) if appdata else Path.home() / "AppData" / "Roaming"
-    else:
-        xdg = os.environ.get("XDG_CONFIG_HOME")
-        base = Path(xdg) if xdg else Path.home() / ".config"
+    appdata = os.environ.get("APPDATA")
+    base = Path(appdata) if appdata else Path.home() / "AppData" / "Roaming"
     target = base / "mini-ide"
     target.mkdir(parents=True, exist_ok=True)
     return target
@@ -32,13 +22,12 @@ def _config_dir() -> Path:
 def _default_project_dir_guess() -> str:
     """猜测默认项目目录（每台机器自适应，猜不到返回空串）。
 
-    历史上 Windows 公司机器固定用 G:\\whaty\\project；其他机器（含 macOS）
-    在家目录下找常见的项目根目录名。都没有就返回空，由对话框 fallback。
+    公司机器固定用 G:\\whaty\\project；其他机器在家目录下找常见的项目根目录名。
+    都没有就返回空，由对话框 fallback。
     """
-    if sys.platform == "win32":
-        legacy = Path(r"G:\whaty\project")
-        if legacy.is_dir():
-            return str(legacy)
+    legacy = Path(r"G:\whaty\project")
+    if legacy.is_dir():
+        return str(legacy)
     home = Path.home()
     for name in ("Developer", "Projects", "projects", "project", "workspace", "dev", "code"):
         cand = home / name

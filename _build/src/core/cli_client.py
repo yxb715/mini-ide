@@ -25,8 +25,6 @@ def _safe_write(stream, text: str) -> None:
 
 def _attach_console():
     """GUI exe（runw 引导器）没有控制台，CLI 模式需要附加到父进程的控制台。"""
-    if sys.platform != "win32":
-        return
     try:
         import ctypes
         kernel32 = ctypes.windll.kernel32

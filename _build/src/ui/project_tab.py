@@ -6,8 +6,6 @@ from __future__ import annotations
 
 import logging
 import re
-import shutil
-import sys
 import time
 from pathlib import Path
 
@@ -761,16 +759,12 @@ class ProjectTab(QWidget):
             self._script_runners[key] = runner
 
         # 命令构造：按脚本类型选解释器。
-        # .ps1 → PowerShell（Windows 用 powershell，类 Unix 用 pwsh，没装则原样交出去）
-        # .sh/.command → bash（不要求脚本有可执行位）
+        # .ps1 → PowerShell
         # .bat/.cmd/.exe/其他 → 直接交给 process_runner._split_program 处理
         ext = p.suffix.lower()
         if ext == ".ps1":
-            ps = "powershell" if sys.platform == "win32" else (shutil.which("pwsh") or "pwsh")
-            command = [ps, "-NoLogo", "-NoProfile",
+            command = ["powershell", "-NoLogo", "-NoProfile",
                        "-ExecutionPolicy", "Bypass", "-File", str(p)]
-        elif ext in (".sh", ".command") and sys.platform != "win32":
-            command = ["bash", str(p)]
         else:
             # .bat / .cmd / .exe 都直接交给 _split_program；它会按扩展名走 cmd /c 或直跑
             command = [str(p)]
