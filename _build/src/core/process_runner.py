@@ -388,7 +388,10 @@ def _scan_once() -> dict[int, list[dict]]:
     for conn in conns:
         if not conn.laddr or not conn.pid:
             continue
-        if conn.status not in (psutil.CONN_LISTEN, psutil.CONN_ESTABLISHED, "LISTEN"):
+        # 只收 LISTEN：那才是服务对外提供的端口。ESTABLISHED 是临时连接
+        # （nacos/数据库/HTTP 客户端连出去的高位端口），把它们算进来会让服务面板
+        # 把某个随机高位端口误当成模块的服务端口显示（如 gateway 真实 19000 却显示 56720）。
+        if conn.status not in (psutil.CONN_LISTEN, "LISTEN"):
             continue
         pid_to_ports.setdefault(conn.pid, set()).add(conn.laddr.port)
     for pid, ports in pid_to_ports.items():

@@ -215,7 +215,7 @@ class ProjectTab(QWidget):
             left_wrap = QSplitter(Qt.Orientation.Vertical)
             left_wrap.setHandleWidth(2)
             self.service_panel = ServicePanel(
-                [(name, port) for name, _path, port in self.project_meta.spring_boot_modules],
+                [(name, port) for name, _path, port, _cls in self.project_meta.spring_boot_modules],
                 parent=self,
             )
             self.service_panel.startRequested.connect(self._start_module)
@@ -581,7 +581,7 @@ class ProjectTab(QWidget):
         """并行启动所有未运行的模块（无依赖编排——用户砍掉 Workspace 时已认可）"""
         # 先刷新一次外部感知，避免对已在外部运行的模块重复拉起
         self._detect_and_apply_external()
-        for mod_name, _path, _port in self.project_meta.spring_boot_modules:
+        for mod_name, _path, _port, _cls in self.project_meta.spring_boot_modules:
             r = self.module_runners.get(mod_name)
             if r and r.is_running():
                 continue
@@ -923,8 +923,9 @@ class ProjectTab(QWidget):
         # 候选：(module, 归一化匹配键列表)
         result: dict[str, tuple[int, int]] = {}
         used_pids: set[int] = set()
-        for mod_name, mod_path, _port in self.project_meta.spring_boot_modules:
-            keys = self._module_match_keys(mod_name, mod_path)
+        for mod_name, mod_path, _port, main_class in self.project_meta.spring_boot_modules:
+            keys = self._module_match_keys(mod_name, mod_path, main_class)
+            norm_cls = main_class.replace("\\", "/").lower() if main_class else ""
             best: tuple[int, int] | None = None
             for port, holders in snap.items():
                 for h in holders:
@@ -934,10 +935,15 @@ class ProjectTab(QWidget):
                     cmd = (h.get("cmdline") or "").replace("\\", "/").lower()
                     if not cmd:
                         continue
-                    # 闸门：命令行必须含本项目根路径才算本项目的进程。否则像 Chrome
-                    # 的安装路径 (...\Chrome\Application\chrome.exe) 会用 "application"
-                    # 误撞模块名；别的项目里的同名模块也会被错认。
-                    if proj and proj not in cmd:
+                    # 闸门：必须确认是「本项目」的进程，否则别的项目同名模块、
+                    # 甚至 Chrome (...\Application\chrome.exe) 会误撞模块名。
+                    # 两个可靠信号满足其一即可：
+                    #   1. 命令行含本项目根路径（IDE/终端直接 java -jar、展开 classpath 的场景）
+                    #   2. 命令行含本模块主类全限定名（gradle bootRun 把 classpath 塞进
+                    #      Temp jar，命令行里没有项目路径，只能靠主类认）
+                    in_project = bool(proj) and proj in cmd
+                    in_main_class = bool(norm_cls) and norm_cls in cmd
+                    if not (in_project or in_main_class):
                         continue
                     if any(k in cmd for k in keys):
                         best = (pid, port)
@@ -949,7 +955,7 @@ class ProjectTab(QWidget):
                 used_pids.add(best[0])
         return result
 
-    def _module_match_keys(self, mod_name: str, mod_path: str) -> list[str]:
+    def _module_match_keys(self, mod_name: str, mod_path: str, main_class: str = "") -> list[str]:
         """生成用于匹配进程命令行的关键字（已归一化为正斜杠小写）。"""
         keys: list[str] = []
         norm_path = mod_path.replace("\\", "/").lower().rstrip("/")
@@ -961,12 +967,17 @@ class ProjectTab(QWidget):
             keys.append(f"/{seg}/")
             keys.append(f"/{seg}.jar")
             keys.append(f"/{seg}-")  # 带版本号的 jar：timing-service-1.0.jar
+        # 主类全限定名：gradle bootRun 把 classpath 塞进 Temp jar 后，进程命令行里
+        # 没有项目路径，只剩主类名。这是认出本项目服务进程的关键信号，且带包名前缀
+        # （com.shwhaty.xxx）不会误撞 Chrome 等无关进程。
+        if main_class:
+            keys.append(main_class.lower())
         return keys
 
     def _detect_and_apply_external(self) -> None:
         """刷新 _module_external_pids（不碰面板，仅供批量启动前去重用）。"""
         external = self._detect_external_modules()
-        for mod_name, _path, _port in self.project_meta.spring_boot_modules:
+        for mod_name, _path, _port, _cls in self.project_meta.spring_boot_modules:
             r = self.module_runners.get(mod_name)
             if r and r.is_running():
                 self._module_external_pids.pop(mod_name, None)
@@ -980,7 +991,7 @@ class ProjectTab(QWidget):
             # 多模块：顶部只显示 "N/M 运行中"；每行运行时长更新到 ServicePanel
             external = self._detect_external_modules()
             running = 0
-            for mod_name, _path, _port in self.project_meta.spring_boot_modules:
+            for mod_name, _path, _port, _cls in self.project_meta.spring_boot_modules:
                 r = self.module_runners.get(mod_name)
                 if r and r.is_running():
                     # mini-ide 亲手拉起的进程优先，覆盖外部感知
@@ -1618,7 +1629,7 @@ class ProjectTab(QWidget):
                 f"并行启动所有 {len(self.project_meta.spring_boot_modules)} 个模块",
                 self._start_all_modules,
             ))
-            for mod_name, _path, _port in self.project_meta.spring_boot_modules:
+            for mod_name, _path, _port, _cls in self.project_meta.spring_boot_modules:
                 r = self.module_runners.get(mod_name)
                 if r and r.is_running():
                     commands.append((

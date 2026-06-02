@@ -46,10 +46,12 @@ class ProjectMeta:
     main_class: str = ""             # Spring Boot 主类（如能识别）
     spring_profiles: list[str] = field(default_factory=list)  # application-*.yml 扫描结果
     notes: list[str] = field(default_factory=list)            # 识别过程中的提示
-    # Spring Boot 多模块场景下所有带 @SpringBootApplication 的子模块：[(name, abs_path, port_or_None)]。
+    # Spring Boot 多模块场景下所有带 @SpringBootApplication 的子模块：
+    # [(name, abs_path, port_or_None, main_class)]。
     # ProjectTab 用来渲染左侧服务面板；≥2 个才算多模块。
     # port 从该模块自己的 application*.yml 扫出，扫不到填 None（运行时仍能启动）。
-    spring_boot_modules: list[tuple[str, str, int | None]] = field(default_factory=list)
+    # main_class 是 @SpringBootApplication 主类全限定名，供外部进程感知按命令行匹配。
+    spring_boot_modules: list[tuple[str, str, int | None, str]] = field(default_factory=list)
 
 
 # ---------- 工具函数 ----------
@@ -215,22 +217,26 @@ def _detect_gradle(root: Path) -> ProjectMeta | None:
         run_module = ""
         main_class = _detect_spring_boot_main(root)
         notes: list[str] = []
-        module_list: list[tuple[str, str, int | None]] = []
+        # 四元组：(模块名, 绝对路径, port_or_None, 主类全限定名)。
+        # 主类用于外部进程感知——gradle bootRun 把 classpath 塞进 Temp jar 后，
+        # 进程命令行里没有项目路径，只剩主类名，靠它才能认出本项目的服务进程。
+        module_list: list[tuple[str, str, int | None, str]] = []
         if boot_modules:
             run_module = boot_modules[0][0]
             main_class = boot_modules[0][2]
             # 每个子模块独立扫它自己的 application.yml 取 port，填到服务面板上显示
             per_module_scan = [
-                (name, path, _scan_spring_profiles(path))
-                for name, path, _ in boot_modules
+                (name, path, cls, _scan_spring_profiles(path))
+                for name, path, cls in boot_modules
             ]
-            module_list = [(name, str(path), scan[1]) for name, path, scan in per_module_scan]
+            module_list = [(name, str(path), scan[1], cls)
+                           for name, path, cls, scan in per_module_scan]
             if len(boot_modules) > 1:
                 names = ", ".join(m[0] for m in boot_modules)
                 notes.append(f"检测到多个 Spring Boot 模块: {names}")
             # 主启动模块的 profile 和 port 用来填 ProjectMeta 的默认值
-            _, port, ctx = per_module_scan[0][2]
-            profiles_list = per_module_scan[0][2][0]
+            _, port, ctx = per_module_scan[0][3]
+            profiles_list = per_module_scan[0][3][0]
         else:
             profiles_list, port, ctx = _scan_spring_profiles(root)
 

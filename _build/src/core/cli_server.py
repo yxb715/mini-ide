@@ -157,7 +157,7 @@ def _cmd_list_modules(tab) -> list:
     tab: ProjectTab
     modules = []
     external = getattr(tab, "_module_external_pids", {})
-    for mod_name, _path, _port in tab.project_meta.spring_boot_modules:
+    for mod_name, _path, _port, _cls in tab.project_meta.spring_boot_modules:
         runner = tab.module_runners.get(mod_name)
         state = runner.state() if runner else "stopped"
         pid = None
