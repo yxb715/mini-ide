@@ -202,13 +202,14 @@ def _cmd_start(tab, module: str | None) -> dict:
             runner = tab.module_runners.get(module)
             if runner and runner.is_running():
                 return {"ok": False, "error": "already running"}
-            if module in getattr(tab, "_module_external_pids", {}):
-                return {"ok": False, "error": "already running (external process)"}
-            tab._start_module(module)
+            # 刷新一次外部感知：若该模块被一个 mini-ide 没在管的进程占着，
+            # 静默启动会先接管（杀旧的 + 等端口释放）再用本实例启动。
+            tab._detect_and_apply_external()
+            tab._start_module(module, silent=True)
             return {"ok": True}
         else:
-            # 启动所有模块
-            tab._start_all_modules()
+            # 启动所有模块（含接管外部进程）
+            tab._start_all_modules(silent=True)
             return {"ok": True}
     else:
         # 单模块
@@ -246,7 +247,13 @@ def _cmd_stop(tab, module: str | None) -> dict:
 
 
 def _cmd_restart(tab, module: str | None) -> dict:
-    """同步 restart：stop → 等进程退出（最多 10s）→ start。"""
+    """同步 restart：stop → 等进程退出（最多 10s）→ start。
+
+    关键：目标模块可能是被一个 mini-ide 没在管的外部进程占着（典型：跨重启后靠
+    端口感知到的旧进程）。这种进程不能只 stop 自管理 runner（那一步对它无效），
+    必须按感知到的 PID 杀掉并等端口释放，否则新进程会撞端口瞬间退出。_start_module
+    的静默模式已内置这套接管逻辑。
+    """
     from src.ui.project_tab import ProjectTab
     tab: ProjectTab
 
@@ -261,7 +268,9 @@ def _cmd_restart(tab, module: str | None) -> dict:
                 # 等进程退出
                 if not _wait_runner_stop(runner, 10000):
                     return {"ok": False, "error": "stop timeout"}
-            tab._start_module(module)
+            # 刷新外部感知：外部进程交给 _start_module(silent) 接管
+            tab._detect_and_apply_external()
+            tab._start_module(module, silent=True)
             return {"ok": True}
         else:
             # 全部重启
@@ -273,7 +282,7 @@ def _cmd_restart(tab, module: str | None) -> dict:
             for mod_name, r in list(tab.module_runners.items()):
                 remaining = max(0, int((deadline - time.time()) * 1000))
                 _wait_runner_stop(r, remaining)
-            tab._start_all_modules()
+            tab._start_all_modules(silent=True)
             return {"ok": True}
     else:
         if tab.runner.is_running():

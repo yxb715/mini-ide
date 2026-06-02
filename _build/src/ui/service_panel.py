@@ -121,29 +121,15 @@ class _ServiceRow(QFrame):
             self.btn.setToolTip(f"{self.module_name} 正在启动")
             self.btn.setEnabled(False)
             self.btn.setStyleSheet(_row_btn_qss(COLOR_WARN, COLOR_WARN))
-        elif state == STATE_RUNNING:
+        elif state in (STATE_RUNNING, STATE_RUNNING_EXTERNAL):
+            # 不分内部/外部、不显示运行时长：CLI 与界面操作的是同一个 mini-ide 实例，
+            # 起来的服务一律显示「运行中」。外部进程（跨重启后靠端口感知到的）停止时
+            # 仍走 kill pid，但展示上不再区分。
             self.lbl_icon.setText("⏹")
             self.lbl_icon.setStyleSheet(f"color:{COLOR_SUCCESS}; font-size:{FONT_PT_UI}pt;")
-            parts: list[str] = []
-            if port_str:
-                parts.append(port_str)
-            if elapsed_seconds > 0:
-                m, s = divmod(int(elapsed_seconds), 60)
-                h, m = divmod(m, 60)
-                parts.append(f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}")
-            self.lbl_info.setText("  ".join(parts) if parts else "运行中")
+            self.lbl_info.setText(f"{port_str}  运行中".strip() if port_str else "运行中")
             self.btn.setText("⏹")
             self.btn.setToolTip(f"停止 {self.module_name}")
-            self.btn.setEnabled(True)
-            self.btn.setStyleSheet(_row_btn_qss(COLOR_SUCCESS, COLOR_SUCCESS))
-        elif state == STATE_RUNNING_EXTERNAL:
-            # 外部进程：图标用空心方块区分，文案标「(外部)」，仍可点停止（走 kill pid）
-            self.lbl_icon.setText("◻")
-            self.lbl_icon.setStyleSheet(f"color:{COLOR_SUCCESS}; font-size:{FONT_PT_UI}pt;")
-            label = f"{port_str}  运行中(外部)".strip() if port_str else "运行中(外部)"
-            self.lbl_info.setText(label)
-            self.btn.setText("⏹")
-            self.btn.setToolTip(f"停止 {self.module_name}（外部进程，将按端口结束 PID）")
             self.btn.setEnabled(True)
             self.btn.setStyleSheet(_row_btn_qss(COLOR_SUCCESS, COLOR_SUCCESS))
         elif state == STATE_STOPPING:

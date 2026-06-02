@@ -456,6 +456,22 @@ def invalidate_port_cache() -> None:
         _port_snapshot = {}
 
 
+def is_port_listening(port: int) -> bool:
+    """同步直查某端口当前是否仍有进程监听（不走后台快照，用于 kill 后确认释放）。
+
+    后台快照每数秒才刷新一次、且 kill 后会被清空，等待端口释放时不能依赖它，
+    否则会被「快照已清空 → 误判已释放」骗到。这里实时查一次 net_connections。
+    """
+    try:
+        for conn in psutil.net_connections(kind="inet"):
+            if conn.laddr and conn.laddr.port == port and \
+                    conn.status in (psutil.CONN_LISTEN, "LISTEN"):
+                return True
+    except (psutil.AccessDenied, psutil.Error):
+        pass
+    return False
+
+
 def kill_pid(pid: int) -> bool:
     """一键杀掉指定 PID 及其子进程"""
     try:

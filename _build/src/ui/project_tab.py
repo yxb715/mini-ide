@@ -512,27 +512,39 @@ class ProjectTab(QWidget):
         self.center_tabs.setCurrentIndex(idx)
         return lw
 
-    def _start_module(self, module: str) -> None:
+    def _start_module(self, module: str, silent: bool = False) -> None:
+        """启动单个模块。
+
+        silent=True 时用于 CLI：不弹任何确认框。若该模块已被一个 mini-ide
+        没在管的外部进程占着（典型：跨重启后靠端口感知到的旧进程），先按 PID
+        把它停掉、等端口释放，再用 mini-ide 自己启动——这样起来的就是 mini-ide
+        亲手管理的进程，界面正常显示「运行中」，不会再留外部标记。
+        """
         prof = self._find_module_run_profile(module)
         if not prof:
-            QMessageBox.warning(self, "启动失败", f"未找到模块「{module}」的启动命令")
+            if not silent:
+                QMessageBox.warning(self, "启动失败", f"未找到模块「{module}」的启动命令")
             return
         runner = self._ensure_module_runner(module)
         if runner.is_running():
             return
-        # 已有外部进程占着该模块：避免重复拉起导致端口冲突，先让用户确认
+        # 已有外部进程占着该模块
         if module in self._module_external_pids:
             pid = self._module_external_pids[module]
-            ret = QMessageBox.question(
-                self, "模块已在外部运行",
-                f"模块「{module}」似乎已在 mini-ide 之外运行（PID {pid}）。\n"
-                f"仍要再启动一个实例吗？（可能端口冲突）",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            if ret != QMessageBox.StandardButton.Yes:
-                return
-            self._module_external_pids.pop(module, None)
+            if silent:
+                # CLI：静默接管——杀掉旧的外部进程并等端口释放，避免新进程撞端口秒退
+                self._takeover_external(module)
+            else:
+                ret = QMessageBox.question(
+                    self, "模块已在外部运行",
+                    f"模块「{module}」似乎已在 mini-ide 之外运行（PID {pid}）。\n"
+                    f"仍要再启动一个实例吗？（可能端口冲突）",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if ret != QMessageBox.StandardButton.Yes:
+                    return
+                self._module_external_pids.pop(module, None)
         log_w = self._ensure_module_log_tab(module)
         log_w.begin_run(f"{self.project_meta.name}-{module}")
         ctx = RunContext(
@@ -546,6 +558,34 @@ class ProjectTab(QWidget):
         ok = runner.start(list(prof.command), ctx)
         if not ok:
             log_w.append_line("stderr", f"[启动失败] 无法启动 {module}")
+
+    def _takeover_external(self, module: str) -> bool:
+        """杀掉占着该模块的外部进程并等端口真正释放。返回端口是否已空出。
+
+        给 CLI 静默启动/重启用：旧进程不是 mini-ide 亲手起的（只靠扫端口感知到），
+        重启时若不先停掉它，新进程会撞端口/gradle 冲突，瞬间以错误码退出，结果旧的
+        没停、新的没起，界面继续挂着外部标记。
+        """
+        from src.core.process_runner import kill_pid, is_port_listening
+        port = self._module_ports.get(module)
+        pid = self._module_external_pids.pop(module, None)
+        if pid:
+            kill_pid(pid)
+        # 等端口真正释放（最多 ~8s）。用实时直查而非后台快照：kill 后快照会被清空，
+        # 依赖它会被「清空 = 已释放」骗到。期间 processEvents 让 UI 不至于完全冻结。
+        if port:
+            import time
+            from PySide6.QtCore import QCoreApplication, QEventLoop
+            deadline = time.time() + 8.0
+            while time.time() < deadline:
+                if not is_port_listening(port):
+                    return True
+                QCoreApplication.processEvents(
+                    QEventLoop.ProcessEventsFlag.AllEvents, 100
+                )
+            return not is_port_listening(port)
+        return True
+
 
     def _stop_module(self, module: str) -> None:
         runner = self.module_runners.get(module)
@@ -577,18 +617,22 @@ class ProjectTab(QWidget):
                 # 刷新会重新感知真实状态
                 self._refresh_status_row()
 
-    def _start_all_modules(self) -> None:
-        """并行启动所有未运行的模块（无依赖编排——用户砍掉 Workspace 时已认可）"""
+    def _start_all_modules(self, silent: bool = False) -> None:
+        """并行启动所有未运行的模块（无依赖编排——用户砍掉 Workspace 时已认可）
+
+        silent=True（CLI 全部启动）：对靠端口感知到的外部进程也接管——先杀旧的
+        再用 mini-ide 启动，使其纳入本实例管理。界面操作时仍跳过外部进程不重复拉起。
+        """
         # 先刷新一次外部感知，避免对已在外部运行的模块重复拉起
         self._detect_and_apply_external()
         for mod_name, _path, _port, _cls in self.project_meta.spring_boot_modules:
             r = self.module_runners.get(mod_name)
             if r and r.is_running():
                 continue
-            if mod_name in self._module_external_pids:
+            if mod_name in self._module_external_pids and not silent:
                 # 已在外部运行，跳过（不弹确认框）
                 continue
-            self._start_module(mod_name)
+            self._start_module(mod_name, silent=silent)
 
     def _stop_all_modules(self) -> None:
         """并行停止所有运行中的模块"""
@@ -975,14 +1019,21 @@ class ProjectTab(QWidget):
         return keys
 
     def _detect_and_apply_external(self) -> None:
-        """刷新 _module_external_pids（不碰面板，仅供批量启动前去重用）。"""
+        """刷新 _module_external_pids（不碰面板，仅供批量启动前去重用）。
+
+        同时把感知到的外部端口记入 _module_ports，供 _takeover_external 精确等待
+        端口释放。
+        """
         external = self._detect_external_modules()
         for mod_name, _path, _port, _cls in self.project_meta.spring_boot_modules:
             r = self.module_runners.get(mod_name)
             if r and r.is_running():
                 self._module_external_pids.pop(mod_name, None)
             elif mod_name in external:
-                self._module_external_pids[mod_name] = external[mod_name][0]
+                pid, port = external[mod_name]
+                self._module_external_pids[mod_name] = pid
+                if port:
+                    self._module_ports[mod_name] = port
             else:
                 self._module_external_pids.pop(mod_name, None)
 
