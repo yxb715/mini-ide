@@ -136,7 +136,7 @@ def _find_powershell() -> str:
 def _unix_terminal_launch_args(target_dir: Path, run_cmd: str) -> list[str]:
     """类 Unix（macOS/Linux）下打开终端、cd 到目录并执行命令的 argv。
 
-    macOS：用 osascript 驱动终端——装了 iTerm 优先 iTerm，否则用系统 Terminal.app。
+    macOS：用 osascript 驱动系统自带的 Terminal.app（统一用系统终端，不再优先 iTerm）。
     Linux：探测常见终端模拟器，回落到 x-terminal-emulator。
     返回空 list 表示当前平台找不到可用终端。
     """
@@ -147,21 +147,12 @@ def _unix_terminal_launch_args(target_dir: Path, run_cmd: str) -> list[str]:
         if shutil.which("osascript") is None:
             return []
         inner = full.replace("\\", "\\\\").replace('"', '\\"')
-        if Path("/Applications/iTerm.app").exists():
-            script = (
-                'tell application "iTerm"\n'
-                "  activate\n"
-                "  set newWindow to (create window with default profile)\n"
-                '  tell current session of newWindow to write text "%s"\n'
-                "end tell"
-            ) % inner
-        else:
-            script = (
-                'tell application "Terminal"\n'
-                "  activate\n"
-                '  do script "%s"\n'
-                "end tell"
-            ) % inner
+        script = (
+            'tell application "Terminal"\n'
+            "  activate\n"
+            '  do script "%s"\n'
+            "end tell"
+        ) % inner
         return ["osascript", "-e", script]
 
     # Linux：bash -lc 保持终端常驻，跑完命令后落到交互 shell

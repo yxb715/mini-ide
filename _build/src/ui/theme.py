@@ -137,11 +137,12 @@ W_LEFT_PANEL = 260
 # 字号（point）
 # macOS 上字偏小：UI 字号按 Windows 96 DPI 标尺设计，而 macOS 逻辑 DPI 锁定 72，
 # 同样 pt 字号渲染像素缩水约 25%。Qt6 在 Mac 上忽略 QT_FONT_DPI / QT_SCALE_FACTOR，
-# 无法靠 DPI 校正，只能直接抬高字号。Mac 用 ×1.1（×1.33/1.2 偏大，×1.1 适中）。
+# 无法靠 DPI 校正，只能直接抬高字号。低分屏(2048×1152)下 mac 再缩一档，
+# ×0.93 让每个字号约减 1pt；Windows 仍用 1.0。高分屏曾用 ×1.1。
 import sys as _sys
-_FONT_SCALE = 1.1 if _sys.platform == "darwin" else 1.0
-# 树/列表行的上下内边距：字号放大后行高要同步加大，否则行距偏挤。Mac 用更大值。
-TREE_ITEM_PAD_V = 6 if _sys.platform == "darwin" else 3
+_FONT_SCALE = 0.93 if _sys.platform == "darwin" else 1.0
+# 树/列表行的上下内边距：取消字号放大后行高回到常规值。
+TREE_ITEM_PAD_V = 3 if _sys.platform == "darwin" else 3
 FONT_PT_UI = round(15 * _FONT_SCALE)       # UI 主字号（13+2，整套放大一档）
 FONT_PT_UI_SM = round(14 * _FONT_SCALE)    # 副标题 / 次级文字
 FONT_PT_UI_LG = round(17 * _FONT_SCALE)    # 标题
