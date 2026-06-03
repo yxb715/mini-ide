@@ -135,12 +135,12 @@ H_STATUSBAR = 24
 W_LEFT_PANEL = 260
 
 # 字号（point）
-TREE_ITEM_PAD_V = 3                        # 树/列表行的上下内边距
-FONT_PT_UI = 15       # UI 主字号（13+2，整套放大一档）
-FONT_PT_UI_SM = 14    # 副标题 / 次级文字
-FONT_PT_UI_LG = 17    # 标题
-FONT_PT_CODE = 18     # 编辑器 / 日志
-FONT_PT_DIFF = 16     # diff 视图
+TREE_ITEM_PAD_V = 3        # 树/列表行的上下内边距
+FONT_PT_UI = 10            # UI 主字号（Qt 默认 9 偏小）
+FONT_PT_UI_SM = 9          # 副标题 / 次级文字
+FONT_PT_UI_LG = 12         # 标题
+FONT_PT_CODE = 13          # 编辑器 / 日志
+FONT_PT_DIFF = 11          # diff 视图
 
 # 字体族
 FONT_FAMILY_UI = '"Segoe UI", "Microsoft YaHei UI", system-ui, sans-serif'
