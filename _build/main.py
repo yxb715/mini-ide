@@ -47,7 +47,7 @@ def _forward_to_existing(path: str | None) -> bool:
 
 def _start_local_server(window: MainWindow) -> QLocalServer | None:
     """在本实例启动 IPC server 监听后续右键请求。"""
-    # Unix 残留 socket 文件清理（Windows named pipe 自动回收，无副作用）
+    # 清理可能残留的同名 server（Windows named pipe 自动回收，调用无副作用）
     QLocalServer.removeServer(SERVER_NAME)
     server = QLocalServer(window)
     if not server.listen(SERVER_NAME):
@@ -127,13 +127,8 @@ def main():
             logger.info("检测到已运行的 mini-ide，已转发路径=%r 后退出", initial_project)
             return
 
-        # 图标：macOS 用带留白边距的 .icns（符合 Dock 图标规范，不会显得偏大），
-        # 其他平台优先 ICO（Windows 任务栏更清晰），都回落 PNG。
-        if sys.platform == "darwin":
-            icon_names = ("icon.icns", "icon.png")
-        else:
-            icon_names = ("icon.ico", "icon.png")
-        for name in icon_names:
+        # 图标：优先 ICO（Windows 任务栏更清晰），回落 PNG。
+        for name in ("icon.ico", "icon.png"):
             icon_path = ROOT / "src" / "resources" / name
             if icon_path.exists():
                 app.setWindowIcon(QIcon(str(icon_path)))

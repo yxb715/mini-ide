@@ -6,8 +6,6 @@ from __future__ import annotations
 
 import logging
 import re
-import shutil
-import sys
 import time
 from pathlib import Path
 
@@ -589,23 +587,25 @@ class ProjectTab(QWidget):
         return True
 
 
-    def _stop_module(self, module: str) -> None:
+    def _stop_module(self, module: str, silent: bool = False) -> None:
         runner = self.module_runners.get(module)
         if runner and runner.is_running():
             runner.stop()
             return
-        # 外部进程（非 mini-ide 拉起）：按感知到的 pid 结束。需用户确认，避免误杀。
+        # 外部进程（非 mini-ide 拉起）：按感知到的 pid 结束。
+        # GUI 操作需用户确认避免误杀；CLI（silent）直接停。
         pid = self._module_external_pids.get(module)
         if pid is not None:
-            ret = QMessageBox.question(
-                self, "停止外部进程",
-                f"模块「{module}」是在 mini-ide 之外启动的（PID {pid}）。\n"
-                f"确定要结束该进程及其子进程吗？",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            if ret != QMessageBox.StandardButton.Yes:
-                return
+            if not silent:
+                ret = QMessageBox.question(
+                    self, "停止外部进程",
+                    f"模块「{module}」是在 mini-ide 之外启动的（PID {pid}）。\n"
+                    f"确定要结束该进程及其子进程吗？",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if ret != QMessageBox.StandardButton.Yes:
+                    return
             from src.core.process_runner import kill_pid
             if self.service_panel:
                 self.service_panel.update_state(module, STATE_STOPPING)
@@ -636,11 +636,53 @@ class ProjectTab(QWidget):
                 continue
             self._start_module(mod_name, silent=silent)
 
-    def _stop_all_modules(self) -> None:
-        """并行停止所有运行中的模块"""
-        for mod_name, runner in list(self.module_runners.items()):
+    def _stop_all_modules(self, silent: bool = False) -> None:
+        """停止所有运行中的模块。
+
+        两类进程都要停：
+          1. mini-ide 自己拉起的（runner.is_running()）→ runner.stop()
+          2. CLI/AI/终端在外部起的（_module_external_pids）→ 按 PID kill_pid
+
+        以前只停了第 1 类，导致「CLI 启动的服务点全部停止停不掉」。
+        silent=True（CLI 调用）静默直接停；GUI 点按钮时若有外部进程，先弹一次
+        汇总确认框（避免误杀无关进程），确认后一并 kill。
+        """
+        from src.core.process_runner import kill_pid
+
+        # 先停自管理 runner
+        for runner in list(self.module_runners.values()):
             if runner.is_running():
                 runner.stop()
+
+        # 再处理外部进程
+        external = {m: pid for m, pid in self._module_external_pids.items()
+                    if pid is not None}
+        if not external:
+            return
+
+        if not silent:
+            names = "、".join(sorted(external))
+            ret = QMessageBox.question(
+                self, "停止外部进程",
+                f"以下模块是在 mini-ide 之外启动的（CLI / 终端 / IDE）：\n"
+                f"{names}\n\n确定要一并结束这些进程及其子进程吗？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if ret != QMessageBox.StandardButton.Yes:
+                return
+
+        for module, pid in external.items():
+            if self.service_panel:
+                self.service_panel.update_state(module, STATE_STOPPING)
+            if kill_pid(pid):
+                self._module_external_pids.pop(module, None)
+                if self.service_panel:
+                    self.service_panel.update_state(module, STATE_IDLE)
+            else:
+                self.log.append_line("stderr", f"[停止失败] 无法结束 {module} (PID {pid})")
+        # 刷新一次，把真实状态同步回面板
+        self._refresh_status_row()
 
     def _focus_module_log(self, module: str) -> None:
         lw = self.module_logs.get(module)
@@ -805,16 +847,12 @@ class ProjectTab(QWidget):
             self._script_runners[key] = runner
 
         # 命令构造：按脚本类型选解释器。
-        # .ps1 → PowerShell（Windows 用 powershell，类 Unix 用 pwsh，没装则原样交出去）
-        # .sh/.command → bash（不要求脚本有可执行位）
+        # .ps1 → PowerShell
         # .bat/.cmd/.exe/其他 → 直接交给 process_runner._split_program 处理
         ext = p.suffix.lower()
         if ext == ".ps1":
-            ps = "powershell" if sys.platform == "win32" else (shutil.which("pwsh") or "pwsh")
-            command = [ps, "-NoLogo", "-NoProfile",
+            command = ["powershell", "-NoLogo", "-NoProfile",
                        "-ExecutionPolicy", "Bypass", "-File", str(p)]
-        elif ext in (".sh", ".command") and sys.platform != "win32":
-            command = ["bash", str(p)]
         else:
             # .bat / .cmd / .exe 都直接交给 _split_program；它会按扩展名走 cmd /c 或直跑
             command = [str(p)]

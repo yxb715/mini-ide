@@ -232,12 +232,14 @@ def _cmd_stop(tab, module: str | None) -> dict:
             if module not in mod_names:
                 return {"ok": False, "error": f"module not found: {module}"}
             runner = tab.module_runners.get(module)
-            if not runner or not runner.is_running():
+            running = runner and runner.is_running()
+            external = module in tab._module_external_pids
+            if not running and not external:
                 return {"ok": False, "error": "not running"}
-            tab._stop_module(module)
+            tab._stop_module(module, silent=True)
             return {"ok": True}
         else:
-            tab._stop_all_modules()
+            tab._stop_all_modules(silent=True)
             return {"ok": True}
     else:
         if not tab.runner.is_running():
