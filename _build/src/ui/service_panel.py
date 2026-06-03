@@ -1,6 +1,7 @@
 """左侧服务面板（多模块 Spring Boot 专用）
 
-每行：状态图标 模块名 端口/运行时长 启停按钮
+每行：状态图标 模块名 端口 启停按钮
+（运行/未启动等状态只用图标表达，不再显示文字）
 
 交互：
 - 左键行主体 → 切到该模块的日志 tab
@@ -105,10 +106,11 @@ class _ServiceRow(QFrame):
         # port 优先用本次传入的（启动后从日志抓的真实端口），否则用 application.yml 的默认值
         effective_port = port if port is not None else self.default_port
         port_str = f":{effective_port}" if effective_port else ""
+        # lbl_info 只显示端口号；运行/未启动/启动中/停止中一律靠左侧图标和右侧按钮表达，不放文字
+        self.lbl_info.setText(port_str)
         if state == STATE_IDLE:
             self.lbl_icon.setText("▶")
             self.lbl_icon.setStyleSheet(f"color:{DOT_IDLE}; font-size:{FONT_PT_UI}pt;")
-            self.lbl_info.setText(f"{port_str}  (未启动)".strip() if port_str else "(未启动)")
             self.btn.setText("▶")
             self.btn.setToolTip(f"启动 {self.module_name}")
             self.btn.setEnabled(True)
@@ -116,18 +118,15 @@ class _ServiceRow(QFrame):
         elif state == STATE_STARTING:
             self.lbl_icon.setText("◐")
             self.lbl_icon.setStyleSheet(f"color:{COLOR_WARN}; font-size:{FONT_PT_UI}pt;")
-            self.lbl_info.setText(f"{port_str}  启动中...".strip() if port_str else "启动中...")
             self.btn.setText("◐")
             self.btn.setToolTip(f"{self.module_name} 正在启动")
             self.btn.setEnabled(False)
             self.btn.setStyleSheet(_row_btn_qss(COLOR_WARN, COLOR_WARN))
         elif state in (STATE_RUNNING, STATE_RUNNING_EXTERNAL):
-            # 不分内部/外部、不显示运行时长：CLI 与界面操作的是同一个 mini-ide 实例，
-            # 起来的服务一律显示「运行中」。外部进程（跨重启后靠端口感知到的）停止时
-            # 仍走 kill pid，但展示上不再区分。
+            # 不分内部/外部：CLI 与界面操作的是同一个 mini-ide 实例，起来的服务一律
+            # 显示运行图标。外部进程（跨重启后靠端口感知到的）停止时仍走 kill pid。
             self.lbl_icon.setText("⏹")
             self.lbl_icon.setStyleSheet(f"color:{COLOR_SUCCESS}; font-size:{FONT_PT_UI}pt;")
-            self.lbl_info.setText(f"{port_str}  运行中".strip() if port_str else "运行中")
             self.btn.setText("⏹")
             self.btn.setToolTip(f"停止 {self.module_name}")
             self.btn.setEnabled(True)
@@ -135,7 +134,6 @@ class _ServiceRow(QFrame):
         elif state == STATE_STOPPING:
             self.lbl_icon.setText("◐")
             self.lbl_icon.setStyleSheet(f"color:{COLOR_WARN}; font-size:{FONT_PT_UI}pt;")
-            self.lbl_info.setText(f"{port_str}  停止中...".strip() if port_str else "停止中...")
             self.btn.setText("◐")
             self.btn.setToolTip(f"{self.module_name} 正在停止")
             self.btn.setEnabled(False)
