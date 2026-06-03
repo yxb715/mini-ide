@@ -31,9 +31,12 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(960, 600)
         self.setAcceptDrops(True)
 
-        icon_path = Path(__file__).resolve().parents[2] / "src" / "resources" / "icon.ico"
+        import sys as _sys
+        res_dir = Path(__file__).resolve().parents[2] / "src" / "resources"
+        _icon_name = "icon.icns" if _sys.platform == "darwin" else "icon.ico"
+        icon_path = res_dir / _icon_name
         if not icon_path.exists():
-            icon_path = icon_path.with_suffix(".png")
+            icon_path = res_dir / "icon.png"
         if icon_path.exists():
             self.setWindowIcon(QIcon(str(icon_path)))
 

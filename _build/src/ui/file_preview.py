@@ -38,7 +38,7 @@ from PySide6.QtWidgets import (
 from src.ui.syntax_highlighter import PygmentsHighlighter, get_lexer_for
 from src.ui.theme import (
     BG_CODE, BG_L2, BG_L4, BORDER_SUBTLE, COLOR_ERROR, COLOR_SUCCESS, COLOR_WARN,
-    FG_DIM, FG_SECONDARY, RADIUS_SM, apply_search_style,
+    FG_DIM, FG_SECONDARY, FONT_PT_CODE, RADIUS_SM, apply_search_style,
 )
 from src.util import app_log
 from src.util.editor import REVEAL_LABEL, open_in_editor, reveal_in_explorer
@@ -48,7 +48,7 @@ log = app_log.get_logger("preview")
 _MAX_READ_BYTES = 2 * 1024 * 1024   # 2MB 以上只读头部
 _AUTOSAVE_DELAY_MS = 3000
 _EXTRELOAD_DEBOUNCE_MS = 200   # 外部修改 debounce：避免 VSCode "删除-重命名" 写盘瞬间读到空文件
-_FONT_PT = 13   # 固定字号；用户反馈"调了不生效"反复出 bug，砍掉调节功能
+_FONT_PT = FONT_PT_CODE   # 编辑器/日志统一字号（走 theme token，改一处全生效）
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".jfif", ".gif", ".bmp", ".ico", ".webp",
                ".svg", ".svgz", ".tif", ".tiff", ".tga", ".cur", ".xbm", ".xpm",
                ".pbm", ".pgm", ".ppm"}

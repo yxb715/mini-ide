@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -72,20 +73,26 @@ def _file_exists(root: Path, *names: str) -> Path | None:
 
 
 def _gradle_cmd(root: Path) -> str:
-    """返回可用的 gradle 调用命令（优先项目自带 gradlew.bat）"""
-    wrapper = root / "gradlew.bat"
-    if wrapper.exists():
-        return str(wrapper)
-    if shutil.which("gradle"):
-        return "gradle"
-    return "gradlew.bat"
+    """返回可用的 gradle 调用命令（优先项目自带 wrapper）"""
+    if sys.platform == "win32":
+        wrapper = root / "gradlew.bat"
+        if wrapper.exists():
+            return str(wrapper)
+        if shutil.which("gradle"):
+            return "gradle"
+        return "gradlew.bat"
+    wrapper = root / "gradlew"
+    return str(wrapper) if wrapper.exists() else "gradle"
 
 
 def _mvn_cmd(root: Path) -> str:
-    wrapper = root / "mvnw.cmd"
-    if wrapper.exists():
-        return str(wrapper)
-    return "mvn.cmd" if shutil.which("mvn.cmd") else "mvn"
+    if sys.platform == "win32":
+        wrapper = root / "mvnw.cmd"
+        if wrapper.exists():
+            return str(wrapper)
+        return "mvn.cmd" if shutil.which("mvn.cmd") else "mvn"
+    wrapper = root / "mvnw"
+    return str(wrapper) if wrapper.exists() else "mvn"
 
 
 def _scan_spring_profiles(root: Path) -> tuple[list[str], int | None, str]:

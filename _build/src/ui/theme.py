@@ -135,11 +135,18 @@ H_STATUSBAR = 24
 W_LEFT_PANEL = 260
 
 # 字号（point）
-FONT_PT_UI = 10            # UI 主字号（Qt 默认 9 偏小）
-FONT_PT_UI_SM = 9          # 副标题 / 次级文字
-FONT_PT_UI_LG = 12         # 标题
-FONT_PT_CODE = 13          # 编辑器 / 日志
-FONT_PT_DIFF = 11          # diff 视图
+# macOS 上字偏小：UI 字号按 Windows 96 DPI 标尺设计，而 macOS 逻辑 DPI 锁定 72，
+# 同样 pt 字号渲染像素缩水约 25%。Qt6 在 Mac 上忽略 QT_FONT_DPI / QT_SCALE_FACTOR，
+# 无法靠 DPI 校正，只能直接抬高字号。Mac 用 ×1.1（×1.33/1.2 偏大，×1.1 适中）。
+import sys as _sys
+_FONT_SCALE = 1.1 if _sys.platform == "darwin" else 1.0
+# 树/列表行的上下内边距：字号放大后行高要同步加大，否则行距偏挤。Mac 用更大值。
+TREE_ITEM_PAD_V = 6 if _sys.platform == "darwin" else 3
+FONT_PT_UI = round(15 * _FONT_SCALE)       # UI 主字号（13+2，整套放大一档）
+FONT_PT_UI_SM = round(14 * _FONT_SCALE)    # 副标题 / 次级文字
+FONT_PT_UI_LG = round(17 * _FONT_SCALE)    # 标题
+FONT_PT_CODE = round(18 * _FONT_SCALE)     # 编辑器 / 日志
+FONT_PT_DIFF = round(16 * _FONT_SCALE)     # diff 视图
 
 # 字体族
 FONT_FAMILY_UI = '"Segoe UI", "Microsoft YaHei UI", system-ui, sans-serif'
@@ -292,7 +299,7 @@ QTreeView, QTreeWidget, QListView, QListWidget {{
     alternate-background-color: {BG_L2};
 }}
 QTreeView::item, QTreeWidget::item, QListView::item, QListWidget::item {{
-    padding: 3px 4px;
+    padding: {TREE_ITEM_PAD_V}px 4px;
     border: none;
 }}
 QTreeView::item:hover, QTreeWidget::item:hover, QListView::item:hover, QListWidget::item:hover {{
@@ -328,9 +335,9 @@ QTabBar::tab:hover:!selected {{
     color: {FG_PRIMARY};
 }}
 QTabBar::tab:selected {{
-    background: {BG_L1};
-    color: {FG_PRIMARY};
-    border-top: 2px solid {ACCENT};
+    background: {ACCENT_SUBTLE};
+    color: {FG_BRIGHT};
+    border-top: 3px solid {ACCENT};
 }}
 QTabBar::close-button {{
     subcontrol-position: right;

@@ -88,7 +88,9 @@ if [ "$OS_NAME" = "Darwin" ]; then
     --workpath pyinstaller-work \
     --specpath . \
     main.py
-  ln -snf "dist/mini-ide.app" "../mini-ide.app"
+  # 软链接放在项目根，目标相对路径要从项目根解析（真身在 _build/dist/ 下）。
+  # 旧版写 "dist/mini-ide.app" 会断链（根目录无 dist/），Finder 报"找不到原始项目"。
+  ln -snf "_build/dist/mini-ide.app" "../mini-ide.app"
   echo
   echo "[build] Done. Output: dist/mini-ide.app (symlinked at project root)"
   echo "[build] 首次打开被 Gatekeeper 拦截时，右键 → 打开，或运行："

@@ -6,11 +6,12 @@ Windows 下加 CREATE_NO_WINDOW 避免弹 cmd 窗口。
 from __future__ import annotations
 
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-_NO_WINDOW = 0x08000000  # CREATE_NO_WINDOW
-_POPEN_KW = {"creationflags": _NO_WINDOW}
+_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0  # CREATE_NO_WINDOW
+_POPEN_KW = {"creationflags": _NO_WINDOW} if _NO_WINDOW else {}
 
 
 @dataclass
@@ -43,7 +44,7 @@ def repo_root(path: str) -> str:
     rc, out, _ = _run(["rev-parse", "--show-toplevel"], path, timeout=3)
     if rc != 0:
         return path
-    return out.strip().replace("/", "\\")
+    return out.strip().replace("/", "\\") if sys.platform == "win32" else out.strip()
 
 
 def list_changed_files(cwd: str) -> list[ChangedFile]:

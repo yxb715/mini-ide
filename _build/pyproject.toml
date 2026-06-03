@@ -7,7 +7,13 @@ package-mode = false
 
 [tool.poetry.dependencies]
 python = ">=3.11,<3.14"
-PySide6 = "^6.7.0"
+# PySide6 按平台分流：Windows 用 6.7+；macOS（尤其 Intel/x86_64）官方自 6.6 起
+# 不再发布 wheel，能装的最高版是 6.5.2（universal2，含 Qt 二进制），故 mac 钉到 6.5.2。
+# 6.5.2 只支持 Python <3.12，故 mac 这条额外限定 3.11.x（与本机 3.11.9 匹配）。
+PySide6 = [
+    { version = "^6.7.0", markers = "sys_platform != 'darwin'" },
+    { version = "6.5.2", markers = "sys_platform == 'darwin'", python = ">=3.11,<3.12" },
+]
 psutil = "^5.9.8"
 watchdog = "^4.0.0"
 sqlparse = "^0.4.4"

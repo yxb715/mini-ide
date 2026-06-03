@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
 
 from src.core import git_ops
 from src.ui.theme import (
-    FG_SECONDARY, GIT_ADD, GIT_DEL, GIT_FILE_HEAD, GIT_HUNK, GIT_META,
+    FG_SECONDARY, FONT_PT_DIFF, GIT_ADD, GIT_DEL, GIT_FILE_HEAD, GIT_HUNK, GIT_META,
     GIT_MODIFY,
 )
 from src.util.editor import REVEAL_LABEL, reveal_in_explorer
@@ -168,7 +168,7 @@ class GitViewer(QDialog):
         self.diff_view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
         f = QFont()
         f.setFamilies(["Cascadia Mono", "Consolas"])
-        f.setPointSize(10)
+        f.setPointSize(FONT_PT_DIFF)
         self.diff_view.setFont(f)
         DiffHighlighter(self.diff_view.document())
         split.addWidget(self.diff_view)

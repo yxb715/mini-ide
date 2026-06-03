@@ -6,10 +6,16 @@
 """
 from __future__ import annotations
 
+import shlex
 import shutil
 import subprocess
-import winreg
+import sys
 from pathlib import Path
+
+if sys.platform == "win32":
+    import winreg
+else:
+    winreg = None
 
 from PySide6.QtCore import Qt, QFile, QMimeData, QThread, QTimer, QUrl, Signal
 from PySide6.QtGui import QColor, QFont, QKeySequence, QShortcut
@@ -66,16 +72,19 @@ QTreeWidget::branch:closed:has-children:has-siblings {{
 """
 
 
-# 右键菜单"▶ 运行"显示的可执行脚本类型
-_RUNNABLE_SCRIPT_EXTS = {".bat", ".cmd", ".ps1", ".exe"}
+# 右键菜单"▶ 运行"显示的可执行脚本类型（Windows: bat/cmd/ps1/exe；类 Unix: sh）
+if sys.platform == "win32":
+    _RUNNABLE_SCRIPT_EXTS = {".bat", ".cmd", ".ps1", ".exe"}
+else:
+    _RUNNABLE_SCRIPT_EXTS = {".sh", ".command", ".ps1"}
 _CUT_MIME = "application/x-mini-ide-cut"
-_NO_WINDOW = 0x08000000  # CREATE_NO_WINDOW
+_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0  # CREATE_NO_WINDOW
 
 # 节点级 git 染色缓存：(color_hex, strikethrough, tooltip)，
 # 染色函数对比缓存值，相同则不调 setForeground/setFont/setToolTip，避免 viewport 误重绘
 _RENDER_CACHE_ROLE = Qt.ItemDataRole.UserRole + 2
 
-_CC_REGISTRY_COMMANDS = [
+_CC_REGISTRY_COMMANDS = [] if winreg is None else [
     (winreg.HKEY_CURRENT_USER, r"Software\Classes\Directory\shell\Claude Code\command"),
     (winreg.HKEY_CURRENT_USER, r"Software\Classes\Directory\Background\shell\Claude Code\command"),
     (winreg.HKEY_CLASSES_ROOT, r"Directory\shell\Claude Code\command"),
@@ -124,6 +133,49 @@ def _find_powershell() -> str:
     return ""
 
 
+def _unix_terminal_launch_args(target_dir: Path, run_cmd: str) -> list[str]:
+    """类 Unix（macOS/Linux）下打开终端、cd 到目录并执行命令的 argv。
+
+    macOS：用 osascript 驱动终端——装了 iTerm 优先 iTerm，否则用系统 Terminal.app。
+    Linux：探测常见终端模拟器，回落到 x-terminal-emulator。
+    返回空 list 表示当前平台找不到可用终端。
+    """
+    cd_part = f"cd {shlex.quote(str(target_dir))}"
+    full = f"{cd_part} && {run_cmd}" if run_cmd else cd_part
+
+    if sys.platform == "darwin":
+        if shutil.which("osascript") is None:
+            return []
+        inner = full.replace("\\", "\\\\").replace('"', '\\"')
+        if Path("/Applications/iTerm.app").exists():
+            script = (
+                'tell application "iTerm"\n'
+                "  activate\n"
+                "  set newWindow to (create window with default profile)\n"
+                '  tell current session of newWindow to write text "%s"\n'
+                "end tell"
+            ) % inner
+        else:
+            script = (
+                'tell application "Terminal"\n'
+                "  activate\n"
+                '  do script "%s"\n'
+                "end tell"
+            ) % inner
+        return ["osascript", "-e", script]
+
+    # Linux：bash -lc 保持终端常驻，跑完命令后落到交互 shell
+    keep = f'{full}; exec "$SHELL"'
+    for term in ("x-terminal-emulator", "gnome-terminal", "konsole", "xterm"):
+        found = shutil.which(term)
+        if not found:
+            continue
+        if term == "gnome-terminal":
+            return [found, "--", "bash", "-lc", keep]
+        return [found, "-e", f"bash -lc {shlex.quote(keep)}"]
+    return []
+
+
 def _open_in_codex_args(target_dir: Path) -> list[str]:
     """Build a portable Codex launcher for the current machine.
 
@@ -131,6 +183,8 @@ def _open_in_codex_args(target_dir: Path) -> list[str]:
     a machine-local PowerShell path, which breaks when this project is copied to
     another computer.
     """
+    if sys.platform != "win32":
+        return _unix_terminal_launch_args(target_dir, "codex")
     target = str(target_dir)
     cmd = shutil.which("cmd.exe") or "cmd.exe"
     ps = _find_powershell()
@@ -140,7 +194,14 @@ def _open_in_codex_args(target_dir: Path) -> list[str]:
 
 
 def _open_in_cc_command(target_dir: Path) -> str | list[str]:
-    """返回打开 Claude Code 的启动命令（沿用注册表里现成的右键命令 / PowerShell 命令行）。"""
+    """返回打开 Claude Code 的启动命令。
+
+    Windows 返回字符串（沿用注册表里现成的右键命令 / PowerShell 命令行）；
+    类 Unix 返回 argv list（osascript / 终端模拟器）。
+    """
+    if sys.platform != "win32":
+        return _unix_terminal_launch_args(target_dir, "claude")
+
     target = str(target_dir)
     for hive, subkey in _CC_REGISTRY_COMMANDS:
         try:

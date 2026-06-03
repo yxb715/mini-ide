@@ -1,4 +1,5 @@
 """mini-ide 入口"""
+import os
 import sys
 from pathlib import Path
 
@@ -92,6 +93,8 @@ def _start_local_server(window: MainWindow) -> QLocalServer | None:
 def _set_windows_app_id():
     """让 Windows 任务栏按 mini-ide 自己的 AppUserModelID 分组并显示我们的图标，
     而不是 pythonw.exe 的默认蓝色 logo。必须在任何 window 显示前调用。"""
+    if sys.platform != "win32":
+        return
     try:
         import ctypes
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("whaty.mini-ide")
@@ -110,6 +113,13 @@ def main():
         app.setApplicationName("mini-ide")
         app.setOrganizationName("whaty")
 
+        # 全局基准字体：用 setFont 直接定基准字号（比 QSS font-size 优先级更稳，
+        # 不会被个别 widget 的局部样式或平台默认覆盖）。具体字号取 theme 的主 UI token。
+        from src.ui.theme import FONT_PT_UI
+        _base_font = app.font()
+        _base_font.setPointSize(FONT_PT_UI)
+        app.setFont(_base_font)
+
         initial_project = sys.argv[1] if len(sys.argv) > 1 else None
 
         # 单实例：已有实例在跑就转发路径后退出
@@ -117,8 +127,13 @@ def main():
             logger.info("检测到已运行的 mini-ide，已转发路径=%r 后退出", initial_project)
             return
 
-        # 优先用 ICO（Windows 下任务栏显示更清晰），回落 PNG
-        for name in ("icon.ico", "icon.png"):
+        # 图标：macOS 用带留白边距的 .icns（符合 Dock 图标规范，不会显得偏大），
+        # 其他平台优先 ICO（Windows 任务栏更清晰），都回落 PNG。
+        if sys.platform == "darwin":
+            icon_names = ("icon.icns", "icon.png")
+        else:
+            icon_names = ("icon.ico", "icon.png")
+        for name in icon_names:
             icon_path = ROOT / "src" / "resources" / name
             if icon_path.exists():
                 app.setWindowIcon(QIcon(str(icon_path)))
