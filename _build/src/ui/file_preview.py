@@ -102,6 +102,53 @@ _LINE_COMMENT_BY_NAME: dict[str, str] = {
 }
 
 
+def _detect_encoding(raw: bytes) -> tuple[str, str]:
+    """轻量编码探测（纯标准库，不引第三方依赖）。
+
+    返回 (text, encoding)。按可靠性从高到低尝试：
+      1. BOM：UTF-8/UTF-16 的字节序标记是确定性信号
+      2. 严格 UTF-8：能无错解码就是 UTF-8（多字节序列校验性极强，几乎不会误判）
+      3. GBK：中文 Windows 环境最常见的非 UTF-8 编码，覆盖 GB2312
+      4. 兜底：latin-1 永不抛错，保证任何字节都能往返（round-trip）不丢失
+    探测出 GBK/latin-1 时，保存会按原编码回写，避免把非 UTF-8 文件以 UTF-8
+    覆盖导致内容不可逆损坏。
+    """
+    for bom, enc in ((b"\xef\xbb\xbf", "utf-8-sig"),
+                     (b"\xff\xfe", "utf-16-le"), (b"\xfe\xff", "utf-16-be")):
+        if raw.startswith(bom):
+            try:
+                return raw.decode(enc), enc
+            except UnicodeDecodeError:
+                break
+    for enc in ("utf-8", "gbk"):
+        try:
+            return raw.decode(enc), enc
+        except UnicodeDecodeError as e:
+            # 截断读取（>2MB 只读头部）可能在多字节字符中间切断，导致末尾
+            # 几个字节不完整。若错误恰好发生在缓冲区尾部，截掉残字节按该编码
+            # 重试——避免把一个完整的 UTF-8 大文件误判成 GBK/latin-1。
+            if e.start >= len(raw) - 4:
+                try:
+                    return raw[:e.start].decode(enc), enc
+                except UnicodeDecodeError:
+                    pass
+            continue
+    # latin-1 单字节映射，任何字节都能解码且可原样写回
+    return raw.decode("latin-1"), "latin-1"
+
+
+def _detect_newline(text: str) -> str:
+    """嗅探文本主导行尾。返回供 open(newline=) 使用的值：
+    "\\r\\n"（Windows）/ "\\r"（老 Mac）/ ""（Unix LF，写入时不转换）。
+    """
+    first_lf = text.find("\n")
+    if first_lf == -1:
+        return "\r" if "\r" in text else ""
+    if first_lf > 0 and text[first_lf - 1] == "\r":
+        return "\r\n"
+    return ""
+
+
 def _line_comment_prefix(path: str) -> str | None:
     """根据文件路径返回行注释前缀（如 '#' / '//' / '--'）。不支持的返回 None"""
     p = Path(path)
@@ -380,6 +427,17 @@ class FilePreviewPane(QWidget):
         self._not_found = False
         self._dirty = False
         self._read_only = False
+        # 读文件时探测出的原始编码与行尾，保存时按原样回写，避免：
+        #   1. 把 LF 文件整体改写成 CRLF（污染整文件 git diff）
+        #   2. 把 GBK 等非 UTF-8 文件以 UTF-8 写回（内容不可逆损坏）
+        self._encoding = "utf-8"
+        self._newline = ""  # "" = 保持文本原有的 \n（写入时不转换）
+        # 搜索状态去抖：_update_search_status 每次全文 toPlainText+lower+线性扫描，
+        # 大文件下挂在 view.textChanged（编辑每字符触发）会卡。停顿 150ms 再算。
+        self._search_status_timer = QTimer(self)
+        self._search_status_timer.setSingleShot(True)
+        self._search_status_timer.setInterval(150)
+        self._search_status_timer.timeout.connect(self._update_search_status)
         self._highlighter: PygmentsHighlighter | None = None
         self._image_scroll: QScrollArea | None = None
         self._image_label: QLabel | None = None
@@ -427,7 +485,7 @@ class FilePreviewPane(QWidget):
         self.search_input.setPlaceholderText("搜索（Ctrl+F）")
         apply_search_style(self.search_input)
         self.search_input.returnPressed.connect(self._find_next)
-        self.search_input.textChanged.connect(self._update_search_status)
+        self.search_input.textChanged.connect(self._schedule_search_status)
         search_row.addWidget(self.search_input, 1)
         self.chk_search_case = QCheckBox("大小写")
         self.chk_search_case.toggled.connect(self._update_search_status)
@@ -444,7 +502,7 @@ class FilePreviewPane(QWidget):
         self.view = CodeView()
         self.view.document().modificationChanged.connect(self._on_modified)
         self.view.textChanged.connect(self._on_text_changed)
-        self.view.textChanged.connect(self._update_search_status)
+        self.view.textChanged.connect(self._schedule_search_status)
         root.addWidget(self.view, 1)
 
         # 自动保存
@@ -524,7 +582,10 @@ class FilePreviewPane(QWidget):
             with p.open("rb") as f:
                 raw = f.read(_MAX_READ_BYTES)
             self._truncated = size > _MAX_READ_BYTES
-            text = raw.decode("utf-8", errors="replace")
+            text, self._encoding = _detect_encoding(raw)
+            # 记录原始行尾，保存时按原样回写；编辑器内部统一用 \n
+            self._newline = _detect_newline(text)
+            text = text.replace("\r\n", "\n").replace("\r", "\n")
             self.view.setPlainText(text)
             self.view.document().setModified(False)
             self.lbl_path.setText(f"{self._display_path()}  ({_human_size(size)})")
@@ -722,13 +783,24 @@ class FilePreviewPane(QWidget):
             return
         self._autosave_timer.start(_AUTOSAVE_DELAY_MS)
 
+    def _write_text_preserving(self, target: Path, text: str) -> None:
+        """按文件原始编码与行尾写回。
+
+        编辑器内部行尾统一是 \\n；这里用 open(newline=self._newline) 让 Python 在
+        写入时把 \\n 翻译回原行尾（newline="" 表示不翻译，保持 LF）。编码用读取时
+        探测到的 self._encoding，避免把非 UTF-8 文件以 UTF-8 覆盖。
+        """
+        with open(target, "w", encoding=self._encoding,
+                  newline=self._newline) as f:
+            f.write(text)
+
     def _autosave(self) -> None:
         if not self._dirty or self._read_only:
             return
         try:
             p = Path(self.path)
             tmp = p.with_suffix(p.suffix + ".minitmp")
-            tmp.write_text(self.view.toPlainText(), encoding="utf-8")
+            self._write_text_preserving(tmp, self.view.toPlainText())
             # 设忽略窗口：watcher 接下来 1 秒内的 fileChanged 是我们自己写的，不要触发重载
             self._ignore_external_until = time.monotonic() + 1.0
             tmp.replace(p)
@@ -756,7 +828,7 @@ class FilePreviewPane(QWidget):
         p = Path(self.path)
         try:
             tmp = p.with_suffix(p.suffix + ".minitmp")
-            tmp.write_text(self.view.toPlainText(), encoding="utf-8")
+            self._write_text_preserving(tmp, self.view.toPlainText())
             self._ignore_external_until = time.monotonic() + 1.0
             tmp.replace(p)
             self.view.document().setModified(False)
@@ -883,6 +955,10 @@ class FilePreviewPane(QWidget):
             positions.append(pos)
             start = pos + max(1, len(needle))
         return positions
+
+    def _schedule_search_status(self) -> None:
+        # 去抖入口：搜索框输入 / 正文编辑都先重置定时器，停顿后才真正算匹配数
+        self._search_status_timer.start()
 
     def _update_search_status(self) -> None:
         q = self.search_input.text()

@@ -57,31 +57,40 @@ def list_port_listeners(port: int) -> list[PortOwner]:
 
 
 def kill_process(pid: int, force: bool = False) -> tuple[bool, str]:
-    """杀进程。默认 terminate，3s 内不退则升级到 kill。
+    """杀进程及其整棵子进程树。默认 terminate，3s 内不退则升级到 kill。
     force=True 直接 kill。
     返回 (ok, message)。
+
+    必须连子进程一起杀：端口对话框里占端口的常是 gradle/java、npm 等，它们会
+    fork 出真正的服务进程。只杀父进程会留下占着端口的孤儿子进程（界面显示已杀、
+    端口却还占着）。这里先快照整棵树再统一 terminate/kill。
     """
     try:
-        p = psutil.Process(pid)
+        parent = psutil.Process(pid)
     except psutil.NoSuchProcess:
         return True, f"进程 {pid} 已不存在"
 
     try:
-        if force:
-            p.kill()
-        else:
-            p.terminate()
-        try:
-            p.wait(timeout=3)
-        except psutil.TimeoutExpired:
-            if not force:
-                p.kill()
+        procs = [parent, *parent.children(recursive=True)]
+    except psutil.Error:
+        procs = [parent]
+
+    try:
+        for p in procs:
+            try:
+                p.kill() if force else p.terminate()
+            except psutil.NoSuchProcess:
+                pass
+        gone, alive = psutil.wait_procs(procs, timeout=3)
+        if alive and not force:
+            for p in alive:
                 try:
-                    p.wait(timeout=2)
-                except psutil.TimeoutExpired:
-                    return False, "kill 后仍未退出（可能权限不足）"
+                    p.kill()
+                except psutil.NoSuchProcess:
+                    pass
+            _, alive = psutil.wait_procs(alive, timeout=2)
+        if alive:
+            return False, "kill 后仍未退出（可能权限不足）"
     except psutil.AccessDenied as e:
         return False, f"权限不足：{e}"
-    except psutil.NoSuchProcess:
-        return True, "已结束"
     return True, "已结束"

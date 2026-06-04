@@ -82,13 +82,17 @@ GIT_STATUS_UNTRACKED = "untracked" # 新建但未 add（??）
 GIT_STATUS_CONFLICT = "conflict"   # 合并冲突（U/AA/DD/AU/UA/DU/UD）
 
 
-def file_status_map(cwd: str) -> dict[str, str]:
+def file_status_map(cwd: str, files: list["ChangedFile"] | None = None) -> dict[str, str]:
     """返回 {相对仓库根的正斜杠路径: GIT_STATUS_*}。
 
     优先级：conflict > deleted > added > modified > untracked。
     rename 取目标路径的状态。
+
+    files 可传入已查好的 list_changed_files 结果以复用，避免同一轮刷新里重复
+    跑 git status（GitStatusWorker 用得上）；不传则自己查，保持向后兼容。
     """
-    files = list_changed_files(cwd)
+    if files is None:
+        files = list_changed_files(cwd)
     out: dict[str, str] = {}
     for f in files:
         s = f.status  # 两字符 XY
@@ -134,13 +138,16 @@ def list_ignored_files(cwd: str) -> set[str]:
     return result
 
 
-def list_deleted_paths(cwd: str) -> dict[str, list[str]]:
+def list_deleted_paths(cwd: str, files: list["ChangedFile"] | None = None) -> dict[str, list[str]]:
     """返回被删除（磁盘已无）的文件，按父目录归组。
 
     返回 {parent_rel_posix: [filename, ...]}；parent_rel 为 "" 表示项目根。
     用来给 file_tree 在父目录下补"已删除"占位行——磁盘上 iterdir 看不到这些文件。
+
+    files 同 file_status_map：传入则复用，不传则自查（向后兼容）。
     """
-    files = list_changed_files(cwd)
+    if files is None:
+        files = list_changed_files(cwd)
     out: dict[str, list[str]] = {}
     for f in files:
         if "D" not in f.status:

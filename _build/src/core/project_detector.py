@@ -526,16 +526,30 @@ def _detect_python(root: Path) -> ProjectMeta | None:
         run_cmd = py_cmd.split() + ["manage.py", "runserver"]
         port = 8000
     else:
-        for candidate in ("main.py", "app.py", "run.py", "server.py", "wsgi.py", "web.py", "start.py"):
-            if (root / candidate).exists():
-                entry_script = candidate
+        # 入口探测目录：先根目录，根目录没有再找 src/ 子目录
+        # （部分仓库习惯把入口放在 src/main.py，根目录只留配置和文档）
+        # prefix 用正斜杠拼到 entry_script 上（如 "src/main.py"）；
+        # 它最终作为参数传给 python，cwd 仍是项目根目录，Python 会把脚本
+        # 所在目录加入 sys.path，src 下的包导入照常可用。
+        search_dirs = [(root, "")]
+        if (root / "src").is_dir():
+            search_dirs.append((root / "src", "src/"))
+        for base, prefix in search_dirs:
+            for candidate in ("main.py", "app.py", "run.py", "server.py", "wsgi.py", "web.py", "start.py"):
+                if (base / candidate).exists():
+                    entry_script = prefix + candidate
+                    break
+            if entry_script:
                 break
-        # 候选名都没命中 → 扫根目录顶层 .py，挑第一个含 `if __name__ == "__main__":` 的脚本
+        # 候选名都没命中 → 扫这些目录顶层 .py，挑第一个含 `if __name__ == "__main__":` 的脚本
         if not entry_script:
             try:
-                for p in sorted(root.glob("*.py")):
-                    if 'if __name__' in _read(p, limit=20_000):
-                        entry_script = p.name
+                for base, prefix in search_dirs:
+                    for p in sorted(base.glob("*.py")):
+                        if 'if __name__' in _read(p, limit=20_000):
+                            entry_script = prefix + p.name
+                            break
+                    if entry_script:
                         break
             except OSError:
                 pass

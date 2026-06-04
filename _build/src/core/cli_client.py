@@ -5,11 +5,10 @@ CLI 模式只用 QCoreApplication + QLocalSocket（不依赖 QtWidgets）。
 from __future__ import annotations
 
 import json
-import os
 import sys
 import time
 
-from PySide6.QtCore import QCoreApplication, QTimer
+from PySide6.QtCore import QCoreApplication
 from PySide6.QtNetwork import QLocalSocket
 
 
@@ -63,6 +62,7 @@ def _parse_args(argv: list[str]) -> dict | None:
         "health": "health",
         "compile": "compile",
         "log": "log",
+        "quit": "quit",
     }
     if cmd_name not in cmd_map:
         return None
@@ -71,6 +71,9 @@ def _parse_args(argv: list[str]) -> dict | None:
     rest = args[1:]
 
     if cmd_name == "list-projects":
+        return result
+
+    if cmd_name == "quit":
         return result
 
     if cmd_name == "list-modules":
@@ -231,4 +234,5 @@ def _print_usage():
         "  --health <project> [module] [--timeout N]  Wait for startup\n"
         "  --compile <project>          Trigger compilation\n"
         "  --log <project> [module] [--tail N]  Get recent log lines\n"
+        "  --quit                       Stop all running services and exit mini-ide\n"
     )

@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable
 
-from PySide6.QtCore import Qt, QEvent, QSize, Signal
+from PySide6.QtCore import Qt, QEvent, QSize, QTimer, Signal
 from PySide6.QtGui import QIcon, QKeyEvent
 from PySide6.QtWidgets import (
     QDialog, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
@@ -82,6 +82,14 @@ class PickerDialog(QDialog):
         self._fetcher: Callable[[str], list[PickerItem]] | None = None
         self._all_items: list[PickerItem] = []
 
+        # 输入去抖：大仓库下 fetcher 是全表 O(n) 模糊打分，每个按键都跑会卡顿。
+        # textChanged 只重置定时器，停顿 120ms 后才真正刷新候选列表。
+        self._debounce = QTimer(self)
+        self._debounce.setSingleShot(True)
+        self._debounce.setInterval(120)
+        self._debounce.timeout.connect(self._do_refresh)
+        self._pending_query = ""
+
     def set_fetcher(self, fetcher: Callable[[str], list[PickerItem]]) -> None:
         """fetcher(query) -> items；query 为空时返回默认列表"""
         self._fetcher = fetcher
@@ -98,7 +106,12 @@ class PickerDialog(QDialog):
         return [it for it in self._all_items if q in it.title.lower() or q in it.subtitle.lower()]
 
     def _on_query_changed(self, text: str) -> None:
-        self._refresh(text)
+        # 走去抖：仅记录最新 query 并重启定时器，停顿后由 _do_refresh 真正刷新
+        self._pending_query = text
+        self._debounce.start()
+
+    def _do_refresh(self) -> None:
+        self._refresh(self._pending_query)
 
     def _refresh(self, query: str) -> None:
         self.list.clear()

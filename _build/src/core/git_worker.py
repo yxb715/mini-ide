@@ -75,11 +75,16 @@ class GitStatusWorker(QThread):
 
     def run(self) -> None:
         from src.core.git_ops import (
-            file_status_map, list_deleted_paths, list_ignored_files,
+            file_status_map, list_changed_files, list_deleted_paths,
+            list_ignored_files,
         )
         from src.util import git_info
-        statuses = file_status_map(self.cwd)
+        # 一轮刷新里 file_status_map 和 list_deleted_paths 都基于 git status
+        # --porcelain，过去各自跑一次（每次 Windows 上 spawn 30-80ms）。这里只
+        # 查一次再喂给两个解析函数，省掉一次重复的 git 子进程。
+        changed = list_changed_files(self.cwd)
+        statuses = file_status_map(self.cwd, files=changed)
         ignored = list_ignored_files(self.cwd)
-        deleted = list_deleted_paths(self.cwd)
+        deleted = list_deleted_paths(self.cwd, files=changed)
         info = git_info.get_info(self.cwd)
         self.done.emit(statuses, ignored, deleted, info)

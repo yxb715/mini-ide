@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 
@@ -252,6 +252,11 @@ class LogWidget(QWidget):
         batch = self._pending
         self._pending = []
 
+        # 插入前采样：用户当前是否贴在底部。只有贴底时才在 flush 后自动跟随到
+        # 最新——否则用户往上翻看历史会被每 50ms 一次的 flush 反复拽回底部。
+        sb = self.edit.verticalScrollBar()
+        was_at_bottom = sb.value() >= sb.maximum() - 4
+
         self.edit.setUpdatesEnabled(False)
         try:
             for stream, line in batch:
@@ -281,9 +286,10 @@ class LogWidget(QWidget):
         finally:
             self.edit.setUpdatesEnabled(True)
 
-        # 批次末尾统一刷新一次计数并滚动到底部
+        # 批次末尾统一刷新一次计数；仅在用户原本贴底时才跟随滚动到最新
         self._update_counts(None)
-        self.edit.verticalScrollBar().setValue(self.edit.verticalScrollBar().maximum())
+        if was_at_bottom:
+            sb.setValue(sb.maximum())
 
         # Qt 文档超限时会自动淘汰头部旧块，同步截断 _lines 保持一致
         max_blocks = self.edit.maximumBlockCount()
@@ -355,6 +361,12 @@ class LogWidget(QWidget):
 
         base_fmt = self._fmt.get(meta.kind, self._fmt["plain"])
 
+        # 记录插入前的 block 数：line 可能含 \n（如 SQL 被美化成多行），
+        # insertText 会把它拆成多个文档 block。下面用实际增量补齐 _lines，
+        # 保证 _lines 与文档 block 严格一一对应——否则之后所有按 block 索引的
+        # 双击跳转 / 异常上下文收集都会从这条多行日志起整体错位。
+        blocks_before = self.edit.document().blockCount()
+
         # 分段插入：把 jump 部分用 link 样式，其他用基础样式
         if meta.jumps:
             last_end = 0
@@ -371,8 +383,14 @@ class LogWidget(QWidget):
         # 块用户数据
         block = cursor.block()
         block.setUserState(_kind_to_state(meta.kind))
-        # 用 list 索引关联
+        # 与文档 block 一一对应：首块挂真实 meta，多出来的续块挂无 jump 的
+        # 副本（续行的 jump 偏移是按整行算的，对拆分后的子行无意义，置空避免误跳）。
+        added = self.edit.document().blockCount() - blocks_before
         self._lines.append(meta)
+        if added > 0:
+            cont_meta = replace(meta, jumps=[]) if meta.jumps else meta
+            for _ in range(added):
+                self._lines.append(cont_meta)
 
     def _update_counts(self, cls: lc.Classification | None) -> None:
         # 计数已在 _flush_pending 里累加，这里只更新 UI 标签

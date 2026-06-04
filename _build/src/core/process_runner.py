@@ -8,6 +8,7 @@ from __future__ import annotations
 import os
 import shlex
 import shutil
+import socket
 import sys
 import threading
 import time
@@ -116,14 +117,26 @@ class ProcessRunner(QObject):
         return True
 
     def stop(self, timeout_ms: int = 5000) -> None:
-        """优雅停止：先 SIGTERM 整棵进程树，超时则 SIGKILL"""
+        """优雅停止：先 SIGTERM 整棵进程树，超时则 SIGKILL。
+
+        杀进程树（psutil terminate + wait_procs 最长 timeout_ms）放到后台线程跑，
+        本方法立即返回——否则进程顽固不退时主线程会冻结到 5 秒。状态先置 stopping，
+        is_running() 立刻转 False、UI 即时响应；进程真正退出后 QProcess 的 finished
+        信号仍在主线程触发 _on_finished 收回 idle，CLI 端 _wait_runner_stop 的
+        processEvents 轮询照常工作（只是不再阻塞在 wait_procs 上）。
+        """
         if not self._proc or self._state != "running":
             return
         self._set_state("stopping")
         self._manually_stopped = True
         pid = int(self._proc.processId())
         if pid > 0:
-            _kill_tree(pid, graceful_timeout=timeout_ms / 1000)
+            graceful = timeout_ms / 1000
+            t = threading.Thread(
+                target=_kill_tree, args=(pid, graceful),
+                name=f"kill-tree-{pid}", daemon=True,
+            )
+            t.start()
         else:
             self._proc.kill()
 
@@ -465,15 +478,23 @@ def is_port_listening(port: int) -> bool:
     """同步直查某端口当前是否仍有进程监听（不走后台快照，用于 kill 后确认释放）。
 
     后台快照每数秒才刷新一次、且 kill 后会被清空，等待端口释放时不能依赖它，
-    否则会被「快照已清空 → 误判已释放」骗到。这里实时查一次 net_connections。
+    否则会被「快照已清空 → 误判已释放」骗到。
+
+    实现用 socket.connect_ex 探活（微秒级），而非 psutil.net_connections 全量
+    扫描（Windows 上一次 200-800ms）。本函数曾被主线程的端口释放等待循环反复
+    调用，全量扫描会把 UI 卡到肉眼可见——这正是项目反复强调「net_connections
+    不上主线程」的红线。connect_ex 直连 127.0.0.1:port：连得上=仍在监听，连不上
+    =已释放。本地 dev 服务几乎都监听 0.0.0.0/127.0.0.1，可靠。
     """
-    try:
-        for conn in psutil.net_connections(kind="inet"):
-            if conn.laddr and conn.laddr.port == port and \
-                    conn.status in (psutil.CONN_LISTEN, "LISTEN"):
-                return True
-    except (psutil.AccessDenied, psutil.Error):
-        pass
+    for family, host in ((socket.AF_INET, "127.0.0.1"),
+                         (socket.AF_INET6, "::1")):
+        try:
+            with socket.socket(family, socket.SOCK_STREAM) as s:
+                s.settimeout(0.2)
+                if s.connect_ex((host, port)) == 0:
+                    return True
+        except OSError:
+            continue
     return False
 
 

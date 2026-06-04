@@ -38,12 +38,6 @@ def notify_success(title: str, message: str) -> None:
         tray.showMessage(title, message, QSystemTrayIcon.MessageIcon.Information, 4000)
 
 
-def notify_warn(title: str, message: str) -> None:
-    tray = _get_tray()
-    if tray:
-        tray.showMessage(title, message, QSystemTrayIcon.MessageIcon.Warning, 6000)
-
-
 def notify_error(title: str, message: str) -> None:
     tray = _get_tray()
     if tray:

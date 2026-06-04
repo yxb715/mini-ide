@@ -144,6 +144,12 @@ class ProjectTab(QWidget):
         # 「外部启动感知」：非 mini-ide 拉起、但端口快照里按 cmdline 匹配到的模块 → pid。
         # 这些模块面板显示「运行中(外部)」，停止按钮走 kill_pid 而非 runner.stop()。
         self._module_external_pids: dict[str, int] = {}
+        # 外部进程感知器：构造时一次性预算各模块的 match keys（模块列表不变），
+        # 之后每轮刷新只做匹配。从 ProjectTab 抽到 core.external_detector 便于单测。
+        from src.core.external_detector import ExternalProcessDetector
+        self._external_detector = ExternalProcessDetector(
+            meta.path, meta.spring_boot_modules,
+        )
 
         # 文件树「▶ 运行脚本」启动的脚本：每个脚本绝对路径一个独立 runner + log tab。
         # 与 module_runners 完全解耦，不进 ServicePanel，不影响多模块聚合状态。
@@ -154,6 +160,9 @@ class ProjectTab(QWidget):
 
         self._current_profile: RunProfile | None = None
         self._pending_after_compile: RunProfile | None = None
+        # 待重启的 profile：stop() 后不靠固定延时赌进程已退，而是在 _on_finished
+        # （进程真正退出）里消费它再启动，避免慢停止导致重复弹框 / 定时器叠加。
+        self._pending_restart: RunProfile | None = None
         self._git_fetch_worker: GitFetchWorker | None = None
         self._git_checkout_worker: GitCheckoutWorker | None = None
         self._git_merge_worker: GitMergePushWorker | None = None
@@ -372,8 +381,10 @@ class ProjectTab(QWidget):
             )
             if ret != QMessageBox.StandardButton.Yes:
                 return
+            # 事件驱动重启：记下待启动 profile，停止完成后由 _on_finished 接力，
+            # 不赌固定延时——慢停止时既不会重复弹框，也不会叠加定时器。
+            self._pending_restart = prof
             self.runner.stop()
-            QTimer.singleShot(RESTART_GAP_MS, lambda: self._run_profile(prof))
             return
 
         # 启动前强制编译
@@ -447,9 +458,9 @@ class ProjectTab(QWidget):
         if not primary:
             return
         if self.runner.is_running():
-            self._pending_after_stop = primary
+            # 同 _run_profile：事件驱动，停止完成后由 _on_finished 接力启动
+            self._pending_restart = primary
             self.runner.stop()
-            QTimer.singleShot(RESTART_GAP_MS, lambda: self._run_profile(primary))
         else:
             self._run_profile(primary)
 
@@ -715,7 +726,6 @@ class ProjectTab(QWidget):
                 port=self._module_ports.get(module),
                 elapsed_seconds=elapsed,
             )
-        self._refresh_aggregate_state()
         self.statusChanged.emit()
 
     def _on_module_finished(self, module: str, exit_code: int) -> None:
@@ -887,11 +897,6 @@ class ProjectTab(QWidget):
     def _any_script_running(self) -> bool:
         return any(r.is_running() for r in self._script_runners.values())
 
-    def _refresh_aggregate_state(self) -> None:
-        """多模块项目的顶部运行状态指示已移除；运行计数由 _refresh_status_row
-        更新到 lbl_elapsed。此处保留空实现，兼容历史调用点。"""
-        return
-
     # ---- 事件回调 ----
 
     def _on_output(self, stream: str, line: str) -> None:
@@ -909,17 +914,21 @@ class ProjectTab(QWidget):
         # 运行/停止状态主要靠主按钮的形态表达。
         self._update_main_button(state)
 
-        # 多模块项目：self.runner 只用来跑编译/Clean 等项目级 profile。
-        # 跑完 idle 时刷新一次聚合（目前为空操作）。
-        if self._is_multi_module and state == "idle":
-            self._refresh_aggregate_state()
-
         self.statusChanged.emit()
 
     def _on_finished(self, exit_code: int) -> None:
         prof = self._current_profile
         self.log.end_run()
         self._current_profile = None
+
+        # 事件驱动重启：进程已真正退出，现在安全地启动待重启的 profile。
+        # 用 singleShot(0) 让本次 finished 回调先彻底结束（状态机收尾、UI 刷新），
+        # 再在下一个事件循环里启动，避免在回调里重入 runner。
+        if self._pending_restart is not None:
+            nxt = self._pending_restart
+            self._pending_restart = None
+            QTimer.singleShot(RESTART_GAP_MS, lambda: self._run_profile(nxt))
+            return
 
         # 启动前编译完成，接着执行主任务
         if prof and prof.kind == "compile" and self._pending_after_compile:
@@ -947,74 +956,12 @@ class ProjectTab(QWidget):
     def _detect_external_modules(self) -> dict[str, tuple[int, int]]:
         """从后台端口快照里按命令行匹配各模块，返回 {module: (pid, port)}。
 
-        感知非 mini-ide 启动的进程（AI / 终端 / IDE 起的）。匹配信号：
-        监听进程的 cmdline 含模块绝对路径（normalize 后），或含 /模块名/ 这类
-        明确的模块标识。匹配不到端口的模块（如 timing-service）也能被认出来。
-
+        感知非 mini-ide 启动的进程（AI / 终端 / IDE 起的、或跨重启遗留的孤儿）。
+        实际匹配逻辑在 core.external_detector，这里只取端口快照并委托过去。
         只读后台快照，不阻塞主线程。
         """
         from src.core.process_runner import port_snapshot
-
-        snap = port_snapshot()
-        if not snap:
-            return {}
-
-        # 项目根路径（归一化）——用于排除与本项目无关的同名进程
-        proj = (self.project_meta.path or "").replace("\\", "/").lower().rstrip("/")
-
-        # 候选：(module, 归一化匹配键列表)
-        result: dict[str, tuple[int, int]] = {}
-        used_pids: set[int] = set()
-        for mod_name, mod_path, _port, main_class in self.project_meta.spring_boot_modules:
-            keys = self._module_match_keys(mod_name, mod_path, main_class)
-            norm_cls = main_class.replace("\\", "/").lower() if main_class else ""
-            best: tuple[int, int] | None = None
-            for port, holders in snap.items():
-                for h in holders:
-                    pid = h.get("pid")
-                    if pid is None or pid in used_pids:
-                        continue
-                    cmd = (h.get("cmdline") or "").replace("\\", "/").lower()
-                    if not cmd:
-                        continue
-                    # 闸门：必须确认是「本项目」的进程，否则别的项目同名模块、
-                    # 甚至 Chrome (...\Application\chrome.exe) 会误撞模块名。
-                    # 两个可靠信号满足其一即可：
-                    #   1. 命令行含本项目根路径（IDE/终端直接 java -jar、展开 classpath 的场景）
-                    #   2. 命令行含本模块主类全限定名（gradle bootRun 把 classpath 塞进
-                    #      Temp jar，命令行里没有项目路径，只能靠主类认）
-                    in_project = bool(proj) and proj in cmd
-                    in_main_class = bool(norm_cls) and norm_cls in cmd
-                    if not (in_project or in_main_class):
-                        continue
-                    if any(k in cmd for k in keys):
-                        best = (pid, port)
-                        break
-                if best:
-                    break
-            if best:
-                result[mod_name] = best
-                used_pids.add(best[0])
-        return result
-
-    def _module_match_keys(self, mod_name: str, mod_path: str, main_class: str = "") -> list[str]:
-        """生成用于匹配进程命令行的关键字（已归一化为正斜杠小写）。"""
-        keys: list[str] = []
-        norm_path = mod_path.replace("\\", "/").lower().rstrip("/")
-        if norm_path:
-            keys.append(norm_path)
-        # gradle 模块名 a:b → 路径片段 a/b；普通模块名直接作为路径片段
-        seg = mod_name.replace(":", "/").lower().strip("/")
-        if seg:
-            keys.append(f"/{seg}/")
-            keys.append(f"/{seg}.jar")
-            keys.append(f"/{seg}-")  # 带版本号的 jar：timing-service-1.0.jar
-        # 主类全限定名：gradle bootRun 把 classpath 塞进 Temp jar 后，进程命令行里
-        # 没有项目路径，只剩主类名。这是认出本项目服务进程的关键信号，且带包名前缀
-        # （com.shwhaty.xxx）不会误撞 Chrome 等无关进程。
-        if main_class:
-            keys.append(main_class.lower())
-        return keys
+        return self._external_detector.detect(port_snapshot())
 
     def _detect_and_apply_external(self) -> None:
         """刷新 _module_external_pids（不碰面板，仅供批量启动前去重用）。
@@ -1585,6 +1532,13 @@ class ProjectTab(QWidget):
         self._poll_timer.stop()
         self._fetch_timer.stop()
         self.indexer.stop()
+        # 等可能在跑的 git worker 收尾：它们 parent 到 self，tab 关闭后 self 随
+        # GC 销毁，若某 QThread 仍在运行会触发「QThread destroyed while still
+        # running」崩溃。都很短命，给个短超时等一下即可。
+        for w in (self._git_status_worker, self._git_fetch_worker,
+                  self._git_checkout_worker, self._git_merge_worker):
+            if w is not None and w.isRunning():
+                w.wait(2000)
         return True
 
     # ---- 快捷键与导航 ----

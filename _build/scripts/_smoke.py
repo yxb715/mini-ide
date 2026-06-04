@@ -19,6 +19,7 @@ modules = [
     "src.core.process_runner",
     "src.core.log_classifier",
     "src.core.git_worker",
+    "src.core.external_detector",
     "src.ui.theme",
     "src.ui.styles",
     "src.ui.log_widget",

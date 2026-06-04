@@ -62,6 +62,9 @@ def _dispatch(cmd: dict, window: "MainWindow") -> dict:
     if action == "list-projects":
         return _cmd_list_projects(window)
 
+    if action == "quit":
+        return _cmd_quit(window)
+
     # 以下命令都需要 project 参数
     project_key = cmd.get("project")
     if not project_key:
@@ -134,6 +137,82 @@ def _find_project_tab(window: "MainWindow", key: str):
 
 
 # ---- 命令实现 ----
+
+def _stop_tab_all(tab) -> int:
+    """停掉一个 ProjectTab 下所有运行中的服务，返回停掉的服务数。
+
+    覆盖三类进程，与关闭窗口时的清理保持一致：
+      1. mini-ide 自己拉起的（单模块主 runner / 多模块 module_runners / 脚本 runner）
+      2. 多模块里被外部（CLI/终端/IDE）启动、靠端口快照感知到的孤儿进程 → 按 PID 杀
+    silent=True 全程不弹确认框（CLI 场景无人值守）。
+    """
+    from src.ui.project_tab import ProjectTab
+    tab: ProjectTab
+    count = 0
+
+    if tab._is_multi_module:
+        # 先刷新外部感知，让 _stop_all_modules 能把孤儿进程也算进去
+        try:
+            tab._detect_and_apply_external()
+        except Exception:
+            log.exception("刷新外部进程感知失败")
+        running = sum(1 for r in tab.module_runners.values() if r.is_running())
+        running += len(getattr(tab, "_module_external_pids", {}))
+        if running:
+            tab._stop_all_modules(silent=True)
+            count += running
+    else:
+        if tab.runner.is_running():
+            tab._stop()
+            count += 1
+
+    # 文件树「▶ 运行脚本」起的进程（nginx/.bat 等），两类项目都可能有
+    for r in list(getattr(tab, "_script_runners", {}).values()):
+        if r.is_running():
+            r.stop()
+            count += 1
+
+    return count
+
+
+def _cmd_quit(window: "MainWindow") -> dict:
+    """停掉所有项目的所有服务，持久化会话后退出 mini-ide。
+
+    退出动作延迟到响应发回客户端之后执行（QTimer.singleShot），否则主进程
+    先退导致 CLI 端收不到确认、报「empty response」。
+    """
+    from src.ui.project_tab import ProjectTab
+    from PySide6.QtCore import QTimer
+    from PySide6.QtWidgets import QApplication
+
+    stopped_total = 0
+    projects = []
+    for i in range(window.tabs.count()):
+        w = window.tabs.widget(i)
+        if not isinstance(w, ProjectTab):
+            continue
+        try:
+            n = _stop_tab_all(w)
+        except Exception:
+            log.exception("停止项目服务失败: %s", w.project_meta.name)
+            n = 0
+        if n:
+            projects.append({"name": w.project_meta.name, "stopped": n})
+            stopped_total += n
+
+    # 持久化窗口几何 + Tab 会话，下次启动能恢复（与 closeEvent 行为一致）
+    try:
+        window._persist_geometry()
+        window._persist_tabs()
+        window.config.save()
+    except Exception:
+        log.exception("退出前持久化失败")
+
+    log.info("CLI quit：停止 %d 个服务，准备退出", stopped_total)
+    # 延迟退出，确保响应已写回客户端
+    QTimer.singleShot(300, QApplication.quit)
+    return {"ok": True, "stopped": stopped_total, "projects": projects}
+
 
 def _cmd_list_projects(window: "MainWindow") -> list:
     from src.ui.project_tab import ProjectTab
