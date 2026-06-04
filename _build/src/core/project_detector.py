@@ -593,13 +593,56 @@ def _detect_python(root: Path) -> ProjectMeta | None:
     )
 
 
+def _detect_go(root: Path) -> ProjectMeta | None:
+    go_mod = root / "go.mod"
+    if not go_mod.exists():
+        return None
+
+    name = root.name
+    txt = _read(go_mod, limit=20_000)
+    m = re.search(r"^\s*module\s+(\S+)", txt, re.MULTILINE)
+    if m:
+        # module 路径常带域名前缀（github.com/foo/bar），取最后一段当项目名
+        name = m.group(1).rstrip("/").split("/")[-1] or name
+
+    # 找 main 包所在目录：优先根目录 main.go，其次 cmd/<name>/ 约定布局
+    run_target = "."
+    if not (root / "main.go").exists():
+        cmd_dir = root / "cmd"
+        if cmd_dir.is_dir():
+            for sub in sorted(p for p in cmd_dir.iterdir() if p.is_dir()):
+                if (sub / "main.go").exists():
+                    run_target = f"./cmd/{sub.name}"
+                    break
+
+    go_cmd = "go"
+    profiles = [
+        RunProfile("install", "下载依赖", [go_cmd, "mod", "download"], kind="compile", icon="📦"),
+        RunProfile("run", "启动", [go_cmd, "run", run_target], kind="run", icon="▶", primary=True),
+        RunProfile("build", "编译", [go_cmd, "build", "-o", "bin/" + name, run_target], kind="build", icon="🔨"),
+        RunProfile("test", "测试", [go_cmd, "test", "./..."], kind="test", icon="🧪"),
+    ]
+
+    return ProjectMeta(
+        path=str(root),
+        name=name,
+        project_type="go",
+        display_type="Go",
+        icon="🐹",
+        package_manager="go",
+        default_port=None,
+        ignored_dirs=["vendor", "bin", ".git", ".idea", ".vscode"],
+        profiles=profiles,
+    )
+
+
 # ---------- 对外入口 ----------
 
 def detect_project(path: str) -> ProjectMeta:
     """按优先级探测项目类型，识别不出时返回 generic。"""
     root = Path(path)
 
-    for detector in (_detect_gradle, _detect_maven, _detect_node, _detect_python):
+    for detector in (_detect_gradle, _detect_maven, _detect_node, _detect_python, _detect_go):
         meta = detector(root)
         if meta:
             return meta

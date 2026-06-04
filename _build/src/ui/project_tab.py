@@ -35,8 +35,8 @@ from src.ui.service_panel import (
 )
 from src.ui.settings_panel import SettingsPanel
 from src.ui.theme import (
-    BG_L0, BG_L4, BORDER_SUBTLE, COLOR_SUCCESS, COLOR_WARN,
-    DOT_IDLE, DOT_RUNNING, DOT_WARN, FG_DIM, FG_PRIMARY, FG_SECONDARY,
+    BG_L4, BORDER_SUBTLE, COLOR_SUCCESS, COLOR_WARN,
+    FG_DIM, FG_PRIMARY, FG_SECONDARY,
     FONT_PT_UI_SM, RADIUS_SM,
 )
 from src.util import git_info, notify
@@ -160,9 +160,6 @@ class ProjectTab(QWidget):
         self._git_status_worker: GitStatusWorker | None = None
         self._git_viewer = None
         self._merge_dialog = None
-        # 手动「刷新远程分支」才给反馈；后台 5 分钟轮询保持静默
-        self._fetch_manual = False
-        self._fetch_behind_before = 0
         # 启动完成标记：日志里看到 Started / ready in 等 marker 后，只给状态栏贴一次"✓ 启动完成"
         self._startup_phase_marked = False
         self._recent_files: list[str] = []     # 最近在预览里打开的文件
@@ -194,7 +191,6 @@ class ProjectTab(QWidget):
         root.setSpacing(0)
 
         root.addWidget(self._build_toolbar())
-        root.addWidget(self._build_status_row())
 
         self.splitter = QSplitter(Qt.Orientation.Horizontal)
         self.splitter.setHandleWidth(2)
@@ -266,7 +262,11 @@ class ProjectTab(QWidget):
 
     def _build_toolbar(self) -> QWidget:
         bar = QFrame()
+        bar.setObjectName("top_toolbar")
         bar.setFrameShape(QFrame.Shape.NoFrame)
+        bar.setStyleSheet(
+            f"#top_toolbar {{ border-bottom:1px solid {BORDER_SUBTLE}; }}"
+        )
         lay = QHBoxLayout(bar)
         lay.setContentsMargins(10, 6, 10, 6)
         lay.setSpacing(6)
@@ -292,7 +292,9 @@ class ProjectTab(QWidget):
         self.btn_main.setMinimumWidth(110)
         self.btn_main.clicked.connect(self._on_main_clicked)
         lay.addWidget(self.btn_main)
-        if self._is_multi_module:
+        # 多模块项目走左侧服务面板，主按钮隐藏；
+        # 通用目录（未识别出可启动命令）也隐藏主按钮，不显示无意义的灰色「启动」
+        if self._is_multi_module or self._primary_profile is None:
             self.btn_main.setVisible(False)
         else:
             self._update_main_button("idle")
@@ -318,32 +320,7 @@ class ProjectTab(QWidget):
 
         lay.addStretch(1)
 
-        # 工具栏极简：主按钮旁只留命令面板入口；其它常用动作全部进 Ctrl+Shift+P
-        btn_cmd = QToolButton()
-        btn_cmd.setText("⌘")
-        btn_cmd.setToolTip("命令面板 (Ctrl+Shift+P)")
-        btn_cmd.clicked.connect(self.open_command_palette)
-        lay.addWidget(btn_cmd)
-
-        return bar
-
-    def _build_status_row(self) -> QWidget:
-        bar = QFrame()
-        bar.setStyleSheet(
-            f"background:{BG_L0}; border-bottom:1px solid {BORDER_SUBTLE};"
-        )
-        lay = QHBoxLayout(bar)
-        lay.setContentsMargins(12, 4, 12, 4)
-        lay.setSpacing(14)
-
-        self.dot = QLabel("●")
-        self.dot.setStyleSheet(f"color: {DOT_IDLE};")
-        self.lbl_state = QLabel("就绪")
-        self.lbl_state.setProperty("role", "subtitle")
-        lay.addWidget(self.dot)
-        lay.addWidget(self.lbl_state)
-
-        lay.addWidget(QLabel(""))
+        # 运行计数 / 启动完成提示（原状态行，已并入本工具栏，靠右显示）
         self.lbl_elapsed = QLabel("")
         self.lbl_elapsed.setProperty("role", "subtitle")
         lay.addWidget(self.lbl_elapsed)
@@ -375,7 +352,12 @@ class ProjectTab(QWidget):
         self.btn_changes.setVisible(False)
         lay.addWidget(self.btn_changes)
 
-        lay.addStretch(1)
+        # 工具栏极简：最右侧留命令面板入口；其它常用动作全部进 Ctrl+Shift+P
+        btn_cmd = QToolButton()
+        btn_cmd.setText("⌘")
+        btn_cmd.setToolTip("命令面板 (Ctrl+Shift+P)")
+        btn_cmd.clicked.connect(self.open_command_palette)
+        lay.addWidget(btn_cmd)
 
         return bar
 
@@ -906,26 +888,9 @@ class ProjectTab(QWidget):
         return any(r.is_running() for r in self._script_runners.values())
 
     def _refresh_aggregate_state(self) -> None:
-        """多模块项目：根据所有 runner + 外部感知汇总状态更新状态栏 dot / lbl_state"""
-        if not self._is_multi_module:
-            return
-        total = len(self.project_meta.spring_boot_modules)
-        running = sum(1 for r in self.module_runners.values() if r.is_running())
-        # 外部感知到、且不是自管理 runner 在跑的模块也计入
-        running += sum(
-            1 for m in self._module_external_pids
-            if not (self.module_runners.get(m) and self.module_runners[m].is_running())
-        )
-        stopping = any(r.state() == "stopping" for r in self.module_runners.values())
-        if running == 0 and not stopping:
-            self.dot.setStyleSheet(f"color: {DOT_IDLE};")
-            self.lbl_state.setText("就绪")
-        elif stopping:
-            self.dot.setStyleSheet(f"color: {DOT_WARN};")
-            self.lbl_state.setText(f"停止中 ({running}/{total} 运行中)")
-        else:
-            self.dot.setStyleSheet(f"color: {DOT_RUNNING};")
-            self.lbl_state.setText(f"{running}/{total} 运行中")
+        """多模块项目的顶部运行状态指示已移除；运行计数由 _refresh_status_row
+        更新到 lbl_elapsed。此处保留空实现，兼容历史调用点。"""
+        return
 
     # ---- 事件回调 ----
 
@@ -940,23 +905,12 @@ class ProjectTab(QWidget):
                 self.lbl_phase.setStyleSheet(f"color: {COLOR_SUCCESS};")
 
     def _on_state(self, state: str) -> None:
-        mapping = {
-            "idle":     ("●", DOT_IDLE, "就绪"),
-            "running":  ("●", DOT_RUNNING, "运行中"),
-            "stopping": ("●", DOT_WARN, "正在停止..."),
-        }
-        dot, color, text = mapping.get(state, ("●", FG_SECONDARY, state))
-        self.dot.setText(dot)
-        self.dot.setStyleSheet(f"color: {color};")
-
-        if state == "running" and self._current_profile:
-            text = f"{self._current_profile.label} 中"
-        self.lbl_state.setText(text)
-
+        # 顶部运行状态圆点/文字已移除；启动完成的 ✓ 提示仍由 lbl_phase 显示，
+        # 运行/停止状态主要靠主按钮的形态表达。
         self._update_main_button(state)
 
         # 多模块项目：self.runner 只用来跑编译/Clean 等项目级 profile。
-        # 跑完 idle 时要把状态栏恢复成"N/M 运行中"的聚合显示。
+        # 跑完 idle 时刷新一次聚合（目前为空操作）。
         if self._is_multi_module and state == "idle":
             self._refresh_aggregate_state()
 
@@ -1458,7 +1412,6 @@ class ProjectTab(QWidget):
         remote = data["remote"]
         menu.set_current_branch(cur)
 
-        menu.addAction("🔄 刷新远程分支", lambda: self._start_remote_fetch(manual=True))
         menu.addAction("🔀 合并远程分支到当前", self._show_merge_dialog)
         menu.addSeparator()
 
@@ -1487,27 +1440,14 @@ class ProjectTab(QWidget):
                 act.setData(b)
                 act.triggered.connect(lambda _=False, br=b: QApplication.clipboard().setText(br))
 
-    def _start_remote_fetch(self, manual: bool = False) -> None:
-        """后台 git fetch。后台轮询时静默；手动点菜单（manual=True）给托盘反馈。"""
+    def _start_remote_fetch(self) -> None:
+        """后台静默 git fetch，刷新 ahead/behind 状态，发现远程领先时高亮分支按钮。"""
         if self._git_fetch_worker and self._git_fetch_worker.isRunning():
-            if manual:
-                notify.notify_info("刷新远程分支", "正在刷新，请稍候…")
             return
         from src.core.git_ops import has_upstream, is_git_repo
         path = self.project_meta.path
-        if not is_git_repo(path):
-            if manual:
-                notify.notify_warn("刷新远程分支", "当前项目不是 git 仓库。")
+        if not is_git_repo(path) or not has_upstream(path):
             return
-        if not has_upstream(path):
-            if manual:
-                notify.notify_warn("刷新远程分支", "当前分支没有配置远程上游，无法刷新。")
-            return
-        self._fetch_manual = manual
-        info_before = git_info.get_info(path)
-        self._fetch_behind_before = info_before.behind if info_before else 0
-        if manual:
-            notify.notify_info("刷新远程分支", "正在拉取远程更新…")
         self._git_fetch_worker = GitFetchWorker(path, parent=self)
         self._git_fetch_worker.done.connect(self._on_remote_fetch_done)
         self._git_fetch_worker.finished.connect(self._git_fetch_worker.deleteLater)
@@ -1516,27 +1456,10 @@ class ProjectTab(QWidget):
     def _on_remote_fetch_done(self, ok: bool) -> None:
         if self.sender() is self._git_fetch_worker:
             self._git_fetch_worker = None
-        manual = self._fetch_manual
-        self._fetch_manual = False
         if not ok:
-            if manual:
-                notify.notify_error("刷新远程分支", "拉取失败，请检查网络或远程仓库权限。")
             return
         git_info.invalidate(self.project_meta.path)
         self._refresh_status_row()
-        if not manual:
-            return
-        info = git_info.get_info(self.project_meta.path)
-        behind = info.behind if info else 0
-        new_commits = behind - self._fetch_behind_before
-        if behind > 0:
-            extra = f"，其中本次新增 {new_commits} 个" if new_commits > 0 else ""
-            notify.notify_success(
-                "刷新远程分支",
-                f"远程领先当前分支 {behind} 个提交{extra}，可用「合并远程分支」拉取。",
-            )
-        else:
-            notify.notify_success("刷新远程分支", "已是最新，没有需要合并的远程提交。")
 
     def _do_checkout(self, branch: str) -> None:
         from src.core.git_ops import is_dirty

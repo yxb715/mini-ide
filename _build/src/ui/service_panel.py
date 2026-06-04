@@ -1,11 +1,11 @@
 """左侧服务面板（多模块 Spring Boot 专用）
 
-每行：状态图标 模块名 端口 启停按钮
-（运行/未启动等状态只用图标表达，不再显示文字）
+每行：模块名 端口 启停按钮
+（运行/未启动等状态只用右侧按钮的图标表达，不再显示文字，也不再有左侧独立状态图标）
 
 交互：
 - 左键行主体 → 切到该模块的日志 tab
-- 右侧小按钮 → 启停（启动中/停止中时禁用）
+- 右侧小按钮 → 启停（▶ 启动 / ⏹ 停止，启动中/停止中时禁用并显示 ◐）
 - 顶部"全部启动 / 全部停止"按钮
 
 对外信号：
@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
 from src.ui.theme import (
     ACCENT, BG_BTN_DANGER, BG_BTN_DANGER_HOVER, BG_BTN_PRIMARY,
     BG_BTN_PRIMARY_HOVER, BG_L0, BG_L1, BG_L2, BG_L4, BORDER_SUBTLE,
-    COLOR_SUCCESS, COLOR_WARN, DOT_IDLE, FG_BRIGHT, FG_DIM, FG_PRIMARY,
+    COLOR_SUCCESS, COLOR_WARN, FG_BRIGHT, FG_DIM, FG_PRIMARY,
     FG_SECONDARY, FONT_PT_UI, FONT_PT_UI_SM, RADIUS_SM,
 )
 
@@ -67,11 +67,6 @@ class _ServiceRow(QFrame):
         lay.setContentsMargins(10, 5, 6, 5)
         lay.setSpacing(8)
 
-        self.lbl_icon = QLabel("▶")
-        self.lbl_icon.setFixedWidth(14)
-        self.lbl_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        lay.addWidget(self.lbl_icon)
-
         self.lbl_name = QLabel(module_name)
         self.lbl_name.setStyleSheet(f"color:{FG_PRIMARY}; font-size:{FONT_PT_UI}pt;")
         lay.addWidget(self.lbl_name, 1)
@@ -109,31 +104,23 @@ class _ServiceRow(QFrame):
         # lbl_info 只显示端口号；运行/未启动/启动中/停止中一律靠左侧图标和右侧按钮表达，不放文字
         self.lbl_info.setText(port_str)
         if state == STATE_IDLE:
-            self.lbl_icon.setText("▶")
-            self.lbl_icon.setStyleSheet(f"color:{DOT_IDLE}; font-size:{FONT_PT_UI}pt;")
             self.btn.setText("▶")
             self.btn.setToolTip(f"启动 {self.module_name}")
             self.btn.setEnabled(True)
             self.btn.setStyleSheet(_row_btn_qss(BORDER_SUBTLE, FG_DIM))
         elif state == STATE_STARTING:
-            self.lbl_icon.setText("◐")
-            self.lbl_icon.setStyleSheet(f"color:{COLOR_WARN}; font-size:{FONT_PT_UI}pt;")
             self.btn.setText("◐")
             self.btn.setToolTip(f"{self.module_name} 正在启动")
             self.btn.setEnabled(False)
             self.btn.setStyleSheet(_row_btn_qss(COLOR_WARN, COLOR_WARN))
         elif state in (STATE_RUNNING, STATE_RUNNING_EXTERNAL):
             # 不分内部/外部：CLI 与界面操作的是同一个 mini-ide 实例，起来的服务一律
-            # 显示运行图标。外部进程（跨重启后靠端口感知到的）停止时仍走 kill pid。
-            self.lbl_icon.setText("⏹")
-            self.lbl_icon.setStyleSheet(f"color:{COLOR_SUCCESS}; font-size:{FONT_PT_UI}pt;")
+            # 显示停止图标。外部进程（跨重启后靠端口感知到的）停止时仍走 kill pid。
             self.btn.setText("⏹")
             self.btn.setToolTip(f"停止 {self.module_name}")
             self.btn.setEnabled(True)
             self.btn.setStyleSheet(_row_btn_qss(COLOR_SUCCESS, COLOR_SUCCESS))
         elif state == STATE_STOPPING:
-            self.lbl_icon.setText("◐")
-            self.lbl_icon.setStyleSheet(f"color:{COLOR_WARN}; font-size:{FONT_PT_UI}pt;")
             self.btn.setText("◐")
             self.btn.setToolTip(f"{self.module_name} 正在停止")
             self.btn.setEnabled(False)
