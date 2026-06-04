@@ -83,6 +83,46 @@ def open_folder(path: str) -> None:
     QDesktopServices.openUrl(QUrl.fromLocalFile(path))
 
 
+# 办公文档类型：双击应交给系统默认关联程序（docx→WPS/Word、pdf→默认阅读器…），
+# 而不是塞进内置文本预览（会显示"二进制不可预览"）或代码编辑器（乱码）。
+# 刻意不含 zip/exe/dll（双击 exe 会执行、有风险）和图片（内置看图更顺手）。
+_OFFICE_DOC_EXTS = {
+    # Word 系
+    ".doc", ".docx", ".docm", ".dot", ".dotx", ".dotm", ".rtf", ".odt",
+    # Excel 系
+    ".xls", ".xlsx", ".xlsm", ".xlsb", ".xlt", ".xltx", ".ods",
+    # PowerPoint 系
+    ".ppt", ".pptx", ".pptm", ".pps", ".ppsx", ".pot", ".potx", ".odp",
+    # PDF
+    ".pdf",
+    # WPS 原生格式
+    ".wps", ".et", ".dps", ".ett", ".wpt", ".dpt",
+    # Visio / Project
+    ".vsd", ".vsdx", ".mpp",
+}
+
+
+def is_office_doc(path: str) -> bool:
+    """是否为应交给系统默认程序打开的办公文档类型"""
+    return Path(path).suffix.lower() in _OFFICE_DOC_EXTS
+
+
+def open_with_system_default(path: str) -> bool:
+    """用系统默认关联程序打开文件，等价于在资源管理器里双击。
+
+    Windows 优先走 os.startfile（即 ShellExecute，双击的底层调用），
+    失败回落到 QDesktopServices.openUrl。文件不存在返回 False。
+    """
+    p = Path(path)
+    if not p.exists():
+        return False
+    try:
+        os.startfile(str(p))  # type: ignore[attr-defined]  # Windows 专属
+        return True
+    except (OSError, AttributeError):
+        return QDesktopServices.openUrl(QUrl.fromLocalFile(str(p)))
+
+
 def reveal_in_explorer(path: str) -> None:
     """在资源管理器中选中文件"""
     p = Path(path)

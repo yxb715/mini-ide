@@ -40,7 +40,10 @@ from src.ui.theme import (
     FONT_PT_UI_SM, RADIUS_SM,
 )
 from src.util import git_info, notify
-from src.util.editor import open_in_editor, open_folder, reveal_in_explorer
+from src.util.editor import (
+    open_in_editor, open_folder, reveal_in_explorer,
+    is_office_doc, open_with_system_default,
+)
 
 
 # 顶层调谐常量（提到顶部方便统一调，避免散在各方法里成 magic number）
@@ -1114,6 +1117,9 @@ class ProjectTab(QWidget):
     # ---- 文件跳转 ----
 
     def _jump_to_file(self, path: str, line: int, col: int) -> None:
+        # 办公文档：交给系统默认关联程序打开（无行号语义）
+        if is_office_doc(path) and open_with_system_default(path):
+            return
         # file_open_mode=preview 总是用内置预览；auto 则先试外部编辑器
         if self.config.file_open_mode == "preview":
             self._show_preview(path, line, col)
@@ -1130,6 +1136,9 @@ class ProjectTab(QWidget):
     def _show_preview(self, path: str, line: int, col: int) -> None:
         """在中心 tab 区打开文件：同文件已开则聚焦，否则新建 tab（默认编辑模式）"""
         from pathlib import Path
+        # 办公文档不进内置预览，直接交给系统默认程序（git 改动/环境面板等入口也会走到这）
+        if is_office_doc(path) and open_with_system_default(path):
+            return
         p = Path(path)
         if not p.is_absolute():
             from src.util.editor import search_in_project
@@ -1480,6 +1489,9 @@ class ProjectTab(QWidget):
     # ---- 其他 ----
 
     def _on_file_activated(self, path: str) -> None:
+        # 办公文档（docx/xlsx/pdf…）：交给系统默认关联程序打开（等价于资源管理器双击）
+        if is_office_doc(path) and open_with_system_default(path):
+            return
         if self.config.file_open_mode == "preview":
             self._show_preview(path, 0, 0)
             return
