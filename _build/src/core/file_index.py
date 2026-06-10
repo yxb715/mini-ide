@@ -86,10 +86,11 @@ class FileIndexer(QObject):
         with self._lock:
             files = self._files
         for f in files:
-            score = _fuzzy_score(f.name, query, f.rel_path.lower())
+            score = _fuzzy_score(f.name, query, f.rel_path.lower(), f.name_original)
             if score > 0:
                 matches.append((score, f))
-        matches.sort(key=lambda p: (-p[0], p[1].rel_path))
+        # 排序：分数高优先；同分时文件名短的优先（更接近完整匹配）；再按路径稳定排序
+        matches.sort(key=lambda p: (-p[0], len(p[1].name), p[1].rel_path))
         return [m[1] for m in matches[:limit]]
 
     def stop(self) -> None:
@@ -229,23 +230,89 @@ def _should_ignore(p: Path, root: Path) -> bool:
     return False
 
 
-def _fuzzy_score(name: str, query: str, rel_path: str) -> int:
-    """简单打分：文件名连续匹配最高分，子串匹配次之，字符顺序匹配最低"""
+def _camel_initials(name: str) -> str:
+    """提取驼峰/分隔符首字母缩写：UserController.java → ucj，get_category → gc。
+
+    规则：每个"词"的首字母入选。词边界 = 字符串开头、大写字母（驼峰）、
+    分隔符（_ - . 空格）之后。全部转小写返回，供缩写匹配（如 uc→UserController）。
+    """
+    out: list[str] = []
+    prev_boundary = True
+    for ch in name:
+        if ch in "_-. ":
+            prev_boundary = True
+            continue
+        is_upper = ch.isupper()
+        if prev_boundary or is_upper:
+            out.append(ch.lower())
+        prev_boundary = False
+    return "".join(out)
+
+
+def _fuzzy_score(name: str, query: str, rel_path: str, name_original: str = "") -> int:
+    """文件名模糊打分。分数越高越靠前。
+
+    name 是小写文件名（子串/前缀匹配用），name_original 是原始大小写
+    （驼峰首字母缩写用，识别 UserController 这种大写词边界）。
+    覆盖几类匹配，按"用户意图明显程度"给分：
+    - 完全相等 / 前缀 / 子串：最强信号
+    - 驼峰首字母缩写（uc → UserController、gcl → getCategoryList）：很常用
+    - 子序列匹配：兜底，且按"连续程度 + 是否贴着词首"加权，
+      让 gcl→getCategoryList 这种贴词首的子序列排在松散匹配前面
+    """
     if not query:
         return 1
-    if query == name:
-        return 1000
+    # 去扩展名后的主干名（AppEquipment.java → appequipment），用于"完整匹配"判定
+    stem = name.rsplit(".", 1)[0] if "." in name else name
+    if query == name or query == stem:
+        return 1000          # 文件名（含/不含扩展名）正好就是 query → 最高，必置顶
     if name.startswith(query):
-        return 800
+        # 前缀匹配：越接近"完整等于"分越高。多余字符越少越优先，
+        # 这样 appequipment 命中时 AppEquipment > AppEquipmentController
+        # > AppEquipmentAssignmentController，不再被路径字母序打乱。
+        extra = len(stem) - len(query)
+        return 900 - min(extra, 99)
     if query in name:
-        return 500
+        return 600
+
+    # 驼峰/分隔首字母缩写：gcl == getCategoryList 的首字母串
+    initials = _camel_initials(name_original or name)
+    if query == initials:
+        return 720
+    if initials.startswith(query):
+        return 560
+
+    # 子序列匹配 + 连续度/词首加权
+    sub = _subsequence_score(name_original or name, query)
+    if sub > 0:
+        return sub
+    # 文件名都不沾边，再看相对路径子串（弱信号）
     if query in rel_path:
-        return 300
-    # 字符顺序匹配（a-b-c 能匹配 ab-c）
+        return 120
+    return 0
+
+
+def _subsequence_score(name: str, query: str) -> int:
+    """query 的字符按序出现在 name 里则算命中，按连续段和词首奖励打分。
+
+    name 用原始大小写（识别驼峰词首）；query 已小写，比较时按位转小写。
+    基础分 100；每个紧跟前一字符的连续命中 +12；每个落在词首
+    （开头 / 大写 / 分隔符后）的命中 +8。不命中返回 0。
+    """
+    low = name.lower()
     idx = 0
+    score = 100
+    prev_pos = -2
     for ch in query:
-        pos = name.find(ch, idx)
+        pos = low.find(ch, idx)
         if pos < 0:
             return 0
+        if pos == prev_pos + 1:
+            score += 12   # 连续
+        is_word_start = (pos == 0 or name[pos - 1] in "_-. "
+                         or (name[pos].isupper() and not name[pos - 1].isupper()))
+        if is_word_start:
+            score += 8
+        prev_pos = pos
         idx = pos + 1
-    return 100
+    return score

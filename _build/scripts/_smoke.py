@@ -31,6 +31,7 @@ modules = [
     "src.ui.file_preview",
     "src.ui.syntax_highlighter",
     "src.core.file_index",
+    "src.core.controller_index",
     "src.ui.quick_open",
     "src.ui.content_search",
     "src.core.git_ops",

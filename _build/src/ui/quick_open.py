@@ -12,17 +12,84 @@ from dataclasses import dataclass
 from typing import Callable
 
 from PySide6.QtCore import Qt, QEvent, QSize, QTimer, Signal
-from PySide6.QtGui import QIcon, QKeyEvent
+from PySide6.QtGui import (
+    QAbstractTextDocumentLayout, QColor, QIcon, QKeyEvent, QPalette,
+    QTextDocument,
+)
 from PySide6.QtWidgets import (
-    QDialog, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
+    QApplication, QDialog, QHBoxLayout, QLabel, QLineEdit, QListWidget,
+    QListWidgetItem, QStyle, QStyledItemDelegate, QStyleOptionViewItem,
     QVBoxLayout, QWidget,
 )
 
 from src.ui.theme import (
     ACCENT, ACCENT_SUBTLE, BG_CODE, BG_L1, BG_L2, BG_L4,
-    BORDER_STRONG, BORDER_SUBTLE, FG_BRIGHT, FG_PRIMARY, FG_SECONDARY,
+    BORDER_STRONG, BORDER_SUBTLE, FG_BRIGHT, FG_DIM, FG_PRIMARY, FG_SECONDARY,
     FONT_PT_UI, FONT_PT_UI_LG, FONT_PT_UI_SM, RADIUS_SM, apply_search_style,
 )
+
+
+def _esc(s: str) -> str:
+    """HTML 转义，避免文件名/路径里的 < & 破坏富文本渲染"""
+    return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+
+class _PickerItemDelegate(QStyledItemDelegate):
+    """候选项两段式渲染：标题（文件名）亮色加粗，副标题（路径）暗色小字。
+
+    之前 title + "\\n  " + subtitle 拼成纯文本一把渲染，全白同字号，
+    一搜满屏白字根本扫不出文件名。这里用 QTextDocument 渲染富文本，
+    让文件名跳出来、路径退到背景。
+    """
+
+    def _build_doc(self, index, selected: bool) -> QTextDocument | None:
+        it = index.data(Qt.ItemDataRole.UserRole)
+        if it is None or not isinstance(it, PickerItem):
+            return None
+        title = _esc(it.title)
+        sub = _esc(it.subtitle) if it.subtitle else ""
+        # 选中态标题用纯白，普通态用主色；路径恒用暗色
+        title_color = FG_BRIGHT if selected else FG_PRIMARY
+        html = (f'<span style="color:{title_color}; font-size:{FONT_PT_UI}pt;'
+                f' font-weight:600;">{title}</span>')
+        if sub:
+            html += (f'<br/><span style="color:{FG_DIM};'
+                     f' font-size:{FONT_PT_UI_SM}pt;">{sub}</span>')
+        doc = QTextDocument()
+        doc.setDocumentMargin(0)
+        doc.setHtml(html)
+        return doc
+
+    def paint(self, painter, option, index):
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        selected = bool(opt.state & QStyle.StateFlag.State_Selected)
+        doc = self._build_doc(index, selected)
+        if doc is None:
+            super().paint(painter, option, index)
+            return
+        # 背景（hover/选中）走默认主题绘制，文字我们自己画
+        opt.text = ""
+        widget = opt.widget
+        style = widget.style() if widget else QApplication.style()
+        style.drawControl(QStyle.ControlElement.CE_ItemViewItem, opt, painter, widget)
+        text_rect = style.subElementRect(
+            QStyle.SubElement.SE_ItemViewItemText, opt, widget)
+        painter.save()
+        painter.translate(text_rect.topLeft())
+        painter.setClipRect(0, 0, text_rect.width(), text_rect.height())
+        doc.setTextWidth(text_rect.width())
+        ctx = QAbstractTextDocumentLayout.PaintContext()
+        doc.documentLayout().draw(painter, ctx)
+        painter.restore()
+
+    def sizeHint(self, option, index):
+        doc = self._build_doc(index, False)
+        if doc is None:
+            return super().sizeHint(option, index)
+        w = option.rect.width() if option.rect.width() > 0 else 600
+        doc.setTextWidth(w)
+        return QSize(int(doc.idealWidth()), int(doc.size().height()) + 8)
 
 
 @dataclass
@@ -77,6 +144,8 @@ class PickerDialog(QDialog):
         )
         self.list.itemActivated.connect(self._on_activated)
         self.list.installEventFilter(self)
+        # 富文本 delegate：文件名亮+加粗、路径暗+小字（替代纯文本同字号同色渲染）
+        self.list.setItemDelegate(_PickerItemDelegate(self.list))
         root.addWidget(self.list, 1)
 
         self._fetcher: Callable[[str], list[PickerItem]] | None = None
@@ -117,16 +186,12 @@ class PickerDialog(QDialog):
         self.list.clear()
         items = self._fetcher(query) if self._fetcher else []
         for it in items[:200]:
-            item = QListWidgetItem(self._format(it))
+            # 文本由 _PickerItemDelegate 富文本渲染；这里只挂数据，不再拼纯文本
+            item = QListWidgetItem()
             item.setData(Qt.ItemDataRole.UserRole, it)
             self.list.addItem(item)
         if self.list.count() > 0:
             self.list.setCurrentRow(0)
-
-    def _format(self, it: PickerItem) -> str:
-        if it.subtitle:
-            return f"{it.title}\n  {it.subtitle}"
-        return it.title
 
     def _on_activated(self, item: QListWidgetItem) -> None:
         picker = item.data(Qt.ItemDataRole.UserRole)

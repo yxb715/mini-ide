@@ -32,6 +32,35 @@ MAX_MATCHES = 1000
 MAX_FILE_SIZE = 2 * 1024 * 1024    # 单文件超 2MB 不扫
 MAX_LINE_LEN = 500                  # 匹配行显示截断
 
+# 默认隐藏的"噪音文件"：日志、压缩/生成产物、lock 等。
+# 它们能被全文搜命中但绝大多数时候不是用户想找的源码，默认排除、
+# 顶部勾选可放开（见 ContentSearchDialog 的"含日志等"复选框）。
+NOISE_EXTS = {
+    ".log",                          # 日志
+    ".min.js", ".min.css",           # 压缩产物（注意是复合后缀，单独判定）
+    ".map",                          # source map
+    ".lock",                         # 锁文件
+    ".snap",                         # 测试快照
+    ".csv", ".tsv",                  # 大数据表（常是导出/样本数据）
+}
+# 文件名整体命中即视为噪音（无固定扩展名的 lock）
+NOISE_NAMES = {
+    "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "poetry.lock",
+    "composer.lock", "gemfile.lock", "cargo.lock",
+}
+
+
+def _is_noise_file(filename: str) -> bool:
+    """文件名是否属于默认隐藏的噪音文件（日志 / 压缩产物 / lock 等）"""
+    low = filename.lower()
+    if low in NOISE_NAMES:
+        return True
+    # .min.js / .min.css 这类复合后缀单独判
+    if low.endswith(".min.js") or low.endswith(".min.css"):
+        return True
+    ext = Path(filename).suffix.lower()
+    return ext in NOISE_EXTS
+
 
 def _compile_pattern(query: str, case: bool, whole_word: bool, regex: bool):
     """编译搜索 pattern。SearchWorker 跟 dialog 的 highlight delegate 共用同一份。"""
@@ -57,9 +86,11 @@ class SearchWorker(QThread):
     progress = Signal(int, int)  # files_scanned, matches_found
     done = Signal(int, int)      # total_files_scanned, total_matches
     stopped = Signal()
+    files_collected = Signal(list)  # list[str]：本次 walk 收集到的候选文件清单（供 dialog 缓存）
 
     def __init__(self, root: str, query: str, case_sensitive: bool,
                  whole_word: bool, use_regex: bool, include_exts: list[str],
+                 file_list: list[str] | None = None, include_noise: bool = False,
                  parent=None):
         super().__init__(parent)
         self.root = root
@@ -68,6 +99,13 @@ class SearchWorker(QThread):
         self.whole_word = whole_word
         self.regex = use_regex
         self.include_exts = {e.lower() for e in include_exts if e}
+        # 是否把日志/压缩产物/lock 等噪音文件纳入搜索（默认 False，顶部勾选放开）
+        self.include_noise = include_noise
+        # 复用上一次扫描缓存的候选文件清单：非 None 时跳过 os.walk + stat，直接 grep。
+        # 大仓库下省掉的目录遍历和 stat 调用是"输入即搜"流畅度的关键。
+        # 注意：清单里含噪音文件，是否搜它们由 include_noise 在 grep 阶段决定，
+        # 这样切换"含日志"开关无需重新 walk。
+        self.file_list = file_list
         self._stop = False
 
     def stop(self) -> None:
@@ -80,6 +118,70 @@ class SearchWorker(QThread):
             self.done.emit(0, 0)
             return
 
+        if self.file_list is not None:
+            self._run_cached(pattern)
+        else:
+            self._run_walk(pattern)
+
+    def _grep_file(self, abs_p: Path, pattern, batch: list, scanned: int,
+                   total: int) -> tuple[int, bool]:
+        """grep 单个文件，命中追加到 batch。返回 (新增命中数, 是否达上限)。"""
+        rel = str(abs_p.relative_to(self.root)).replace("\\", "/")
+        added = 0
+        try:
+            with abs_p.open("r", encoding="utf-8", errors="replace") as f:
+                for ln, line in enumerate(f, 1):
+                    if self._stop:
+                        return added, False
+                    raw = line.rstrip("\r\n")
+                    for m in pattern.finditer(raw):
+                        text = raw if len(raw) <= MAX_LINE_LEN else raw[:MAX_LINE_LEN] + "…"
+                        batch.append(ContentMatch(
+                            abs_path=str(abs_p), rel_path=rel,
+                            line_no=ln, line_text=text,
+                            col_start=m.start(), col_end=m.end(),
+                        ))
+                        added += 1
+                        if total + added >= MAX_MATCHES:
+                            return added, True
+                        break   # 一行只记一次，减少噪音
+        except OSError:
+            pass
+        return added, False
+
+    def _run_cached(self, pattern) -> None:
+        """走缓存清单：无 os.walk / stat，逐个文件 grep。"""
+        scanned = 0
+        total = 0
+        batch: list[ContentMatch] = []
+        for path in self.file_list:
+            if self._stop:
+                self.stopped.emit()
+                return
+            fn = Path(path).name
+            if not self.include_noise and _is_noise_file(fn):
+                continue
+            ext = Path(path).suffix.lower()
+            if self.include_exts and ext not in self.include_exts:
+                continue
+            abs_p = Path(path)
+            scanned += 1
+            added, capped = self._grep_file(abs_p, pattern, batch, scanned, total)
+            total += added
+            if capped:
+                self.match_found.emit(batch)
+                self.done.emit(scanned, total)
+                return
+            if len(batch) >= 30:
+                self.match_found.emit(batch)
+                batch = []
+                self.progress.emit(scanned, total)
+        if batch:
+            self.match_found.emit(batch)
+        self.done.emit(scanned, total)
+
+    def _run_walk(self, pattern) -> None:
+        collected: list[str] = []
         scanned = 0
         total = 0
         batch: list[ContentMatch] = []
@@ -97,38 +199,27 @@ class SearchWorker(QThread):
                 ext = Path(fn).suffix.lower()
                 if ext in IGNORED_EXTS:
                     continue
-                if self.include_exts and ext not in self.include_exts:
-                    continue
                 abs_p = Path(dirpath) / fn
                 try:
                     if abs_p.stat().st_size > MAX_FILE_SIZE:
                         continue
                 except OSError:
                     continue
-                scanned += 1
-                rel = str(abs_p.relative_to(self.root)).replace("\\", "/")
-                try:
-                    with abs_p.open("r", encoding="utf-8", errors="replace") as f:
-                        for ln, line in enumerate(f, 1):
-                            if self._stop:
-                                self.stopped.emit()
-                                return
-                            raw = line.rstrip("\r\n")
-                            for m in pattern.finditer(raw):
-                                text = raw if len(raw) <= MAX_LINE_LEN else raw[:MAX_LINE_LEN] + "…"
-                                batch.append(ContentMatch(
-                                    abs_path=str(abs_p), rel_path=rel,
-                                    line_no=ln, line_text=text,
-                                    col_start=m.start(), col_end=m.end(),
-                                ))
-                                total += 1
-                                if total >= MAX_MATCHES:
-                                    self.match_found.emit(batch)
-                                    self.done.emit(scanned, total)
-                                    return
-                                break   # 一行只记一次，减少噪音
-                except OSError:
+                # 收集进缓存清单（含所有文本文件，含噪音文件；ext_filter 与噪音
+                # 过滤都在 grep 阶段才做，这样换扩展名/切换"含日志"无需重新 walk）
+                collected.append(str(abs_p))
+                if not self.include_noise and _is_noise_file(fn):
                     continue
+                if self.include_exts and ext not in self.include_exts:
+                    continue
+                scanned += 1
+                added, capped = self._grep_file(abs_p, pattern, batch, scanned, total)
+                total += added
+                if capped:
+                    self.match_found.emit(batch)
+                    self.files_collected.emit(collected)
+                    self.done.emit(scanned, total)
+                    return
 
                 if len(batch) >= 30:
                     self.match_found.emit(batch)
@@ -141,6 +232,7 @@ class SearchWorker(QThread):
 
         if batch:
             self.match_found.emit(batch)
+        self.files_collected.emit(collected)
         self.done.emit(scanned, total)
 
 
@@ -233,6 +325,15 @@ class ContentSearchDialog(QDialog):
 
         self._worker: SearchWorker | None = None
         self._pending_restart = False
+        # 整项目候选文件清单缓存：首次搜索 walk 时填充，之后同会话内复用，
+        # 避免每次输入都重新遍历目录树 + stat（大仓库下这是卡顿主因）
+        self._file_cache: list[str] | None = None
+
+        # 输入即搜去抖：停顿 250ms 才真正触发，避免每个按键都起一个 worker
+        self._debounce = QTimer(self)
+        self._debounce.setSingleShot(True)
+        self._debounce.setInterval(250)
+        self._debounce.timeout.connect(self._start_search)
 
         root_lay = QVBoxLayout(self)
         root_lay.setContentsMargins(10, 10, 10, 10)
@@ -240,13 +341,15 @@ class ContentSearchDialog(QDialog):
         # 查询输入
         top = QHBoxLayout()
         self.input = QLineEdit()
-        self.input.setPlaceholderText("输入文本或正则...")
+        self.input.setPlaceholderText("输入文本或正则（停顿即搜）...")
         self.input.returnPressed.connect(self._start_search)
+        self.input.textChanged.connect(self._on_query_changed)
         top.addWidget(self.input, 1)
 
         self.ext_filter = QLineEdit()
         self.ext_filter.setPlaceholderText("文件扩展名，逗号分隔，如 .java,.yml（留空=所有文本文件）")
         self.ext_filter.setFixedWidth(360)
+        self.ext_filter.textChanged.connect(self._on_query_changed)
         top.addWidget(self.ext_filter)
 
         # 搜索框统一样式（theme.apply_search_style）：白字 + 等宽 + 加大 + 提亮 placeholder
@@ -260,9 +363,18 @@ class ContentSearchDialog(QDialog):
         self.chk_case = QCheckBox("大小写")
         self.chk_word = QCheckBox("整词")
         self.chk_regex = QCheckBox("正则")
+        # 默认隐藏日志/压缩产物/lock 等噪音文件，勾上才纳入搜索
+        self.chk_noise = QCheckBox("含日志等")
+        self.chk_noise.setToolTip("默认隐藏 .log / .min.js / source map / lock 等噪音文件；勾选后一并搜索")
+        # 勾选项变化也立即重搜（去抖统一走 _on_query_changed）
+        self.chk_case.toggled.connect(self._on_query_changed)
+        self.chk_word.toggled.connect(self._on_query_changed)
+        self.chk_regex.toggled.connect(self._on_query_changed)
+        self.chk_noise.toggled.connect(self._on_query_changed)
         opts.addWidget(self.chk_case)
         opts.addWidget(self.chk_word)
         opts.addWidget(self.chk_regex)
+        opts.addWidget(self.chk_noise)
         opts.addStretch(1)
 
         self.btn_search = QPushButton("搜索")
@@ -306,7 +418,21 @@ class ContentSearchDialog(QDialog):
 
     # ---- 搜索控制 ----
 
+    def _on_query_changed(self, _text: str = "") -> None:
+        """输入框 / 扩展名变化：重启去抖定时器，停顿后自动搜。
+
+        query 为空时不搜，并清空结果与"搜索中"状态。
+        """
+        if not self.input.text().strip():
+            self._debounce.stop()
+            self._stop_search()
+            self.tree.clear()
+            self.status.setText("就绪")
+            return
+        self._debounce.start()
+
     def _start_search(self) -> None:
+        self._debounce.stop()
         query = self.input.text().strip()
         if not query:
             return
@@ -339,14 +465,21 @@ class ContentSearchDialog(QDialog):
             case_sensitive=self.chk_case.isChecked(),
             whole_word=self.chk_word.isChecked(),
             use_regex=self.chk_regex.isChecked(),
-            include_exts=exts, parent=QApplication.instance(),
+            include_exts=exts, file_list=self._file_cache,
+            include_noise=self.chk_noise.isChecked(),
+            parent=QApplication.instance(),
         )
         self._worker.match_found.connect(self._on_matches)
         self._worker.progress.connect(self._on_progress)
         self._worker.done.connect(self._on_done)
         self._worker.stopped.connect(self._on_stopped)
+        self._worker.files_collected.connect(self._on_files_collected)
         self._worker.finished.connect(self._worker.deleteLater)
         self._worker.start()
+
+    def _on_files_collected(self, files: list) -> None:
+        # 仅首次 walk 的 worker 会发这个信号；缓存住供后续输入复用
+        self._file_cache = files
 
     def _stop_search(self, restart: bool = False) -> None:
         if self._worker and self._worker.isRunning():

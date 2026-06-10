@@ -6,7 +6,10 @@ from pathlib import Path
 
 import psutil
 from PySide6.QtCore import QTimer
-from PySide6.QtGui import QAction, QCloseEvent, QDragEnterEvent, QDropEvent, QIcon
+from PySide6.QtGui import (
+    QAction, QCloseEvent, QDragEnterEvent, QDropEvent, QIcon,
+    QKeySequence, QShortcut,
+)
 from PySide6.QtWidgets import (
     QApplication, QFileDialog, QLabel, QMainWindow, QMessageBox,
     QStackedWidget, QTabWidget,
@@ -55,6 +58,7 @@ class MainWindow(QMainWindow):
 
         self._build_menu()
         self._build_statusbar()
+        self._register_global_shortcuts()
 
         self._mem_timer = QTimer(self)
         self._mem_timer.setInterval(2000)
@@ -70,6 +74,37 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(100, self._startup_finalize)
 
     # ---- 菜单 ----
+
+    def _register_global_shortcuts(self) -> None:
+        """窗口级快捷键统一在这里注册一次，触发时路由到当前可见的项目 tab。
+
+        放在主窗口（而非每个 ProjectTab）注册的原因：
+        - WindowShortcut 作用域 → 焦点在工具栏/标签栏/任意子组件都能触发，
+          不用先点一下内容区（这正是之前"得先聚焦才生效"的根因）
+        - 若每个 tab 各自注册窗口级快捷键，多 tab 时同窗口内同一序列重复，
+          Qt 会判定歧义导致全部失效；集中注册一份就没有这个问题
+        """
+        # (序列, 调用当前 tab 的哪个方法名)
+        bindings = [
+            ("Ctrl+Shift+N", "open_file_picker"),
+            ("Ctrl+Shift+F", "open_content_search"),
+            ("Ctrl+E", "open_recent_files"),
+            ("Ctrl+Shift+P", "open_command_palette"),
+            ("Ctrl+\\", "open_endpoint_picker"),
+            ("Ctrl+Shift+R", "restart_project"),
+            ("Ctrl+W", "close_current_file_tab"),
+        ]
+        for seq, method in bindings:
+            sc = QShortcut(QKeySequence(seq), self)
+            sc.activated.connect(lambda m=method: self._dispatch_to_current_tab(m))
+
+    def _dispatch_to_current_tab(self, method_name: str) -> None:
+        """把快捷键动作转发给当前可见的项目 tab。没有打开项目时静默忽略。"""
+        tab = self.tabs.currentWidget()
+        if isinstance(tab, ProjectTab):
+            fn = getattr(tab, method_name, None)
+            if callable(fn):
+                fn()
 
     def _build_menu(self) -> None:
         mb = self.menuBar()

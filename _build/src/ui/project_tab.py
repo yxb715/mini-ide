@@ -179,6 +179,9 @@ class ProjectTab(QWidget):
 
         self.indexer = FileIndexer(self.project_meta.path, self)
         self.indexer.start_async_scan()
+        # 接口跳转索引：懒加载，首次按 Ctrl+/ 才扫（见 open_endpoint_picker）
+        self._controller_indexer = None
+        self._endpoint_dialog = None
 
         self._build_ui()
         self._register_shortcuts()
@@ -1582,36 +1585,32 @@ class ProjectTab(QWidget):
     # ---- 快捷键与导航 ----
 
     def _register_shortcuts(self) -> None:
-        from PySide6.QtGui import QKeySequence, QShortcut
-        sc_file = QShortcut(QKeySequence("Ctrl+Shift+N"), self)
-        sc_file.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
-        sc_file.activated.connect(self.open_file_picker)
+        # 快捷键已上移到 MainWindow 统一注册（窗口级，焦点在哪都生效，
+        # 多 tab 不冲突），由 MainWindow 路由到当前可见 tab 的下列 public 方法：
+        #   Ctrl+Shift+N → open_file_picker      Ctrl+Shift+F → open_content_search
+        #   Ctrl+E       → open_recent_files      Ctrl+Shift+P → open_command_palette
+        #   Ctrl+\\       → open_endpoint_picker   Ctrl+Shift+R → restart_project
+        #   Ctrl+W       → close_current_file_tab
+        # 这里留空，仅保留方法以兼容 __init__ 调用。
+        pass
 
-        sc_find = QShortcut(QKeySequence("Ctrl+Shift+F"), self)
-        sc_find.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
-        sc_find.activated.connect(self.open_content_search)
+    # 供 MainWindow 窗口级快捷键路由调用的 public 别名
+    def restart_project(self) -> None:
+        self._restart()
 
-        sc_recent = QShortcut(QKeySequence("Ctrl+E"), self)
-        sc_recent.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
-        sc_recent.activated.connect(self.open_recent_files)
+    def close_current_file_tab(self) -> None:
+        self._close_current_file_tab()
 
-        sc_cmd = QShortcut(QKeySequence("Ctrl+Shift+P"), self)
-        sc_cmd.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
-        sc_cmd.activated.connect(self.open_command_palette)
-
-        sc_restart = QShortcut(QKeySequence("Ctrl+Shift+R"), self)
-        sc_restart.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
-        sc_restart.activated.connect(self._restart)
-
-        sc_close_tab = QShortcut(QKeySequence("Ctrl+W"), self)
-        sc_close_tab.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
-        sc_close_tab.activated.connect(self._close_current_file_tab)
 
     def open_file_picker(self) -> None:
-        """Ctrl+Shift+N：聚焦左侧文件树的过滤框"""
-        if not self.file_tree.isVisible():
-            self.file_tree.setVisible(True)
-        self.file_tree.focus_filter()
+        """Ctrl+Shift+N：弹独立浮窗按文件名搜（IDEA 风格），回车在中心区打开"""
+        from src.ui.quick_open import show_file_picker
+        dlg = show_file_picker(
+            self.indexer,
+            on_pick=lambda p: self._show_preview(p, 0, 0),
+            parent=self,
+        )
+        dlg.show()
 
     def open_content_search(self) -> None:
         dlg = ContentSearchDialog(self.project_meta.path, parent=self)
@@ -1673,6 +1672,7 @@ class ProjectTab(QWidget):
 
         commands.append(("🔍  搜索文件名", "Ctrl+Shift+N", self.open_file_picker))
         commands.append(("🔎  搜索文件内容", "Ctrl+Shift+F", self.open_content_search))
+        commands.append(("🎯  接口地址跳转", "Ctrl+\\  定位 Controller 方法", self.open_endpoint_picker))
         commands.append(("⏱  最近打开的文件", "Ctrl+E", self.open_recent_files))
         commands.append(("📁  打开项目目录", "用资源管理器", lambda: open_folder(self.project_meta.path)))
         commands.append(("🧹  清空日志", "", self.log.clear))
@@ -1682,6 +1682,53 @@ class ProjectTab(QWidget):
         commands.append(("ℹ️  项目信息", "路径 / 类型 / 包管理 / 主类（只读）", self.open_project_info))
 
         dlg = show_command_palette(commands, parent=self)
+        dlg.show()
+
+    def open_endpoint_picker(self) -> None:
+        """Ctrl+\\：按接口地址（如 /tenant/timer/common/getCategoryList）定位 Controller 方法。
+
+        懒加载：首次调用才后台扫描全项目 Controller，扫完自动刷新候选列表。
+        项目里没有 .java 时直接提示，不弹空浮窗。
+        """
+        from src.ui.quick_open import PickerDialog, PickerItem
+        from src.core.controller_index import ControllerIndexer
+
+        if self._controller_indexer is None:
+            # 先粗检项目里有没有 java（用文件索引，零额外 IO）
+            has_java = any(f.name.endswith(".java") for f in self.indexer.files())
+            if not has_java and self.indexer.count() > 0:
+                QMessageBox.information(self, "接口跳转", "当前项目里没有找到 Java 文件。")
+                return
+            self._controller_indexer = ControllerIndexer(self.project_meta.path, self)
+            self._controller_indexer.build_async()
+
+        ci = self._controller_indexer
+        dlg = PickerDialog("按接口地址定位   (Ctrl+\\)", self)
+
+        def fetch(query: str) -> list[PickerItem]:
+            if not ci.is_built():
+                return []
+            return [
+                PickerItem(title=ep.display, subtitle=ep.subtitle,
+                           data=(ep.abs_path, ep.line_no))
+                for ep in ci.search(query, limit=150)
+            ]
+
+        dlg.set_fetcher(fetch)
+        dlg.picked.connect(lambda d: self._show_preview(d[0], d[1], 0))
+
+        if ci.is_built():
+            dlg.input.setPlaceholderText(f"已索引 {ci.count()} 个接口...")
+        else:
+            dlg.input.setPlaceholderText("正在扫描 Controller，请稍候...")
+            # 扫完后刷新当前浮窗（若还开着）
+            def on_ready(n: int):
+                if dlg.isVisible():
+                    dlg.input.setPlaceholderText(f"已索引 {n} 个接口...")
+                    dlg._refresh(dlg.input.text())
+            ci.ready.connect(on_ready)
+
+        self._endpoint_dialog = dlg
         dlg.show()
 
     def open_git_viewer(self) -> None:
