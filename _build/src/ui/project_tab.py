@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtGui import QCursor
 from PySide6.QtWidgets import (
     QApplication, QFrame, QHBoxLayout, QLabel, QMenu, QMessageBox, QPushButton,
     QSplitter, QTabBar, QTabWidget, QToolButton, QVBoxLayout, QWidget,
@@ -1387,14 +1388,39 @@ class ProjectTab(QWidget):
                     act.setEnabled(False)
                 else:
                     act.triggered.connect(lambda _=False, br=b: self._do_checkout(br))
+        menu.addSeparator()
+        menu.addAction("🔄 刷新远程分支", self._manual_fetch_remote)
         if remote:
-            menu.addSeparator()
             head = menu.addAction("远程分支（右键复制）")
             head.setEnabled(False)
             for b in remote:
                 act = menu.addAction("    " + b)
                 act.setData(b)
                 act.triggered.connect(lambda _=False, br=b: QApplication.clipboard().setText(br))
+
+    def _manual_fetch_remote(self) -> None:
+        """用户手动刷新远程分支：fetch 完成后重新弹出菜单。"""
+        from src.core.git_ops import is_git_repo
+        if not is_git_repo(self.project_meta.path):
+            return
+        if self._git_fetch_worker and self._git_fetch_worker.isRunning():
+            return
+        notify.notify_info("刷新远程分支", "正在从远程仓库获取最新分支…")
+        self._git_fetch_worker = GitFetchWorker(self.project_meta.path, parent=self)
+        self._git_fetch_worker.done.connect(self._on_manual_fetch_done)
+        self._git_fetch_worker.finished.connect(self._git_fetch_worker.deleteLater)
+        self._git_fetch_worker.start()
+
+    def _on_manual_fetch_done(self, ok: bool) -> None:
+        if self.sender() is self._git_fetch_worker:
+            self._git_fetch_worker = None
+        if ok:
+            git_info.invalidate(self.project_meta.path)
+            self._refresh_status_row()
+            notify.notify_success("刷新远程分支", "远程分支已更新")
+            self._branch_menu.popup(QCursor.pos())
+        else:
+            notify.notify_error("刷新远程分支", "获取远程分支失败，请检查网络")
 
     def _start_remote_fetch(self) -> None:
         """后台静默 git fetch，刷新 ahead/behind 状态，发现远程领先时高亮分支按钮。"""

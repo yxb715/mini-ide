@@ -245,14 +245,9 @@ def list_branches(cwd: str, include_remote: bool = True) -> dict:
     if include_remote:
         rc2, out2, _ = _run(["branch", "-r", "--format=%(refname:short)"], cwd, timeout=5)
         if rc2 == 0:
-            local_set = set(local)
             for ln in out2.splitlines():
                 name = ln.strip()
                 if not name or "->" in name:
-                    continue
-                # 远程分支若已有同名本地分支就不重复列
-                short = name.split("/", 1)[1] if "/" in name else name
-                if short in local_set:
                     continue
                 remote.append(name)
     return {"current": cur, "local": local, "remote": remote}
