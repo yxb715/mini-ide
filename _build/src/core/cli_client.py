@@ -12,27 +12,109 @@ from PySide6.QtCore import QCoreApplication
 from PySide6.QtNetwork import QLocalSocket
 
 
+_STD_OUTPUT_HANDLE = -11
+_STD_ERROR_HANDLE = -12
+_FILE_TYPE_UNKNOWN = 0
+_FILE_TYPE_CHAR = 0x0002
+
+
+def _win_std_handle(kind: int):
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.windll.kernel32
+        kernel32.GetStdHandle.argtypes = [wintypes.DWORD]
+        kernel32.GetStdHandle.restype = wintypes.HANDLE
+        handle = kernel32.GetStdHandle(kind)
+        invalid = ctypes.c_void_p(-1).value
+        if handle in (None, 0, invalid):
+            return None
+        return handle
+    except Exception:
+        return None
+
+
+def _win_std_handle_usable(kind: int) -> bool:
+    handle = _win_std_handle(kind)
+    if handle is None:
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.windll.kernel32
+        kernel32.GetFileType.argtypes = [wintypes.HANDLE]
+        kernel32.GetFileType.restype = wintypes.DWORD
+        return kernel32.GetFileType(handle) != _FILE_TYPE_UNKNOWN
+    except Exception:
+        return False
+
+
+def _win_write_std(kind: int, text: str) -> bool:
+    """GUI 子系统 exe 没有 Python stdout 时，直接写 Windows 标准句柄。"""
+    handle = _win_std_handle(kind)
+    if handle is None:
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.windll.kernel32
+        kernel32.GetFileType.argtypes = [wintypes.HANDLE]
+        kernel32.GetFileType.restype = wintypes.DWORD
+        file_type = kernel32.GetFileType(handle)
+
+        written = wintypes.DWORD()
+        if file_type == _FILE_TYPE_CHAR:
+            kernel32.WriteConsoleW.argtypes = [
+                wintypes.HANDLE, wintypes.LPCWSTR, wintypes.DWORD,
+                ctypes.POINTER(wintypes.DWORD), wintypes.LPVOID,
+            ]
+            kernel32.WriteConsoleW.restype = wintypes.BOOL
+            if kernel32.WriteConsoleW(handle, text, len(text), ctypes.byref(written), None):
+                return True
+
+        data = text.encode("utf-8", errors="replace")
+        buf = ctypes.create_string_buffer(data)
+        kernel32.WriteFile.argtypes = [
+            wintypes.HANDLE, wintypes.LPCVOID, wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD), wintypes.LPVOID,
+        ]
+        kernel32.WriteFile.restype = wintypes.BOOL
+        return bool(kernel32.WriteFile(handle, buf, len(data), ctypes.byref(written), None))
+    except Exception:
+        return False
+
+
 def _safe_write(stream, text: str) -> None:
     """安全写入——GUI exe 无控制台时 stream 可能无效。"""
     try:
         if stream and hasattr(stream, "write"):
             stream.write(text)
             stream.flush()
+            return
     except OSError:
         pass
+    kind = _STD_ERROR_HANDLE if stream is sys.stderr else _STD_OUTPUT_HANDLE
+    _win_write_std(kind, text)
 
 
 def _attach_console():
-    """GUI exe（runw 引导器）没有控制台，CLI 模式需要附加到父进程的控制台。"""
+    """GUI exe 没有标准句柄时，CLI 模式附加到父控制台作为兜底。"""
     if sys.platform != "win32":
+        return
+    # 如果 stdout/stderr 已经是管道或控制台，不要 AttachConsole 后改写到 CONOUT$；
+    # 否则 PowerShell / AI 工具捕获不到 stdout。
+    if _win_std_handle_usable(_STD_OUTPUT_HANDLE) or _win_std_handle_usable(_STD_ERROR_HANDLE):
         return
     try:
         import ctypes
         kernel32 = ctypes.windll.kernel32
         # ATTACH_PARENT_PROCESS = -1
-        if kernel32.AttachConsole(-1):
-            sys.stdout = open("CONOUT$", "w", encoding="utf-8")
-            sys.stderr = open("CONOUT$", "w", encoding="utf-8")
+        kernel32.AttachConsole(-1)
     except Exception:
         pass
 

@@ -101,7 +101,11 @@ def _scan_spring_profiles(root: Path) -> tuple[list[str], int | None, str]:
     port: int | None = None
     ctx = ""
     candidates: list[Path] = []
-    for sub in ("src/main/resources", "src/main/webapp/WEB-INF", "config"):
+    # resources-local / resources-product：部分项目用非标准 profile 目录区分本地/生产
+    # 配置（如 timing-service），不补进来会扫不到 port，服务面板只能靠运行时反查。
+    # local 优先于 product——本地开发跑的是 local 那份。
+    for sub in ("src/main/resources", "src/main/resources-local",
+                "src/main/resources-product", "src/main/webapp/WEB-INF", "config"):
         base = root / sub
         if base.is_dir():
             candidates.extend(base.glob("application*.yml"))

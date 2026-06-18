@@ -49,18 +49,30 @@ class ExternalProcessDetector:
                  modules: Iterable[tuple[str, str, object, str]]):
         # 项目根路径（归一化）——用于排除与本项目无关的同名进程
         self._proj = (project_path or "").replace("\\", "/").lower().rstrip("/")
-        # 预算：module -> (keys, 归一化主类名)
-        self._module_keys: list[tuple[str, list[str], str]] = []
-        for mod_name, mod_path, _port, main_class in modules:
+        # 预算：module -> (keys, 归一化主类名, 预期端口)
+        # 预期端口来自静态扫描的 application.yml，用于在进程占多个端口时挑出
+        # 真正的 HTTP 主端口（见 detect 的端口校正）。
+        self._module_keys: list[tuple[str, list[str], str, int | None]] = []
+        for mod_name, mod_path, port, main_class in modules:
             keys = build_match_keys(mod_name, mod_path, main_class)
             norm_cls = main_class.replace("\\", "/").lower() if main_class else ""
-            self._module_keys.append((mod_name, keys, norm_cls))
+            exp_port = port if isinstance(port, int) else None
+            self._module_keys.append((mod_name, keys, norm_cls, exp_port))
 
     def detect(self, snapshot: dict[int, list[dict]]) -> dict[str, tuple[int, int]]:
         """从端口快照匹配各模块，返回 {module: (pid, port)}。
 
         snapshot 形如 {port: [{"pid", "name", "cmdline"}, ...]}（process_runner
         的 port_snapshot 输出）。只读，不阻塞。
+
+        端口校正：一个 Spring Boot 进程常同时监听多个端口（HTTP 主端口 +
+        actuator/management + JMX/RMI 等）。认出进程后不能随便挑一个端口当服务
+        端口，否则会把旁路端口（如 8721）误当成主端口显示。规则：
+          1. 预期端口（静态扫 application.yml）在该进程监听列表里 → 用预期端口
+          2. 进程只监听一个端口 → 用那个唯一端口
+          3. 进程监听多个端口、又没有可对上的预期端口 → 端口填 0（不显示具体
+             端口，只显示「外部运行」状态），宁可不显示也不误导
+        port=0 由上层（ProjectTab / ServicePanel）识别为「端口未知」，不显示数字。
         """
         if not snapshot:
             return {}
@@ -79,9 +91,15 @@ class ExternalProcessDetector:
 
         result: dict[str, tuple[int, int]] = {}
         used_pids: set[int] = set()
-        for mod_name, keys, norm_cls in self._module_keys:
+        for mod_name, keys, norm_cls, exp_port in self._module_keys:
+            # 锁定一个 pid，并收集它监听的所有端口（同一进程 cmdline 相同，
+            # 一旦认出就把它在快照里出现的每个端口都收进来）
+            matched_pid: int | None = None
+            ports: list[int] = []
             for pid, port, cmd in normalized:
                 if pid in used_pids:
+                    continue
+                if matched_pid is not None and pid != matched_pid:
                     continue
                 # 闸门：必须确认是「本项目」的进程，否则别的项目同名模块、
                 # 甚至 Chrome (...\Application\chrome.exe) 会误撞模块名。
@@ -94,7 +112,17 @@ class ExternalProcessDetector:
                 if not (in_project or in_main_class):
                     continue
                 if any(k in cmd for k in keys):
-                    result[mod_name] = (pid, port)
-                    used_pids.add(pid)
-                    break
+                    matched_pid = pid
+                    ports.append(port)
+            if matched_pid is None:
+                continue
+            uniq = set(ports)
+            if exp_port is not None and exp_port in uniq:
+                chosen_port = exp_port
+            elif len(uniq) == 1:
+                chosen_port = ports[0]
+            else:
+                chosen_port = 0
+            result[mod_name] = (matched_pid, chosen_port)
+            used_pids.add(matched_pid)
         return result
