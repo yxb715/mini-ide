@@ -150,6 +150,12 @@ def _stop_tab_all(tab) -> int:
     tab: ProjectTab
     count = 0
 
+    # 项目级任务（compile/clean 等）不属于多模块服务，但也由 ProjectTab 的主
+    # runner 管理；CLI quit 必须能清掉它，否则 compile 超时后会继续占着 GUI。
+    if tab.runner.is_running():
+        tab._stop()
+        count += 1
+
     if tab._is_multi_module:
         # 先刷新外部感知，让 _stop_all_modules 能把孤儿进程也算进去
         try:
@@ -162,9 +168,7 @@ def _stop_tab_all(tab) -> int:
             tab._stop_all_modules(silent=True)
             count += running
     else:
-        if tab.runner.is_running():
-            tab._stop()
-            count += 1
+        pass
 
     # 文件树「▶ 运行脚本」起的进程（nginx/.bat 等），两类项目都可能有
     for r in list(getattr(tab, "_script_runners", {}).values()):
@@ -306,6 +310,10 @@ def _cmd_stop(tab, module: str | None) -> dict:
     tab: ProjectTab
 
     if tab._is_multi_module:
+        try:
+            tab._detect_and_apply_external()
+        except Exception:
+            log.exception("刷新外部进程感知失败")
         if module:
             mod_names = [m[0] for m in tab.project_meta.spring_boot_modules]
             if module not in mod_names:
@@ -315,10 +323,28 @@ def _cmd_stop(tab, module: str | None) -> dict:
             external = module in tab._module_external_pids
             if not running and not external:
                 return {"ok": False, "error": "not running"}
-            tab._stop_module(module, silent=True)
+            if running:
+                runner.stop()
+                _wait_runner_stop(runner, 10000)
+            if module in tab._module_external_pids:
+                tab._takeover_external(module)
+            tab._refresh_status_row()
             return {"ok": True}
         else:
+            if tab.runner.is_running():
+                tab._stop()
+                _wait_runner_stop(tab.runner, 10000)
             tab._stop_all_modules(silent=True)
+            for r in list(tab.module_runners.values()):
+                if r.is_running():
+                    _wait_runner_stop(r, 10000)
+            try:
+                tab._detect_and_apply_external()
+                for mod_name in list(tab._module_external_pids):
+                    tab._takeover_external(mod_name)
+            except Exception:
+                log.exception("清理外部进程失败")
+            tab._refresh_status_row()
             return {"ok": True}
     else:
         if not tab.runner.is_running():

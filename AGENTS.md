@@ -8,7 +8,7 @@ Python 3.11+ / PySide6 6.7+ / Pygments / psutil / watchdog / sqlparse。打包�
 
 ## 目录结构
 
-所有源码在 `_build/` 下，根目录只放 `mini-ide.exe` + 文档。
+所有源码在 `_build/` 下，根目录只放 `mini-ide.exe`、`mini-ide-runtime/` + 文档。
 
 ```
 _build/
@@ -26,7 +26,7 @@ _build/
 ├── src/ui/                 # Qt UI 组件
 ├── src/util/               # 工具层
 └── scripts/
-    ├── build.bat           # 一键打包 exe
+    ├── build.bat           # 一键打包并发布 exe + runtime
     └── _smoke.py           # 冒烟测试
 ```
 
@@ -36,7 +36,7 @@ _build/
 |---|---|
 | 日常使用 | 双击根目录 `mini-ide.exe` |
 | 开发态 | `cd _build && poetry run python main.py` |
-| 打包 exe | `_build\scripts\build.bat`（需先关闭 mini-ide） |
+| 打包发布 | `_build\scripts\build.bat`（需先关闭 mini-ide，产物为根目录 `mini-ide.exe` + `mini-ide-runtime\`） |
 | 冒烟测试 | `cd _build && poetry run python scripts/_smoke.py` |
 
 ## CLI 接口（外部 AI 工具可调用）
@@ -62,8 +62,8 @@ mini-ide.exe --log <project> [module] [--tail N]
 
 ## 工作流规则
 
-- **修改代码后必须重新打包**：跑 `_build\scripts\build.bat` 更新 `mini-ide.exe`（需先关闭正在运行的 mini-ide）
-- **冒烟测试**：改完代码先跑 `_smoke.py` 确认 28 模块 import + 0 hex hits
+- **修改代码后必须重新打包**：跑 `_build\scripts\build.bat` 更新根目录 `mini-ide.exe` + `mini-ide-runtime\`（需先关闭正在运行的 mini-ide）
+- **冒烟测试**：改完代码先跑 `_smoke.py` 确认 30 模块 import + 0 hex hits
 - **禁止 hardcode 颜色**：所有颜色/圆角/间距从 `theme.py` token 拿
 - **子进程必须加 `CREATE_NO_WINDOW`**
 - **耗时操作必须放 QThread**

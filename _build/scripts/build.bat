@@ -2,7 +2,8 @@
 setlocal
 
 rem mini-ide one-click build script (self-contained: auto venv + deps + exe)
-rem Requires Python 3.11+ on PATH. Output: mini-ide.exe in project root.
+rem Requires Python 3.11+ on PATH.
+rem Output: mini-ide.exe + mini-ide-runtime\ in project root.
 
 cd /d "%~dp0\.."
 set "BUILD_DIR=%CD%"
@@ -45,30 +46,47 @@ echo [build] Cleaning old artifacts ...
 if exist pyinstaller-work rmdir /s /q pyinstaller-work
 if exist dist rmdir /s /q dist
 if exist mini-ide.spec del /q mini-ide.spec
-if exist ..\mini-ide.exe del /q ..\mini-ide.exe
 
 rem ---------- 6. Build ----------
 echo [build] Running PyInstaller ...
+rem Keep PyInstaller's DLL discovery away from project JDK/Node/etc. PATH entries.
+rem Otherwise unrelated runtime DLLs can be frozen into mini-ide.exe.
+set "ORIG_PATH=%PATH%"
+set "PATH=%SystemRoot%\System32;%SystemRoot%;%SystemRoot%\System32\Wbem;%SystemRoot%\System32\WindowsPowerShell\v1.0\;%VENV_DIR%\Scripts"
 "%VENV_PY%" -m PyInstaller ^
     --noconfirm ^
     --clean ^
-    --onefile ^
+    --onedir ^
     --name mini-ide ^
     --windowed ^
+    --contents-directory mini-ide-runtime ^
     --icon src\resources\icon.ico ^
     --add-data "src;src" ^
     --hidden-import psutil ^
     --hidden-import watchdog ^
     --hidden-import sqlparse ^
     --hidden-import pygments ^
-    --distpath .. ^
+    --distpath dist ^
     --workpath pyinstaller-work ^
     --specpath . ^
     main.py
-if errorlevel 1 goto :fail_build
+set "BUILD_RC=%ERRORLEVEL%"
+set "PATH=%ORIG_PATH%"
+if not "%BUILD_RC%"=="0" goto :fail_build
+
+if not exist "dist\mini-ide\mini-ide.exe" goto :fail_build
+findstr /i /c:"\\jdk" "pyinstaller-work\mini-ide\Analysis-00.toc" >nul 2>nul
+if not errorlevel 1 goto :fail_bad_dll_source
+
+echo [build] Publishing mini-ide.exe ...
+copy /y "dist\mini-ide\mini-ide.exe" "..\mini-ide.exe" >nul
+if errorlevel 1 goto :fail_publish
+if exist "..\mini-ide-runtime" rmdir /s /q "..\mini-ide-runtime"
+xcopy /e /i /y "dist\mini-ide\mini-ide-runtime" "..\mini-ide-runtime" >nul
+if errorlevel 1 goto :fail_publish
 
 echo.
-echo [build] Done. Output: mini-ide.exe (project root)
+echo [build] Done. Output: mini-ide.exe + mini-ide-runtime\ (project root)
 endlocal
 exit /b 0
 
@@ -83,6 +101,12 @@ echo [build] dep install failed
 exit /b 1
 :fail_icon
 echo [build] icon generation failed
+exit /b 1
+:fail_bad_dll_source
+echo [build] PyInstaller collected DLLs from a JDK path. Check PATH isolation.
+exit /b 1
+:fail_publish
+echo [build] failed to publish mini-ide.exe. Close running mini-ide first.
 exit /b 1
 :fail_build
 echo [build] PyInstaller failed

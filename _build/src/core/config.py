@@ -22,12 +22,8 @@ def _config_dir() -> Path:
 def _default_project_dir_guess() -> str:
     """猜测默认项目目录（每台机器自适应，猜不到返回空串）。
 
-    公司机器固定用 G:\\whaty\\project；否则在家目录下找常见的项目根目录名。
-    都没有就返回空，由对话框 fallback。
+    在当前用户家目录下找常见的项目根目录名；都没有就返回空，由对话框 fallback。
     """
-    legacy = Path(r"G:\whaty\project")
-    if legacy.is_dir():
-        return str(legacy)
     home = Path.home()
     for name in ("Developer", "Projects", "projects", "project", "workspace", "dev", "code"):
         cand = home / name
