@@ -35,6 +35,10 @@ from PySide6.QtWidgets import (
     QPushButton, QScrollArea, QTextEdit, QToolButton, QVBoxLayout, QWidget,
 )
 
+from src.core.file_preview_model import (
+    BINARY_EXTS, detect_encoding, detect_newline, image_suffix_format, is_movie_path,
+    line_comment_prefix, should_wrap_text,
+)
 from src.ui.syntax_highlighter import PygmentsHighlighter, get_lexer_for
 from src.ui.theme import (
     BG_CODE, BG_L2, BG_L4, BORDER_SUBTLE, COLOR_ERROR, COLOR_SUCCESS, COLOR_WARN,
@@ -49,119 +53,11 @@ _MAX_READ_BYTES = 2 * 1024 * 1024   # 2MB 以上只读头部
 _AUTOSAVE_DELAY_MS = 3000
 _EXTRELOAD_DEBOUNCE_MS = 200   # 外部修改 debounce：避免 VSCode "删除-重命名" 写盘瞬间读到空文件
 _FONT_PT = FONT_PT_CODE   # 编辑器/日志统一字号（走 theme token，改一处全生效）
-_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".jfif", ".gif", ".bmp", ".ico", ".webp",
-               ".svg", ".svgz", ".tif", ".tiff", ".tga", ".cur", ".xbm", ".xpm",
-               ".pbm", ".pgm", ".ppm"}
-_MOVIE_EXTS = {".gif", ".webp"}
-_BINARY_EXTS = {".class", ".jar", ".war", ".zip", ".7z", ".tar", ".gz",
-                ".pdf", ".doc", ".docx", ".xls", ".xlsx",
-                ".so", ".dll", ".exe", ".dylib", ".bin"}
-# 文本类文件按窗口宽度软换行（行号不变，视觉折行跟随 viewport）；
-# 代码文件保持 NoWrap——缩进 / SQL / 长字符串折行后可读性反而更差
-_WRAP_EXTS = {".md", ".markdown", ".txt"}
-
-# Ctrl+/ 行注释字符表。块注释（HTML/XML/CSS 的 <!-- --> /* */）暂不支持
-# —— 用户后续提了再加，避免这里堆复杂度。
-_LINE_COMMENT_BY_EXT: dict[str, str] = {
-    # # 系（脚本 / 配置文件 / nginx.conf 等）
-    ".py": "#", ".pyw": "#", ".pyi": "#",
-    ".sh": "#", ".bash": "#", ".zsh": "#", ".fish": "#",
-    ".yml": "#", ".yaml": "#",
-    ".toml": "#",
-    ".conf": "#", ".cfg": "#", ".ini": "#",
-    ".env": "#",
-    ".properties": "#",
-    ".rb": "#",
-    ".pl": "#", ".pm": "#",
-    ".r": "#",
-    ".tcl": "#",
-    ".coffee": "#",
-    ".feature": "#",
-    # // 系（C 家族 / Java / 前端）
-    ".java": "//", ".kt": "//", ".kts": "//",
-    ".scala": "//", ".groovy": "//", ".gradle": "//",
-    ".js": "//", ".jsx": "//", ".ts": "//", ".tsx": "//", ".mjs": "//", ".cjs": "//",
-    ".vue": "//", ".svelte": "//",
-    ".c": "//", ".cpp": "//", ".cc": "//", ".cxx": "//",
-    ".h": "//", ".hpp": "//", ".hxx": "//",
-    ".cs": "//", ".go": "//", ".rs": "//", ".swift": "//",
-    ".dart": "//", ".php": "//", ".m": "//", ".mm": "//",
-    ".scss": "//", ".less": "//", ".jsonc": "//",
-    # -- 系
-    ".sql": "--", ".lua": "--", ".hs": "--",
-    # ; 系
-    ".lisp": ";", ".cl": ";", ".el": ";", ".clj": ";", ".cljs": ";",
-}
-# 无后缀但按文件名识别的（Dockerfile / Makefile / .gitignore 等）
-_LINE_COMMENT_BY_NAME: dict[str, str] = {
-    "dockerfile": "#",
-    "makefile": "#",
-    ".gitignore": "#",
-    ".dockerignore": "#",
-    ".env": "#",
-}
-
-
-def _detect_encoding(raw: bytes) -> tuple[str, str]:
-    """轻量编码探测（纯标准库，不引第三方依赖）。
-
-    返回 (text, encoding)。按可靠性从高到低尝试：
-      1. BOM：UTF-8/UTF-16 的字节序标记是确定性信号
-      2. 严格 UTF-8：能无错解码就是 UTF-8（多字节序列校验性极强，几乎不会误判）
-      3. GBK：中文 Windows 环境最常见的非 UTF-8 编码，覆盖 GB2312
-      4. 兜底：latin-1 永不抛错，保证任何字节都能往返（round-trip）不丢失
-    探测出 GBK/latin-1 时，保存会按原编码回写，避免把非 UTF-8 文件以 UTF-8
-    覆盖导致内容不可逆损坏。
-    """
-    for bom, enc in ((b"\xef\xbb\xbf", "utf-8-sig"),
-                     (b"\xff\xfe", "utf-16-le"), (b"\xfe\xff", "utf-16-be")):
-        if raw.startswith(bom):
-            try:
-                return raw.decode(enc), enc
-            except UnicodeDecodeError:
-                break
-    for enc in ("utf-8", "gbk"):
-        try:
-            return raw.decode(enc), enc
-        except UnicodeDecodeError as e:
-            # 截断读取（>2MB 只读头部）可能在多字节字符中间切断，导致末尾
-            # 几个字节不完整。若错误恰好发生在缓冲区尾部，截掉残字节按该编码
-            # 重试——避免把一个完整的 UTF-8 大文件误判成 GBK/latin-1。
-            if e.start >= len(raw) - 4:
-                try:
-                    return raw[:e.start].decode(enc), enc
-                except UnicodeDecodeError:
-                    pass
-            continue
-    # latin-1 单字节映射，任何字节都能解码且可原样写回
-    return raw.decode("latin-1"), "latin-1"
-
-
-def _detect_newline(text: str) -> str:
-    """嗅探文本主导行尾。返回供 open(newline=) 使用的值：
-    "\\r\\n"（Windows）/ "\\r"（老 Mac）/ ""（Unix LF，写入时不转换）。
-    """
-    first_lf = text.find("\n")
-    if first_lf == -1:
-        return "\r" if "\r" in text else ""
-    if first_lf > 0 and text[first_lf - 1] == "\r":
-        return "\r\n"
-    return ""
-
-
-def _line_comment_prefix(path: str) -> str | None:
-    """根据文件路径返回行注释前缀（如 '#' / '//' / '--'）。不支持的返回 None"""
-    p = Path(path)
-    name = p.name.lower()
-    if name in _LINE_COMMENT_BY_NAME:
-        return _LINE_COMMENT_BY_NAME[name]
-    return _LINE_COMMENT_BY_EXT.get(p.suffix.lower())
-
 
 def _image_format_for(path: Path) -> str:
-    suffix = path.suffix.lower()
-    if suffix in _IMAGE_EXTS:
-        return suffix.lstrip(".")
+    suffix_format = image_suffix_format(path)
+    if suffix_format:
+        return suffix_format
     try:
         fmt = QImageReader.imageFormat(str(path))
     except RuntimeError:
@@ -569,7 +465,7 @@ class FilePreviewPane(QWidget):
         if image_format:
             self._load_image(p, image_format)
             return
-        if p.suffix.lower() in _BINARY_EXTS:
+        if p.suffix.lower() in BINARY_EXTS:
             self._binary = True
             self._set_readonly_reason(
                 f"二进制，不可编辑（{_human_size(p.stat().st_size)})",
@@ -582,9 +478,9 @@ class FilePreviewPane(QWidget):
             with p.open("rb") as f:
                 raw = f.read(_MAX_READ_BYTES)
             self._truncated = size > _MAX_READ_BYTES
-            text, self._encoding = _detect_encoding(raw)
+            text, self._encoding = detect_encoding(raw)
             # 记录原始行尾，保存时按原样回写；编辑器内部统一用 \n
-            self._newline = _detect_newline(text)
+            self._newline = detect_newline(text)
             text = text.replace("\r\n", "\n").replace("\r", "\n")
             self.view.setPlainText(text)
             self.view.document().setModified(False)
@@ -607,10 +503,10 @@ class FilePreviewPane(QWidget):
 
         # Ctrl+/ 行注释支持：根据文件名/扩展名挑注释字符（独立于语法高亮）
         # 不支持的文件类型（HTML/XML/CSS 等）prefix=None，view 内部不会触发 toggle
-        self.view.comment_prefix = _line_comment_prefix(self.path)
+        self.view.comment_prefix = line_comment_prefix(self.path)
 
         # Markdown / 纯文本按窗口宽度软换行；其他文件保持横向滚动
-        if p.suffix.lower() in _WRAP_EXTS:
+        if should_wrap_text(p):
             self.view.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
 
         # 注册外部修改监听（只监听存在、可编辑的常规文本文件）
@@ -630,7 +526,7 @@ class FilePreviewPane(QWidget):
 
         self.lbl_path.setText(f"{self._display_path()}  ({_human_size(size)})")
 
-        if p.suffix.lower() in _MOVIE_EXTS:
+        if is_movie_path(p):
             try:
                 movie = self._make_movie_from_memory(p, image_format)
             except OSError as e:

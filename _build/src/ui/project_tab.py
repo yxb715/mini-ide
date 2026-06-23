@@ -23,10 +23,19 @@ from src.core.git_worker import (
 )
 from src.core.process_runner import ProcessRunner, RunContext
 from src.core.project_detector import ProjectMeta, RunProfile
+from src.core.service_state import (
+    KIND_MODULE, KIND_PROJECT, KIND_SCRIPT, SOURCE_EXTERNAL_DETECTOR,
+    SOURCE_MANAGED_RUNNER, SOURCE_NONE, SOURCE_SCRIPT_RUNNER,
+    STATE_RUNNING_EXTERNAL as SERVICE_RUNNING_EXTERNAL,
+    STATE_RUNNING_MANAGED as SERVICE_RUNNING_MANAGED, STATE_STARTING as SERVICE_STARTING,
+    STATE_STOPPED as SERVICE_STOPPED, STATE_STOPPING as SERVICE_STOPPING,
+    ServiceState, running_items,
+)
 from src.ui.content_search import ContentSearchDialog
 from src.ui.file_tree import FileTree
 from src.ui.git_viewer import GitViewer
 from src.ui.log_widget import LogWidget
+from src.ui.project_service_controller import ProjectServiceController
 from src.ui.quick_open import (
     PickerItem, show_command_palette, show_recent_files,
 )
@@ -136,6 +145,7 @@ class ProjectTab(QWidget):
         self.runner.outputLine.connect(self._on_output)
         self.runner.stateChanged.connect(self._on_state)
         self.runner.finished.connect(self._on_finished)
+        self.service_controller = ProjectServiceController(self)
 
         # 每个 Spring Boot 子模块独立的 runner + 日志 widget（仅多模块时有内容）
         self.module_runners: dict[str, ProcessRunner] = {}
@@ -801,72 +811,153 @@ class ProjectTab(QWidget):
     def _any_module_running(self) -> bool:
         return any(r.is_running() for r in self.module_runners.values())
 
-    def running_service_items(self, refresh_external: bool = True) -> list[dict]:
-        """返回当前项目仍在运行的服务/脚本清单，供退出检查和 CLI quit 复用。"""
-        items: list[dict] = []
+    def service_states(self, refresh_external: bool = True) -> list[ServiceState]:
+        """返回当前项目的统一服务状态快照。
+
+        这是 GUI、CLI、退出检查共用的状态入口。旧的 running_service_items()
+        保留给调用方兼容，但内部不再手写散落 dict。
+        """
         if refresh_external and self._is_multi_module:
             try:
                 self._detect_and_apply_external()
             except Exception:
                 log.exception("刷新外部进程感知失败")
 
+        checked_at = int(time.time())
+        states: list[ServiceState] = []
+
         if self.runner.is_running():
             pid = None
             if self.runner._proc:
                 pid = int(self.runner._proc.processId())
-            items.append({
-                "project": self.project_meta.name,
-                "module": self.project_meta.name,
-                "kind": "project",
-                "state": "running_managed",
-                "source": "managed_runner",
-                "pid": pid if pid and pid > 0 else None,
-                "port": self.project_meta.default_port,
-                "reason": "当前 mini-ide 启动，日志上下文完整",
-            })
+            states.append(ServiceState(
+                project=self.project_meta.name,
+                module=self.project_meta.name,
+                kind=KIND_PROJECT,
+                state=SERVICE_RUNNING_MANAGED,
+                source=SOURCE_MANAGED_RUNNER,
+                pid=pid if pid and pid > 0 else None,
+                port=self.project_meta.default_port,
+                expected_port=self.project_meta.default_port,
+                log_attached=True,
+                checked_at=checked_at,
+                reason="当前 mini-ide 启动，日志上下文完整",
+            ))
+        elif self.runner.state() == "stopping":
+            states.append(ServiceState(
+                project=self.project_meta.name,
+                module=self.project_meta.name,
+                kind=KIND_PROJECT,
+                state=SERVICE_STOPPING,
+                source=SOURCE_MANAGED_RUNNER,
+                port=self.project_meta.default_port,
+                expected_port=self.project_meta.default_port,
+                log_attached=True,
+                checked_at=checked_at,
+                reason="正在停止",
+            ))
+        elif not self.project_meta.spring_boot_modules:
+            states.append(ServiceState(
+                project=self.project_meta.name,
+                module=self.project_meta.name,
+                kind=KIND_PROJECT,
+                state=SERVICE_STOPPED,
+                source=SOURCE_NONE,
+                port=self.project_meta.default_port,
+                expected_port=self.project_meta.default_port,
+                log_attached=False,
+                checked_at=checked_at,
+                reason="未检测到运行进程",
+            ))
 
         for mod_name, _path, expected_port, _cls in self.project_meta.spring_boot_modules:
             runner = self.module_runners.get(mod_name)
+            port = self._module_ports.get(mod_name) or expected_port
             if runner and runner.is_running():
                 pid = int(runner._proc.processId()) if runner._proc else None
-                items.append({
-                    "project": self.project_meta.name,
-                    "module": mod_name,
-                    "kind": "module",
-                    "state": "running_managed",
-                    "source": "managed_runner",
-                    "pid": pid if pid and pid > 0 else None,
-                    "port": self._module_ports.get(mod_name) or expected_port,
-                    "reason": "当前 mini-ide 启动，日志上下文完整",
-                })
+                states.append(ServiceState(
+                    project=self.project_meta.name,
+                    module=mod_name,
+                    kind=KIND_MODULE,
+                    state=SERVICE_RUNNING_MANAGED,
+                    source=SOURCE_MANAGED_RUNNER,
+                    pid=pid if pid and pid > 0 else None,
+                    port=port,
+                    expected_port=expected_port,
+                    log_attached=mod_name in self.module_logs,
+                    checked_at=checked_at,
+                    reason="当前 mini-ide 启动，日志上下文完整",
+                ))
+            elif runner and runner.state() == "stopping":
+                states.append(ServiceState(
+                    project=self.project_meta.name,
+                    module=mod_name,
+                    kind=KIND_MODULE,
+                    state=SERVICE_STOPPING,
+                    source=SOURCE_MANAGED_RUNNER,
+                    port=port,
+                    expected_port=expected_port,
+                    log_attached=mod_name in self.module_logs,
+                    checked_at=checked_at,
+                    reason="正在停止",
+                ))
             elif mod_name in self._module_external_pids:
                 pid = self._module_external_pids.get(mod_name)
-                items.append({
-                    "project": self.project_meta.name,
-                    "module": mod_name,
-                    "kind": "module",
-                    "state": "running_external",
-                    "source": "external_detector",
-                    "pid": pid if pid and pid > 0 else None,
-                    "port": self._module_ports.get(mod_name) or expected_port,
-                    "reason": "外部进程，当前 IDE 没有启动日志上下文",
-                })
+                states.append(ServiceState(
+                    project=self.project_meta.name,
+                    module=mod_name,
+                    kind=KIND_MODULE,
+                    state=SERVICE_RUNNING_EXTERNAL,
+                    source=SOURCE_EXTERNAL_DETECTOR,
+                    pid=pid if pid and pid > 0 else None,
+                    port=port,
+                    expected_port=expected_port,
+                    log_attached=False,
+                    checked_at=checked_at,
+                    reason="外部进程，当前 IDE 没有启动日志上下文",
+                ))
+            else:
+                states.append(ServiceState(
+                    project=self.project_meta.name,
+                    module=mod_name,
+                    kind=KIND_MODULE,
+                    state=SERVICE_STOPPED,
+                    source=SOURCE_NONE,
+                    port=port,
+                    expected_port=expected_port,
+                    log_attached=mod_name in self.module_logs,
+                    checked_at=checked_at,
+                    reason="未检测到运行进程",
+                ))
 
         for key, runner in self._script_runners.items():
-            if not runner.is_running():
-                continue
-            pid = int(runner._proc.processId()) if runner._proc else None
-            items.append({
-                "project": self.project_meta.name,
-                "module": Path(key).name,
-                "kind": "script",
-                "state": "running_managed",
-                "source": "managed_runner",
-                "pid": pid if pid and pid > 0 else None,
-                "port": None,
-                "reason": "当前 mini-ide 启动的脚本进程",
-            })
-        return items
+            if runner.is_running():
+                pid = int(runner._proc.processId()) if runner._proc else None
+                states.append(ServiceState(
+                    project=self.project_meta.name,
+                    module=Path(key).name,
+                    kind=KIND_SCRIPT,
+                    state=SERVICE_RUNNING_MANAGED,
+                    source=SOURCE_SCRIPT_RUNNER,
+                    pid=pid if pid and pid > 0 else None,
+                    checked_at=checked_at,
+                    reason="当前 mini-ide 启动的脚本进程",
+                ))
+            elif runner.state() == "stopping":
+                states.append(ServiceState(
+                    project=self.project_meta.name,
+                    module=Path(key).name,
+                    kind=KIND_SCRIPT,
+                    state=SERVICE_STOPPING,
+                    source=SOURCE_SCRIPT_RUNNER,
+                    checked_at=checked_at,
+                    reason="脚本进程正在停止",
+                ))
+        return states
+
+    def running_service_items(self, refresh_external: bool = True) -> list[dict]:
+        """返回当前项目仍在运行/停止中的服务清单，供退出检查和 CLI quit 复用。"""
+        return running_items(self.service_states(refresh_external=refresh_external))
 
     def stop_all_services(self, include_external: bool = True, silent: bool = True) -> int:
         """停止当前项目内所有运行服务/脚本，返回发起停止的数量。"""
@@ -1661,7 +1752,12 @@ class ProjectTab(QWidget):
         if not ok:
             self._show_preview(path, 0, 0)
 
-    def request_close(self, confirm_running: bool = True, stop_running: bool = True) -> bool:
+    def request_close(
+        self,
+        confirm_running: bool = True,
+        stop_running: bool = True,
+        quiet: bool = False,
+    ) -> bool:
         running_items = self.running_service_items(refresh_external=True)
         any_running = bool(running_items)
         if any_running and confirm_running:
@@ -1686,20 +1782,22 @@ class ProjectTab(QWidget):
             idx = self.center_tabs.indexOf(first)
             if idx >= 0:
                 self.center_tabs.setCurrentIndex(idx)
-            QMessageBox.warning(
-                self,
-                "保存失败",
-                f"有 {len(failed_panes)} 个文件未能保存，已取消关闭项目。",
-            )
+            if not quiet:
+                QMessageBox.warning(
+                    self,
+                    "保存失败",
+                    f"有 {len(failed_panes)} 个文件未能保存，已取消关闭项目。",
+                )
             return False
         if any_running and stop_running:
             self.stop_all_services(include_external=True, silent=True)
             if not self.wait_services_stopped():
-                QMessageBox.warning(
-                    self,
-                    "停止超时",
-                    f"{self.project_meta.name} 仍有服务未完全停止，已取消关闭。",
-                )
+                if not quiet:
+                    QMessageBox.warning(
+                        self,
+                        "停止超时",
+                        f"{self.project_meta.name} 仍有服务未完全停止，已取消关闭。",
+                    )
                 return False
         self._poll_timer.stop()
         self._fetch_timer.stop()

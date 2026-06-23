@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (
     QMessageBox, QPlainTextEdit, QPushButton, QSplitter, QVBoxLayout, QWidget,
 )
 
-from src.core import git_ops
+from src.core import git_context, git_ops
 from src.ui.theme import (
     FG_SECONDARY, FONT_PT_DIFF, GIT_ADD, GIT_DEL, GIT_FILE_HEAD, GIT_HUNK, GIT_META,
     GIT_MODIFY,
@@ -50,15 +50,7 @@ class _FileDiffWorker(QThread):
 
     def run(self) -> None:
         f = self.changed_file
-        if f.status.startswith("?"):
-            text = git_ops.get_untracked_preview(self.root, f.path)
-        else:
-            parts = []
-            if f.is_staged:
-                parts.append("=== Staged ===\n" + git_ops.get_file_diff(self.root, f.path, staged=True))
-            if f.is_unstaged:
-                parts.append("=== Unstaged ===\n" + git_ops.get_file_diff(self.root, f.path, staged=False))
-            text = "\n\n".join(parts) or "(无 diff 内容)"
+        text = git_context.file_diff_text(self.root, f)
         self.done.emit(f.path, text)
 
 
@@ -72,43 +64,15 @@ class _AiDiffContextWorker(QThread):
         self.files = files
         self.summary = summary
 
-    @staticmethod
-    def _status_label(f: git_ops.ChangedFile) -> str:
-        status = f.status
-        if "U" in status or status in {"AA", "DD"}:
-            return "冲突"
-        if status.startswith("?"):
-            return "未跟踪"
-        if "D" in status:
-            return "删除"
-        if f.is_staged and f.is_unstaged:
-            return "已暂存+修改"
-        if f.is_staged:
-            return "已暂存"
-        return "修改"
-
     def run(self) -> None:
-        parts = [self.summary, "", "Diff："]
-        total = len(self.summary)
-        truncated = False
-        for f in self.files:
-            if f.status.startswith("?"):
-                diff = git_ops.get_untracked_preview(self.root, f.path, max_lines=120)
-            else:
-                diff_parts = []
-                if f.is_staged:
-                    diff_parts.append("=== Staged ===\n" + git_ops.get_file_diff(self.root, f.path, staged=True))
-                if f.is_unstaged:
-                    diff_parts.append("=== Unstaged ===\n" + git_ops.get_file_diff(self.root, f.path, staged=False))
-                diff = "\n\n".join(diff_parts) or "(无 diff 内容)"
-            block = f"\n--- {f.path} ({self._status_label(f)}) ---\n{diff}\n"
-            if total + len(block) > AI_DIFF_LIMIT_CHARS:
-                parts.append(f"\n...（diff 已截断，限制 {AI_DIFF_LIMIT_CHARS} 字符）")
-                truncated = True
-                break
-            parts.append(block)
-            total += len(block)
+        diff, truncated = git_context.limited_diff_text(
+            self.root, self.files, max_chars=AI_DIFF_LIMIT_CHARS, untracked_max_lines=120,
+        )
+        parts = [self.summary]
+        if diff:
+            parts.extend(["", "Diff：", diff])
         if truncated:
+            parts.append(f"\n...（diff 已截断，限制 {AI_DIFF_LIMIT_CHARS} 字符）")
             parts.append("请按需打开 Git 改动窗口查看完整 diff。")
         self.done.emit("\n".join(parts))
 
@@ -242,22 +206,11 @@ class GitViewer(QDialog):
         return w
 
     def _status_label(self, f: git_ops.ChangedFile) -> str:
-        status = f.status
-        if "U" in status or status in {"AA", "DD"}:
-            return "冲突"
-        if status.startswith("?"):
-            return "未跟踪"
-        if "D" in status:
-            return "删除"
-        if f.is_staged and f.is_unstaged:
-            return "已暂存+修改"
-        if f.is_staged:
-            return "已暂存"
-        return "修改"
+        return git_context.status_label(f)
 
     def _status_color(self, f: git_ops.ChangedFile) -> str:
         label = self._status_label(f)
-        if label == "未跟踪":
+        if label in ("新增", "未跟踪"):
             return GIT_ADD
         if label == "删除":
             return GIT_DEL
@@ -278,8 +231,7 @@ class GitViewer(QDialog):
         return "\n".join(parts)
 
     def _sort_files(self, files: list[git_ops.ChangedFile]) -> list[git_ops.ChangedFile]:
-        order = {"冲突": 0, "修改": 1, "已暂存": 2, "已暂存+修改": 3, "未跟踪": 4, "删除": 5}
-        return sorted(files, key=lambda f: (order.get(self._status_label(f), 9), f.path.lower()))
+        return git_context.sort_changed_files(files)
 
     def _update_header(self, branch: str, files: list[git_ops.ChangedFile]) -> None:
         self._current_branch = branch
@@ -296,7 +248,7 @@ class GitViewer(QDialog):
         if not files:
             text = f"工作区干净 · {time.strftime('%H:%M:%S')}"
         else:
-            order = ["冲突", "修改", "已暂存", "已暂存+修改", "未跟踪", "删除"]
+            order = ["冲突", "修改", "暂存+修改", "已暂存", "新增", "未跟踪", "删除"]
             parts = [f"{len(files)} 个改动"]
             parts.extend(f"{k} {counts[k]}" for k in order if counts.get(k))
             text = " · ".join(parts) + f" · {time.strftime('%H:%M:%S')}"
@@ -388,38 +340,15 @@ class GitViewer(QDialog):
         if self._current_branch:
             QApplication.clipboard().setText(self._current_branch)
 
-    def _files_by_top_dir(self, files: list[git_ops.ChangedFile]) -> dict[str, list[git_ops.ChangedFile]]:
-        groups: dict[str, list[git_ops.ChangedFile]] = {}
-        for f in files:
-            key = f.path.split("/", 1)[0] if "/" in f.path else "(根目录)"
-            groups.setdefault(key, []).append(f)
-        return groups
-
     def _build_ai_summary(self, include_files: bool = True) -> str:
-        files = self._sort_files(self._current_files)
-        counts: dict[str, int] = {}
-        for f in files:
-            label = self._status_label(f)
-            counts[label] = counts.get(label, 0) + 1
-        lines = [
-            "Git 改动上下文",
-            f"仓库：{self.root}",
-            f"分支：{self._current_branch or '(无分支)'}",
-            f"改动文件数：{len(files)}",
-        ]
-        if counts:
-            lines.append("类型：" + "，".join(f"{k} {v}" for k, v in counts.items()))
-        groups = self._files_by_top_dir(files)
-        if groups:
-            lines.append("影响目录：" + "，".join(f"{k}({len(v)})" for k, v in groups.items()))
-        if include_files and files:
-            lines.append("")
-            lines.append("文件列表：")
-            for f in files:
-                stat = self._numstat.get(f.path)
-                stat_text = f" +{stat[0]} -{stat[1]}" if stat else ""
-                lines.append(f"- [{self._status_label(f)}] {f.path}{stat_text}")
-        return "\n".join(lines)
+        summary = git_context.summary_from_changes(
+            repo=self.root,
+            branch=self._current_branch,
+            files=self._current_files,
+            stats=self._numstat,
+            include_files=include_files,
+        )
+        return git_context.build_ai_text(summary) if summary.get("ok") else summary.get("error", "")
 
     def _copy_ai_context(self, mode: str) -> None:
         if mode == "files":

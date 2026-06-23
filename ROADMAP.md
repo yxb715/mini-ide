@@ -220,15 +220,68 @@
   - 说明是否需要打包。
 - 需要打包时，严格遵守 `AGENTS.md`：先征得用户确认；用户同意后先停所有运行服务，再关闭 mini-ide，再打包。
 
+## 阶段 6：结构化治理
+
+目标：降低后续 AI/人工继续开发时的误改概率，让核心业务状态有清晰边界。
+
+- [x] 6.1 统一服务状态模型
+  - 怎么做：新增纯逻辑 `ServiceState`，统一描述项目、模块、脚本的运行状态、来源、PID、端口、日志上下文和 CLI 兼容输出。
+  - 验收：`ProjectTab`、CLI `--list-modules`、退出前检查不再各自手写一套状态 dict。
+  - 结果：`ProjectTab.service_states()` 成为状态快照入口；`running_service_items()` 保留兼容但内部复用统一模型；CLI 模块列表直接由 `ServiceState.to_cli_module()` 生成。
+
+- [x] 6.2 服务状态模型冒烟检查
+  - 怎么做：把 `src.core.service_state` 加入 import 冒烟，并增加轻量兼容检查，验证 stopped/external 的旧 CLI 输出不变。
+  - 验收：后续修改状态模型时，冒烟测试能拦住 legacy `state/external` 字段回归。
+  - 结果：`scripts/_smoke.py` 已覆盖服务状态模型兼容输出和 running_items 过滤。
+
+- [x] 6.3 抽 ProjectServiceController
+  - 怎么做：把 `ProjectTab` 中服务启动、停止、重启、外部接管、等待停止逐步抽到控制器；UI 只接收信号并渲染。
+  - 验收：CLI 不再直接调用 `ProjectTab` 私有启停方法，GUI/CLI 共享服务生命周期逻辑。
+  - 结果：新增 `ProjectServiceController`；CLI 的 start/stop/restart/health/compile 不再直接操作 `ProjectTab` 的 runner、module_runners、外部 PID 字典。
+
+- [x] 6.4 抽 WorkspaceManager
+  - 怎么做：把工作区候选识别、保存、查找、关闭路径计算、启动恢复策略从 `MainWindow` 拆出。
+  - 验收：`MainWindow` 只负责菜单和弹窗，不直接承担工作区业务判断。
+  - 结果：新增 `workspace_manager` 纯逻辑模块；`MainWindow` 只负责菜单、弹窗和打开/关闭 tab 的 UI 协调。
+
+- [x] 6.5 梳理文件树和预览大文件
+  - 怎么做：在服务主线稳定后，再拆 `file_tree.py` 的文件操作和 `file_preview.py` 的文本/图片/保存逻辑。
+  - 验收：文件操作、预览渲染、保存逻辑有独立边界和更小的测试面。
+  - 结果：新增 `file_actions`、`tool_launchers`、`file_preview_model`、`git_context`，把文件复制/移动规则、外部工具启动命令、编码/行尾/注释/文件类型判断、Git AI 摘要和受限 diff 生成从 UI/CLI 拆出；UI 保留交互和渲染职责。冒烟测试新增文件操作安全边界、重复命名、编码、行尾、注释前缀、图片后缀和 Git 上下文规则覆盖。
+
+## 阶段 7：AI 操作 CLI 增强
+
+目标：让外部 AI 工具从“遥控启停”升级为“可体检、可诊断、可安全收尾”的操作入口。
+
+- [x] 7.1 全局状态与打包前检查
+  - 怎么做：新增 `--status` 返回 IDE、项目、模块、脚本、工作区和运行服务快照；新增 `--preflight-build` / `--can-quit` 在仍有运行服务时返回失败。
+  - 验收：AI 打包前可以机器可读地确认是否还有服务在跑，不再靠人工截图判断。
+
+- [x] 7.2 项目和工作区 CLI
+  - 怎么做：新增 `--open`、`--close`、`--list-workspaces`、`--open-workspace`、`--close-workspace`；关闭项目/工作区时先停止服务并确认停净。
+  - 验收：AI 可以打开/关闭项目和工作区；停不净时不会假装关闭成功。
+
+- [x] 7.3 可靠启动与诊断接口
+  - 怎么做：新增 `--ensure-running`；`--start/--restart` 支持 `--wait --timeout N`；新增 `--diagnose` 汇总状态、诊断摘要、错误日志和近期日志。
+  - 验收：AI 不需要手动拼 start+health；排障时可一次拿到状态和关键日志上下文。
+
+- [x] 7.4 日志与 Git 上下文接口
+  - 怎么做：`--log` 支持 `--errors` 和 `--all-modules`；新增 `--git-status`、`--git-diff`、`--git-ai-context`，完整 diff 放后台线程并有 `--max-chars` 截断。
+  - 验收：AI 能拿到多模块日志、错误摘要、Git 改动摘要和受控 diff，不阻塞主窗口。
+
+- [x] 7.5 CLI 冒烟覆盖
+  - 怎么做：`scripts/_smoke.py` 新增 CLI 参数解析检查，覆盖新增公开命令和旧别名。
+  - 验收：后续改 CLI 时，参数解析回归会在冒烟阶段失败。
+
 ## 当前收尾
 
-- [x] 全部阶段任务已落地到源码和文档。
+- [x] 阶段 0-5 已落地；阶段 6 已完成服务状态模型、服务控制器、工作区管理、文件树和预览核心逻辑拆分；阶段 7 已完成 AI 操作 CLI 增强。
 - [x] Review 修复已完成：
   - GitViewer“复制完整 diff”改为后台生成，避免大 diff 卡住主窗口。
   - CLI quit 遇到服务停止超时会返回失败并取消退出，不再假报成功。
   - 关闭当前工作区会清空活动工作区；工作区恢复模式下会切回上次会话，避免下次又打开已关闭工作区。
   - 外部运行提示已进入“复制诊断给 AI”，包含模块、PID/端口和无当前 IDE 日志上下文说明。
   - “复制 AI 摘要”和“复制文件列表”已区分，摘要不再携带完整文件清单。
-- [x] 冒烟测试通过：30 个模块 import 成功，hex hardcode 扫描 0 命中。
+- [x] 结构化验证通过：37 个模块 import 成功，服务状态兼容检查、CLI 参数解析检查、文件操作规则检查、预览模型规则检查、Git 上下文规则检查通过，hex hardcode 扫描 0 命中。
 - [x] 源码 compileall 通过。
-- [x] 已打包发布：2026-06-23 已按 `AGENTS.md` 铁律先确认服务全停、关闭旧版 mini-ide，再运行 `_build\scripts\build.bat`；新版 `mini-ide.exe` 和 `mini-ide-runtime\` 已生成并完成 CLI 连通性验证。
+- [x] 已打包发布并完成新版 CLI 实测：2026-06-23 已按 `AGENTS.md` 铁律先停运行服务、关闭旧版 mini-ide，再运行 `_build\scripts\build.bat`；新版启动后已验证 `--status`、项目/工作区列表、模块状态、日志、诊断、健康检查、Git 摘要、打包前检查和错误边界返回。

@@ -1,74 +1,67 @@
 # mini-ide
 
-AI 时代的开发指挥台——本机 GUI，管理多个项目的启动/停止/日志/Git 状态。
+mini-ide 是本机开发指挥台：用一个 GUI 管理多个项目的启动、停止、日志、Git 状态、工作区和 AI 操作入口。
 
-## 技术栈
+## 基本信息
 
-Python 3.11+ / PySide6 6.7+ / Pygments / psutil / watchdog / sqlparse。打包用 PyInstaller。
+- 技术栈：Python 3.11+ / PySide6 / Pygments / psutil / watchdog / sqlparse。
+- 源码目录：`_build/`。
+- 发布产物：根目录 `mini-ide.exe` + `mini-ide-runtime/`。
+- 打包脚本：`_build\scripts\build.bat`。
+- 冒烟测试：`cd _build && poetry run python scripts/_smoke.py`。
 
-## 目录结构
+## 代码边界
 
-所有源码在 `_build/` 下，根目录只放 `mini-ide.exe`、`mini-ide-runtime/` + 文档。
+- `src/core/`：纯逻辑层，放配置、项目识别、进程封装、服务状态、工作区、文件操作、Git 上下文等可测试逻辑。
+- `src/ui/`：Qt UI 层，只做交互、展示和 UI 协调；耗时操作必须放 `QThread`。
+- `src/util/`：跨层工具。
+- CLI 通过 `cli_client.py` / `cli_server.py` 走 IPC 控制已运行的 GUI 实例，不要绕过 mini-ide 直接启动业务项目。
 
-```
-_build/
-├── main.py                 # 入口（CLI 分流 + 单实例 + GUI）
-├── src/core/               # 纯逻辑层
-│   ├── cli_client.py       # CLI 客户端（解析参数 → IPC 发命令 → 等响应）
-│   ├── cli_server.py       # CLI 服务端（收 JSON 命令 → 路由到 ProjectTab）
-│   ├── config.py           # AppConfig 持久化
-│   ├── project_detector.py # 项目类型识别 → RunProfile
-│   ├── process_runner.py   # QProcess 封装
-│   ├── log_classifier.py   # 日志行分类
-│   ├── file_index.py       # 文件索引
-│   ├── git_ops.py          # git 命令封装
-│   └── ...
-├── src/ui/                 # Qt UI 组件
-├── src/util/               # 工具层
-└── scripts/
-    ├── build.bat           # 一键打包并发布 exe + runtime
-    └── _smoke.py           # 冒烟测试
-```
+## CLI 能力
 
-## 启动与打包
+外部 AI 工具可以通过根目录 `mini-ide.exe` 调用 CLI。输出统一为 stdout JSON。
 
-| 场景 | 命令 |
-|---|---|
-| 日常使用 | 双击根目录 `mini-ide.exe` |
-| 开发态 | `cd _build && poetry run python main.py` |
-| 打包发布 | `_build\scripts\build.bat`（需先关闭 mini-ide，产物为根目录 `mini-ide.exe` + `mini-ide-runtime\`） |
-| 冒烟测试 | `cd _build && poetry run python scripts/_smoke.py` |
-
-## CLI 接口（外部 AI 工具可调用）
-
-mini-ide 支持通过命令行控制服务生命周期。CLI 命令通过 IPC 发送给已运行的 GUI 实例：
+常用命令：
 
 ```bash
+mini-ide.exe --status
 mini-ide.exe --list-projects
 mini-ide.exe --list-modules <project>
-mini-ide.exe --start <project> [module]
+mini-ide.exe --open <path>
+mini-ide.exe --close <project>
+mini-ide.exe --list-workspaces
+mini-ide.exe --open-workspace <name>
+mini-ide.exe --close-workspace
+mini-ide.exe --start <project> [module] [--wait] [--timeout N]
 mini-ide.exe --stop <project> [module]
-mini-ide.exe --restart <project> [module]
-mini-ide.exe --health <project> [module] [--timeout 60]
+mini-ide.exe --restart <project> [module] [--wait] [--timeout N]
+mini-ide.exe --ensure-running <project> [module] [--timeout N]
+mini-ide.exe --health <project> [module] [--timeout N]
 mini-ide.exe --compile <project>
-mini-ide.exe --log <project> [module] [--tail N]
+mini-ide.exe --log <project> [module] [--tail N] [--errors] [--all-modules]
+mini-ide.exe --diagnose <project> [module] [--tail N]
+mini-ide.exe --git-status <project>
+mini-ide.exe --git-diff <project> [--summary|--full] [--max-chars N]
+mini-ide.exe --git-ai-context <project> [--summary|--full] [--max-chars N]
+mini-ide.exe --preflight-build
+mini-ide.exe --can-quit
+mini-ide.exe --quit
 ```
 
-- `<project>` 按目录名模糊匹配（包含即可，不区分大小写）
-- `<module>` 精确匹配模块名（多模块 Spring Boot 项目）
-- 单模块项目不传 module；多模块不传 module 时操作所有模块
-- 输出：stdout JSON；退出码 0=成功 1=失败 2=参数错误 3=未运行 4=超时
-- IPC 协议：JSON 单行请求/响应，兼容老协议（非 `{` 开头按项目路径处理）
+规则：
 
-## 工作流规则
+- `<project>` 按目录名或完整路径模糊匹配，不区分大小写。
+- `<module>` 精确匹配模块名；多模块项目不传 module 时表示操作全部模块。
+- 退出码：`0=成功`，`1=失败`，`2=参数错误`，`3=mini-ide 未运行`，`4=超时`。
+- 打包前必须先确认 `--preflight-build` 或 `--can-quit` 返回 `ok=true`。
 
-- **修改代码后必须重新打包**：跑 `_build\scripts\build.bat` 更新根目录 `mini-ide.exe` + `mini-ide-runtime\`
-- **打包关闭 IDE 铁律**：重新打包前如果需要关闭正在运行的 mini-ide，必须先征得用户明确确认；没有用户同意，禁止自动关闭 mini-ide 或强杀进程。
-- **关闭 IDE 前先停服务铁律**：用户同意关闭 mini-ide 后，必须先通过 mini-ide 管理入口停止当前 IDE 中正在运行的所有服务，包括后端、前端、Python 等服务；确认服务都停掉后，才允许关闭 mini-ide 并继续打包。
-- **长期任务跟踪**：涉及状态可信度、工作区、安全退出、日志诊断、Git AI 上下文等中长期改造时，必须先看 `ROADMAP.md`，按其中任务拆分推进；每完成一项要更新文档状态，防止上下文压缩后丢失细节。
-- **冒烟测试**：改完代码先跑 `_smoke.py` 确认 30 模块 import + 0 hex hits
-- **禁止 hardcode 颜色**：所有颜色/圆角/间距从 `theme.py` token 拿
-- **子进程必须加 `CREATE_NO_WINDOW`**
-- **耗时操作必须放 QThread**
-- **不引入新依赖**（CLI 用标准库 + Qt 的 QLocalSocket）
+## 必守规则
 
+- **修改代码后要重新打包发布**：跑 `_build\scripts\build.bat` 更新根目录 `mini-ide.exe` 和 `mini-ide-runtime/`。
+- **未经用户明确同意，禁止关闭 mini-ide**。
+- **用户同意关闭后，必须先通过 mini-ide 停止当前 IDE 中正在运行的所有服务**，包括后端、前端、Python、脚本等；确认停净后，才允许关闭 IDE 和打包。
+- **服务启停、日志诊断、编译、工作区管理都必须走 mini-ide CLI 或 GUI 能力**，不要直接运行 `gradle/mvn/npm/python` 启动业务项目。
+- **禁止 hardcode 颜色、圆角、间距**：UI 样式从 `src/ui/theme.py` token 获取。
+- **子进程必须加 `CREATE_NO_WINDOW`**，避免弹出黑窗口。
+- **不引入新依赖**，除非用户明确确认。
+- **完成前必须跑冒烟测试和必要的编译检查**；失败要先修复，不能带着失败结果交付。

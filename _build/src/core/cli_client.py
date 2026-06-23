@@ -136,14 +136,27 @@ def _parse_args(argv: list[str]) -> dict | None:
 
     cmd_name = args[0].lstrip("-")  # --list-projects → list-projects
     cmd_map = {
+        "status": "status",
         "list-projects": "list-projects",
         "list-modules": "list-modules",
+        "open": "open",
+        "close": "close",
+        "list-workspaces": "list-workspaces",
+        "open-workspace": "open-workspace",
+        "close-workspace": "close-workspace",
         "start": "start",
         "stop": "stop",
         "restart": "restart",
+        "ensure-running": "ensure-running",
         "health": "health",
         "compile": "compile",
         "log": "log",
+        "diagnose": "diagnose",
+        "git-status": "git-status",
+        "git-diff": "git-diff",
+        "git-ai-context": "git-ai-context",
+        "preflight-build": "preflight-build",
+        "can-quit": "preflight-build",
         "quit": "quit",
     }
     if cmd_name not in cmd_map:
@@ -152,10 +165,30 @@ def _parse_args(argv: list[str]) -> dict | None:
     result: dict = {"cmd": cmd_map[cmd_name]}
     rest = args[1:]
 
-    if cmd_name == "list-projects":
+    if cmd_name in ("status", "list-projects", "list-workspaces", "close-workspace",
+                    "preflight-build", "can-quit"):
         return result
 
     if cmd_name == "quit":
+        return result
+
+    if cmd_name == "open":
+        if not rest:
+            return None
+        result["path"] = rest[0]
+        return result
+
+    if cmd_name == "close":
+        if not rest:
+            return None
+        result["project"] = rest[0]
+        return result
+
+    if cmd_name == "open-workspace":
+        if not rest:
+            return None
+        # 工作区名允许带空格；CLI 调用方也可以用引号传成一个参数。
+        result["name"] = " ".join(rest).strip()
         return result
 
     if cmd_name == "list-modules":
@@ -168,8 +201,45 @@ def _parse_args(argv: list[str]) -> dict | None:
         if not rest:
             return None
         result["project"] = rest[0]
-        if len(rest) > 1 and not rest[1].startswith("--"):
-            result["module"] = rest[1]
+        i = 1
+        if i < len(rest) and not rest[i].startswith("--"):
+            result["module"] = rest[i]
+            i += 1
+        while i < len(rest):
+            if rest[i] == "--wait":
+                result["wait"] = True
+                i += 1
+            elif rest[i] == "--timeout" and i + 1 < len(rest):
+                try:
+                    result["timeout"] = int(rest[i + 1])
+                except ValueError:
+                    return None
+                i += 2
+            else:
+                return None
+        if result.get("wait") and "timeout" not in result:
+            result["timeout"] = 60
+        return result
+
+    if cmd_name == "ensure-running":
+        if not rest:
+            return None
+        result["project"] = rest[0]
+        i = 1
+        if i < len(rest) and not rest[i].startswith("--"):
+            result["module"] = rest[i]
+            i += 1
+        while i < len(rest):
+            if rest[i] == "--timeout" and i + 1 < len(rest):
+                try:
+                    result["timeout"] = int(rest[i + 1])
+                except ValueError:
+                    return None
+                i += 2
+            else:
+                return None
+        if "timeout" not in result:
+            result["timeout"] = 60
         return result
 
     if cmd_name == "health":
@@ -188,7 +258,7 @@ def _parse_args(argv: list[str]) -> dict | None:
                     return None
                 i += 2
             else:
-                i += 1
+                return None
         if "timeout" not in result:
             result["timeout"] = 60
         return result
@@ -206,7 +276,7 @@ def _parse_args(argv: list[str]) -> dict | None:
                     return None
                 i += 2
             else:
-                i += 1
+                return None
         if "timeout" not in result:
             # 冷编译 Gradle/Maven 动辄数十秒到几分钟，给宽松默认值
             result["timeout"] = 300
@@ -227,10 +297,61 @@ def _parse_args(argv: list[str]) -> dict | None:
                 except ValueError:
                     return None
                 i += 2
-            else:
+            elif rest[i] == "--errors":
+                result["errors"] = True
                 i += 1
+            elif rest[i] == "--all-modules":
+                result["all_modules"] = True
+                i += 1
+            else:
+                return None
         if "tail" not in result:
             result["tail"] = 50
+        return result
+
+    if cmd_name == "diagnose":
+        if not rest:
+            return None
+        result["project"] = rest[0]
+        i = 1
+        if i < len(rest) and not rest[i].startswith("--"):
+            result["module"] = rest[i]
+            i += 1
+        while i < len(rest):
+            if rest[i] == "--tail" and i + 1 < len(rest):
+                try:
+                    result["tail"] = int(rest[i + 1])
+                except ValueError:
+                    return None
+                i += 2
+            else:
+                return None
+        if "tail" not in result:
+            result["tail"] = 120
+        return result
+
+    if cmd_name in ("git-status", "git-diff", "git-ai-context"):
+        if not rest:
+            return None
+        result["project"] = rest[0]
+        i = 1
+        while i < len(rest):
+            if rest[i] == "--full":
+                result["mode"] = "full"
+                i += 1
+            elif rest[i] == "--summary":
+                result["mode"] = "summary"
+                i += 1
+            elif rest[i] == "--max-chars" and i + 1 < len(rest):
+                try:
+                    result["max_chars"] = int(rest[i + 1])
+                except ValueError:
+                    return None
+                i += 2
+            else:
+                return None
+        if "mode" not in result:
+            result["mode"] = "summary"
         return result
 
     return None
@@ -258,8 +379,12 @@ def run_cli(argv: list[str]) -> int:
     sock.flush()
 
     # 等待响应（--health / --compile 可能等很久，按命令携带的 timeout 放宽）
-    if cmd["cmd"] in ("health", "compile"):
+    if cmd["cmd"] in ("health", "compile", "ensure-running") or (
+        cmd["cmd"] in ("start", "restart") and cmd.get("wait")
+    ):
         timeout_ms = (cmd.get("timeout", 60) + 5) * 1000
+    elif cmd["cmd"] in ("git-diff", "git-ai-context"):
+        timeout_ms = 120000
     else:
         timeout_ms = 30000
     response_buf = b""
@@ -308,13 +433,25 @@ def _print_usage():
         sys.stderr,
         "Usage: mini-ide <command> [args...]\n"
         "Commands:\n"
+        "  --status                     Snapshot IDE/projects/services/workspaces\n"
         "  --list-projects              List all open projects\n"
         "  --list-modules <project>     List modules of a project\n"
+        "  --open <path>                Open a project path in the running IDE\n"
+        "  --close <project>            Stop services and close a project tab\n"
+        "  --list-workspaces            List saved workspaces\n"
+        "  --open-workspace <name>      Open a saved workspace\n"
+        "  --close-workspace            Stop services and close active workspace\n"
         "  --start <project> [module]   Start a module\n"
         "  --stop <project> [module]    Stop a module\n"
         "  --restart <project> [module] Restart a module\n"
+        "  --ensure-running <project> [module] [--timeout N]  Start if needed and wait\n"
         "  --health <project> [module] [--timeout N]  Wait for startup\n"
         "  --compile <project>          Trigger compilation\n"
-        "  --log <project> [module] [--tail N]  Get recent log lines\n"
+        "  --log <project> [module] [--tail N] [--errors] [--all-modules]\n"
+        "  --diagnose <project> [module] [--tail N]  Get service/log diagnosis\n"
+        "  --git-status <project>       Get git branch and changed files\n"
+        "  --git-diff <project> [--summary|--full] [--max-chars N]\n"
+        "  --git-ai-context <project> [--summary|--full] [--max-chars N]\n"
+        "  --preflight-build            Check running services before build/quit\n"
         "  --quit                       Stop all running services and exit mini-ide\n"
     )

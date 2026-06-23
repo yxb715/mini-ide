@@ -7,17 +7,184 @@ from __future__ import annotations
 
 import json
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING
 
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot
 from PySide6.QtNetwork import QLocalSocket
 
 if TYPE_CHECKING:
     from src.ui.main_window import MainWindow
 
+from src.core import git_context
 from src.util import app_log
 
 log = app_log.get_logger("cli_server")
+
+
+def _app_version() -> str:
+    """读取打包元信息里的版本号，失败时返回空串。"""
+    try:
+        import tomllib
+        pyproject = Path(__file__).resolve().parents[2] / "pyproject.toml"
+        data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+        return str(data.get("tool", {}).get("poetry", {}).get("version", ""))
+    except Exception:
+        return ""
+
+
+def _project_snapshot(tab) -> dict:
+    """返回项目级快照，供 status / preflight / diagnose 复用。"""
+    states = tab.service_states(refresh_external=True)
+    modules = [s.to_cli_module() for s in states if s.kind != "script"]
+    scripts = [s.to_running_item() for s in states if s.kind == "script" and s.is_active]
+    return {
+        "name": tab.project_meta.name,
+        "path": tab.project_meta.path,
+        "type": tab.project_meta.project_type,
+        "display_type": tab.project_meta.display_type,
+        "package_manager": tab.project_meta.package_manager,
+        "default_port": tab.project_meta.default_port,
+        "health_check_path": tab.project_meta.health_check_path,
+        "modules": modules,
+        "scripts": scripts,
+        "running": [s.to_running_item() for s in states if s.is_active],
+    }
+
+
+def _all_project_tabs(window: "MainWindow") -> list:
+    from src.ui.project_tab import ProjectTab
+    tabs = []
+    for i in range(window.tabs.count()):
+        w = window.tabs.widget(i)
+        if isinstance(w, ProjectTab):
+            tabs.append(w)
+    return tabs
+
+
+def _collect_running(window: "MainWindow") -> list[dict]:
+    items: list[dict] = []
+    for tab in _all_project_tabs(window):
+        try:
+            items.extend(tab.running_service_items(refresh_external=True))
+        except Exception:
+            log.exception("收集运行服务失败: %s", tab.project_meta.name)
+    return items
+
+
+def _workspace_payload(ws, active_name: str = "") -> dict:
+    return {
+        "name": ws.name,
+        "paths": list(ws.paths),
+        "project_count": len(ws.paths),
+        "last_opened_at": ws.last_opened_at,
+        "active": bool(active_name and ws.name == active_name),
+    }
+
+
+def _log_widget_for(tab, module: str | None):
+    return tab.service_controller.log_widget(module)
+
+
+def _iter_log_lines(log_widget, tail: int) -> list[str]:
+    if log_widget is None:
+        return []
+    doc = log_widget.edit.document()
+    total_blocks = doc.blockCount()
+    start = max(0, total_blocks - max(0, tail))
+    lines = []
+    block = doc.findBlockByNumber(start)
+    while block.isValid() and len(lines) < tail:
+        text = block.text()
+        if text:
+            lines.append(text)
+        block = block.next()
+    return lines
+
+
+def _validate_module(tab, module: str | None) -> dict | None:
+    return tab.service_controller.validate_module(module)
+
+
+def _looks_error_line(line: str) -> bool:
+    low = line.lower()
+    return any(x in low for x in (
+        " error", "[error", "exception", "traceback", "failed", "failure",
+        "caused by", "端口", "占用", "错误", "失败",
+    ))
+
+
+class _GitDiffWorker(QObject):
+    done = Signal(dict)
+
+    def __init__(self, root: str, mode: str, max_chars: int, parent=None):
+        super().__init__(parent)
+        self.root = root
+        self.mode = mode
+        self.max_chars = max_chars
+
+    def run(self) -> None:
+        try:
+            summary = git_context.summary_payload(self.root, include_files=True)
+            if not summary.get("ok"):
+                self.done.emit(summary)
+                return
+            if self.mode != "full":
+                summary["text"] = git_context.build_ai_text(summary)
+                self.done.emit(summary)
+                return
+            repo = summary["repo"]
+            diff, truncated = git_context.limited_diff_text(repo, max_chars=self.max_chars)
+            summary["truncated"] = truncated
+            summary["text"] = git_context.build_ai_text(summary, diff=diff)
+            self.done.emit(summary)
+        except Exception as e:
+            log.exception("生成 CLI git diff 失败")
+            self.done.emit({"ok": False, "error": str(e)})
+
+    @Slot(dict)
+    def dispose(self, _payload: dict) -> None:
+        self.deleteLater()
+
+
+class _GitDiffResponder(QObject):
+    def __init__(self, sock: QLocalSocket, thread: QThread, worker: QObject, parent=None):
+        super().__init__(parent)
+        self.sock = sock
+        self.thread = thread
+        self.worker = worker
+
+    @Slot(dict)
+    def finish(self, payload: dict) -> None:
+        if self.sock.state() == QLocalSocket.LocalSocketState.ConnectedState:
+            _send_response(self.sock, payload)
+        self.thread.quit()
+
+    @Slot()
+    def cleanup(self) -> None:
+        try:
+            _active_workers.remove((self.thread, self.worker, self))
+        except ValueError:
+            pass
+        self.thread.deleteLater()
+        self.deleteLater()
+
+
+_active_workers: list[tuple[QThread, QObject, QObject]] = []
+
+
+def _run_git_diff_async(tab, mode: str, max_chars: int, sock: QLocalSocket) -> None:
+    thread = QThread()
+    worker = _GitDiffWorker(tab.project_meta.path, mode, max_chars)
+    responder = _GitDiffResponder(sock, thread, worker)
+    worker.moveToThread(thread)
+
+    worker.done.connect(responder.finish)
+    worker.done.connect(worker.dispose)
+    thread.started.connect(worker.run)
+    thread.finished.connect(responder.cleanup)
+    _active_workers.append((thread, worker, responder))
+    thread.start()
 
 
 def handle_cli_request(data: str, sock: QLocalSocket, window: "MainWindow") -> bool:
@@ -59,8 +226,26 @@ def _dispatch(cmd: dict, window: "MainWindow") -> dict:
     """根据 cmd 类型路由到对应处理函数。"""
     action = cmd["cmd"]
 
+    if action == "status":
+        return _cmd_status(window)
+
     if action == "list-projects":
         return _cmd_list_projects(window)
+
+    if action == "open":
+        return _cmd_open(window, cmd.get("path", ""))
+
+    if action == "list-workspaces":
+        return _cmd_list_workspaces(window)
+
+    if action == "open-workspace":
+        return _cmd_open_workspace(window, cmd.get("name", ""))
+
+    if action == "close-workspace":
+        return _cmd_close_workspace(window)
+
+    if action == "preflight-build":
+        return _cmd_preflight_build(window)
 
     if action == "quit":
         return _cmd_quit(window)
@@ -76,6 +261,8 @@ def _dispatch(cmd: dict, window: "MainWindow") -> dict:
 
     if action == "list-modules":
         return _cmd_list_modules(tab)
+    elif action == "close":
+        return _cmd_close_project(window, tab)
     elif action == "start":
         return _cmd_start(tab, cmd.get("module"))
     elif action == "stop":
@@ -87,7 +274,19 @@ def _dispatch(cmd: dict, window: "MainWindow") -> dict:
     elif action == "compile":
         return {"ok": False, "error": "compile command uses async handler"}
     elif action == "log":
-        return _cmd_log(tab, cmd.get("module"), cmd.get("tail", 50))
+        return _cmd_log(
+            tab,
+            cmd.get("module"),
+            cmd.get("tail", 50),
+            errors=bool(cmd.get("errors")),
+            all_modules=bool(cmd.get("all_modules")),
+        )
+    elif action == "diagnose":
+        return _cmd_diagnose(tab, cmd.get("module"), cmd.get("tail", 120))
+    elif action == "git-status":
+        return _cmd_git_status(tab)
+    elif action in ("git-diff", "git-ai-context"):
+        return {"ok": False, "error": f"{action} command uses async handler"}
     else:
         return {"ok": False, "error": f"unknown command: {action}"}
 
@@ -95,9 +294,14 @@ def _dispatch(cmd: dict, window: "MainWindow") -> dict:
 def handle_async_cli_request(
     cmd: dict, sock: QLocalSocket, window: "MainWindow"
 ) -> bool:
-    """处理需要异步等待的命令（health / compile）。返回 True 表示已接管。"""
+    """处理需要异步等待的命令。返回 True 表示已接管。"""
     action = cmd.get("cmd")
-    if action not in ("health", "compile"):
+    if action in ("start", "restart") and not cmd.get("wait"):
+        return False
+    if action not in (
+        "health", "compile", "ensure-running", "start", "restart",
+        "git-diff", "git-ai-context",
+    ):
         return False
 
     project_key = cmd.get("project")
@@ -115,6 +319,19 @@ def handle_async_cli_request(
         return True
     elif action == "compile":
         _cmd_compile_async(tab, sock, cmd.get("timeout", 300))
+        return True
+    elif action == "ensure-running":
+        _cmd_ensure_running_async(tab, cmd.get("module"), cmd.get("timeout", 60), sock)
+        return True
+    elif action in ("start", "restart"):
+        _cmd_start_or_restart_wait_async(
+            tab, action, cmd.get("module"), cmd.get("timeout", 60), sock,
+        )
+        return True
+    elif action in ("git-diff", "git-ai-context"):
+        mode = cmd.get("mode", "summary")
+        max_chars = int(cmd.get("max_chars", 30000))
+        _run_git_diff_async(tab, mode, max_chars, sock)
         return True
     return False
 
@@ -153,6 +370,187 @@ def _stop_tab_all(tab) -> tuple[int, bool]:
     if count:
         stopped = tab.wait_services_stopped(timeout_ms=15000)
     return count, stopped
+
+
+def _cmd_status(window: "MainWindow") -> dict:
+    from src.core.workspace_manager import ensure_workspace_candidates
+    changed = ensure_workspace_candidates(window.config)
+    if changed:
+        window.config.save()
+        try:
+            window._rebuild_workspace_menu()
+        except Exception:
+            log.exception("刷新工作区菜单失败")
+    current = window.tabs.currentWidget()
+    current_project = None
+    if current is not None and hasattr(current, "project_meta"):
+        current_project = {
+            "name": current.project_meta.name,
+            "path": current.project_meta.path,
+        }
+    projects = [_project_snapshot(tab) for tab in _all_project_tabs(window)]
+    running = []
+    for p in projects:
+        running.extend(p.get("running", []))
+    return {
+        "ok": True,
+        "ide": "mini-ide",
+        "version": _app_version(),
+        "project_count": len(projects),
+        "current_project": current_project,
+        "active_workspace_name": window.config.active_workspace_name,
+        "startup_restore_mode": window.config.startup_restore_mode,
+        "projects": projects,
+        "running": running,
+        "workspaces": [
+            _workspace_payload(ws, window.config.active_workspace_name)
+            for ws in window.config.workspaces
+        ],
+    }
+
+
+def _cmd_open(window: "MainWindow", path: str) -> dict:
+    if not path:
+        return {"ok": False, "error": "missing 'path' argument"}
+    p = Path(path)
+    if not p.is_dir():
+        return {"ok": False, "error": f"path is not a directory: {path}"}
+    tab = window.open_project(str(p), quiet=True)
+    if tab is None:
+        return {"ok": False, "error": f"open project failed: {path}"}
+    return {"ok": True, "project": _project_snapshot(tab)}
+
+
+def _cmd_close_project(window: "MainWindow", tab) -> dict:
+    running_before = tab.running_service_items(refresh_external=True)
+    name = tab.project_meta.name
+    path = tab.project_meta.path
+    ok = window.close_project_tab(tab, quiet=True)
+    if not ok:
+        return {
+            "ok": False,
+            "error": "close project failed",
+            "project": {"name": name, "path": path},
+            "running": running_before,
+        }
+    return {
+        "ok": True,
+        "project": {"name": name, "path": path},
+        "stopped": len(running_before),
+        "services": running_before,
+    }
+
+
+def _cmd_list_workspaces(window: "MainWindow") -> dict:
+    from src.core.workspace_manager import ensure_workspace_candidates
+    changed = ensure_workspace_candidates(window.config)
+    if changed:
+        window.config.save()
+        try:
+            window._rebuild_workspace_menu()
+        except Exception:
+            log.exception("刷新工作区菜单失败")
+    return {
+        "ok": True,
+        "active_workspace_name": window.config.active_workspace_name,
+        "startup_restore_mode": window.config.startup_restore_mode,
+        "workspaces": [
+            _workspace_payload(ws, window.config.active_workspace_name)
+            for ws in window.config.workspaces
+        ],
+    }
+
+
+def _find_workspace(window: "MainWindow", name: str):
+    if not name:
+        return None
+    exact = window.config.find_workspace(name)
+    if exact:
+        return exact
+    key = name.lower()
+    matches = [ws for ws in window.config.workspaces if key in ws.name.lower()]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _cmd_open_workspace(window: "MainWindow", name: str) -> dict:
+    from src.core.workspace_manager import mark_workspace_opened
+    ws = _find_workspace(window, name)
+    if not ws:
+        return {"ok": False, "error": f"workspace not found: {name}"}
+    opened = []
+    failed = []
+    for path in ws.paths:
+        if not Path(path).is_dir():
+            failed.append({"path": path, "error": "path not found"})
+            continue
+        tab = window.open_project(path, quiet=True)
+        if tab is None:
+            failed.append({"path": path, "error": "open failed"})
+            continue
+        opened.append({"name": tab.project_meta.name, "path": tab.project_meta.path})
+    mark_workspace_opened(window.config, ws)
+    window.config.save()
+    try:
+        window._rebuild_workspace_menu()
+    except Exception:
+        log.exception("刷新工作区菜单失败")
+    return {
+        "ok": bool(opened) or not ws.paths,
+        "workspace": _workspace_payload(ws, window.config.active_workspace_name),
+        "opened": opened,
+        "failed": failed,
+    }
+
+
+def _cmd_close_workspace(window: "MainWindow") -> dict:
+    from src.core.workspace_manager import close_workspace_paths
+    current_paths = window._current_project_paths()
+    active = window.config.active_workspace_name
+    ws = window.config.find_workspace(active) if active else None
+    paths = set(ws.paths) if ws else set(current_paths)
+    closed = []
+    failed = []
+    for i in range(window.tabs.count() - 1, -1, -1):
+        tab = window.tabs.widget(i)
+        if not hasattr(tab, "project_meta"):
+            continue
+        if tab.project_meta.path not in paths:
+            continue
+        running = tab.running_service_items(refresh_external=True)
+        if window.close_project_tab(tab, quiet=True):
+            closed.append({
+                "name": tab.project_meta.name,
+                "path": tab.project_meta.path,
+                "stopped": len(running),
+                "services": running,
+            })
+        else:
+            failed.append({
+                "name": tab.project_meta.name,
+                "path": tab.project_meta.path,
+                "running": running,
+            })
+    if failed:
+        return {"ok": False, "error": "close workspace failed", "closed": closed, "failed": failed}
+    close_workspace_paths(window.config, current_paths)
+    window.config.save()
+    try:
+        window._rebuild_workspace_menu()
+    except Exception:
+        log.exception("刷新工作区菜单失败")
+    return {"ok": True, "closed": closed, "active_workspace_name": window.config.active_workspace_name}
+
+
+def _cmd_preflight_build(window: "MainWindow") -> dict:
+    running = _collect_running(window)
+    if running:
+        return {
+            "ok": False,
+            "error": "running services must be stopped before build/quit",
+            "can_build": False,
+            "running": running,
+        }
+    return {"ok": True, "can_build": True, "running": []}
 
 
 def _cmd_quit(window: "MainWindow") -> dict:
@@ -236,257 +634,100 @@ def _cmd_list_projects(window: "MainWindow") -> list:
 def _cmd_list_modules(tab) -> list:
     from src.ui.project_tab import ProjectTab
     tab: ProjectTab
-    modules = []
-    checked_at = int(time.time())
-    try:
-        tab._detect_and_apply_external()
-    except Exception:
-        log.exception("刷新外部进程感知失败")
-    external = getattr(tab, "_module_external_pids", {})
-    ports = getattr(tab, "_module_ports", {})
-    for mod_name, _path, expected_port, _cls in tab.project_meta.spring_boot_modules:
-        runner = tab.module_runners.get(mod_name)
-        pid = None
-        port = ports.get(mod_name) or None
-        log_attached = mod_name in tab.module_logs
-        source = "none"
-        detail_state = "stopped"
-        reason = "未检测到运行进程"
-        if runner and runner.is_running() and runner._proc:
-            pid = runner._proc.processId()
-            detail_state = "running_managed"
-            source = "managed_runner"
-            reason = "当前 mini-ide 启动，日志上下文完整"
-        elif mod_name in external:
-            # 外部启动（AI / 终端 / IDE）的进程，按命令行感知到
-            pid = external[mod_name]
-            detail_state = "running_external"
-            source = "external_detector"
-            reason = "外部进程，当前 IDE 没有启动日志上下文"
-            log_attached = False
-        elif runner and runner.state() == "stopping":
-            detail_state = "stopping"
-            source = "managed_runner"
-            reason = "正在停止"
-        elif runner and runner.state() == "running":
-            detail_state = "running_managed"
-            source = "managed_runner"
-            reason = "当前 mini-ide 启动，日志上下文完整"
-        modules.append({
-            "name": mod_name,
-            # 兼容旧协议：旧客户端只认 running/stopped。
-            "state": "running" if detail_state in ("running_managed", "running_external") else "stopped",
-            "detail_state": detail_state,
-            "source": source,
-            "external": detail_state == "running_external",
-            "pid": pid if pid and pid > 0 else None,
-            "port": port,
-            "expected_port": expected_port if isinstance(expected_port, int) else None,
-            "log_attached": log_attached,
-            "checked_at": checked_at,
-            "reason": reason,
-        })
-    # 单模块项目没有 spring_boot_modules，返回主 runner 状态
-    if not modules:
-        runner_state = tab.runner.state()
-        pid = None
-        detail_state = "stopped"
-        source = "none"
-        reason = "未检测到运行进程"
-        if runner_state == "running":
-            detail_state = "running_managed"
-            source = "managed_runner"
-            reason = "当前 mini-ide 启动，日志上下文完整"
-        elif runner_state == "stopping":
-            detail_state = "stopping"
-            source = "managed_runner"
-            reason = "正在停止"
-        if tab.runner.is_running() and tab.runner._proc:
-            pid = tab.runner._proc.processId()
-        modules.append({
-            "name": tab.project_meta.name,
-            "state": "running" if detail_state == "running_managed" else "stopped",
-            "detail_state": detail_state,
-            "source": source,
-            "external": False,
-            "pid": pid if pid and pid > 0 else None,
-            "port": tab.project_meta.default_port,
-            "expected_port": tab.project_meta.default_port,
-            "log_attached": detail_state == "running_managed",
-            "checked_at": checked_at,
-            "reason": reason,
-        })
+    states = tab.service_controller.states(refresh_external=True)
+    # 对 CLI 来说，脚本运行不是“模块”，避免 list-modules 混入右键脚本进程。
+    modules = [s.to_cli_module() for s in states if s.kind != "script"]
     return modules
 
 
 def _cmd_start(tab, module: str | None) -> dict:
-    from src.ui.project_tab import ProjectTab
-    tab: ProjectTab
-
-    if tab._is_multi_module:
-        if module:
-            # 检查模块是否存在
-            mod_names = [m[0] for m in tab.project_meta.spring_boot_modules]
-            if module not in mod_names:
-                return {"ok": False, "error": f"module not found: {module}"}
-            runner = tab.module_runners.get(module)
-            if runner and runner.is_running():
-                return {"ok": False, "error": "already running"}
-            # 刷新一次外部感知：若该模块被一个 mini-ide 没在管的进程占着，
-            # 静默启动会先接管（杀旧的 + 等端口释放）再用本实例启动。
-            tab._detect_and_apply_external()
-            tab._start_module(module, silent=True)
-            return {"ok": True}
-        else:
-            # 启动所有模块（含接管外部进程）
-            tab._start_all_modules(silent=True)
-            return {"ok": True}
-    else:
-        # 单模块
-        if tab.runner.is_running():
-            return {"ok": False, "error": "already running"}
-        primary = next((p for p in tab.project_meta.profiles if p.primary), None)
-        if not primary:
-            return {"ok": False, "error": "no run profile found"}
-        tab._start_profile(primary)
-        return {"ok": True}
+    return tab.service_controller.start(module)
 
 
 def _cmd_stop(tab, module: str | None) -> dict:
-    from src.ui.project_tab import ProjectTab
-    tab: ProjectTab
-
-    if tab._is_multi_module:
-        try:
-            tab._detect_and_apply_external()
-        except Exception:
-            log.exception("刷新外部进程感知失败")
-        if module:
-            mod_names = [m[0] for m in tab.project_meta.spring_boot_modules]
-            if module not in mod_names:
-                return {"ok": False, "error": f"module not found: {module}"}
-            runner = tab.module_runners.get(module)
-            running = runner and runner.is_running()
-            external = module in tab._module_external_pids
-            if not running and not external:
-                return {"ok": False, "error": "not running"}
-            if running:
-                runner.stop()
-                _wait_runner_stop(runner, 10000)
-            if module in tab._module_external_pids:
-                tab._takeover_external(module)
-            tab._refresh_status_row()
-            return {"ok": True}
-        else:
-            if tab.runner.is_running():
-                tab._stop()
-                _wait_runner_stop(tab.runner, 10000)
-            tab._stop_all_modules(silent=True)
-            for r in list(tab.module_runners.values()):
-                if r.is_running():
-                    _wait_runner_stop(r, 10000)
-            try:
-                tab._detect_and_apply_external()
-                for mod_name in list(tab._module_external_pids):
-                    tab._takeover_external(mod_name)
-            except Exception:
-                log.exception("清理外部进程失败")
-            tab._refresh_status_row()
-            return {"ok": True}
-    else:
-        if not tab.runner.is_running():
-            return {"ok": False, "error": "not running"}
-        tab._stop()
-        return {"ok": True}
+    result = tab.service_controller.stop(module)
+    if result.get("ok") is False and result.get("error") not in ("not running",):
+        log.warning("CLI stop failed: %s", result)
+    return result
 
 
 def _cmd_restart(tab, module: str | None) -> dict:
-    """同步 restart：stop → 等进程退出（最多 10s）→ start。
+    return tab.service_controller.restart(module)
 
-    关键：目标模块可能是被一个 mini-ide 没在管的外部进程占着（典型：跨重启后靠
-    端口感知到的旧进程）。这种进程不能只 stop 自管理 runner（那一步对它无效），
-    必须按感知到的 PID 杀掉并等端口释放，否则新进程会撞端口瞬间退出。_start_module
-    的静默模式已内置这套接管逻辑。
-    """
+
+def _cmd_log(
+    tab,
+    module: str | None,
+    tail: int,
+    errors: bool = False,
+    all_modules: bool = False,
+) -> dict:
+    """获取最近 N 行日志。支持错误过滤和多模块汇总。"""
     from src.ui.project_tab import ProjectTab
     tab: ProjectTab
 
-    if tab._is_multi_module:
-        if module:
-            mod_names = [m[0] for m in tab.project_meta.spring_boot_modules]
-            if module not in mod_names:
-                return {"ok": False, "error": f"module not found: {module}"}
-            runner = tab.module_runners.get(module)
-            if runner and runner.is_running():
-                runner.stop()
-                # 等进程退出
-                if not _wait_runner_stop(runner, 10000):
-                    return {"ok": False, "error": "stop timeout"}
-            # 刷新外部感知：外部进程交给 _start_module(silent) 接管
-            tab._detect_and_apply_external()
-            tab._start_module(module, silent=True)
-            return {"ok": True}
-        else:
-            # 全部重启
-            for mod_name, r in list(tab.module_runners.items()):
-                if r.is_running():
-                    r.stop()
-            # 等所有停止
-            deadline = time.time() + 10
-            for mod_name, r in list(tab.module_runners.items()):
-                remaining = max(0, int((deadline - time.time()) * 1000))
-                _wait_runner_stop(r, remaining)
-            tab._start_all_modules(silent=True)
-            return {"ok": True}
-    else:
-        if tab.runner.is_running():
-            tab.runner.stop()
-            if not _wait_runner_stop(tab.runner, 10000):
-                return {"ok": False, "error": "stop timeout"}
-        primary = next((p for p in tab.project_meta.profiles if p.primary), None)
-        if not primary:
-            return {"ok": False, "error": "no run profile found"}
-        tab._start_profile(primary)
-        return {"ok": True}
+    if all_modules and tab._is_multi_module:
+        logs: dict[str, list[str]] = {}
+        for mod_name, _path, _port, _cls in tab.project_meta.spring_boot_modules:
+            lines = _iter_log_lines(tab.module_logs.get(mod_name), tail)
+            if errors:
+                lines = [line for line in lines if _looks_error_line(line)]
+            logs[mod_name] = lines
+        project_lines = _iter_log_lines(tab.log, tail)
+        if errors:
+            project_lines = [line for line in project_lines if _looks_error_line(line)]
+        return {"ok": True, "logs": logs, "project_lines": project_lines}
+
+    invalid = _validate_module(tab, module)
+    if invalid:
+        return invalid
+    lines = _iter_log_lines(_log_widget_for(tab, module), tail)
+    if errors:
+        lines = [line for line in lines if _looks_error_line(line)]
+    return {"ok": True, "lines": lines}
 
 
-def _wait_runner_stop(runner, timeout_ms: int) -> bool:
-    """阻塞等待 runner 停止。在 Qt 事件循环中用 processEvents 轮询。"""
-    from PySide6.QtCore import QCoreApplication, QEventLoop
-    deadline = time.time() + timeout_ms / 1000.0
-    while runner.is_running() and time.time() < deadline:
-        QCoreApplication.processEvents(QEventLoop.ProcessEventsFlag.AllEvents, 100)
-    return not runner.is_running()
+def _cmd_diagnose(tab, module: str | None, tail: int) -> dict:
+    invalid = _validate_module(tab, module)
+    if invalid:
+        return invalid
+    snapshot = _project_snapshot(tab)
+    target_states = snapshot["modules"]
+    if module:
+        target_states = [s for s in target_states if s.get("name") == module]
+    log_widget = _log_widget_for(tab, module)
+    lines = _iter_log_lines(log_widget, tail)
+    error_lines = [line for line in lines if _looks_error_line(line)]
+    diagnosis = ""
+    if log_widget is not None and hasattr(log_widget, "diagnosis_summary"):
+        diagnosis = log_widget.diagnosis_summary(max_chars=4000)
+    hints = []
+    for state in target_states:
+        if state.get("detail_state") == "running_external":
+            hints.append("服务由 mini-ide 外部进程占用，当前 IDE 没有完整启动日志；建议停止后由 mini-ide 重新启动。")
+        elif state.get("detail_state") == "stopped" and not lines:
+            hints.append("当前没有运行进程，也没有本次日志上下文。")
+        elif error_lines:
+            hints.append("近期日志包含错误关键字，请优先查看 error_lines。")
+    return {
+        "ok": True,
+        "project": {
+            "name": tab.project_meta.name,
+            "path": tab.project_meta.path,
+            "type": tab.project_meta.project_type,
+            "default_port": tab.project_meta.default_port,
+        },
+        "module": module,
+        "states": target_states,
+        "diagnosis": diagnosis,
+        "error_lines": error_lines[-80:],
+        "recent_lines": lines[-tail:],
+        "hints": list(dict.fromkeys(hints)),
+    }
 
 
-def _cmd_log(tab, module: str | None, tail: int) -> dict:
-    """获取最近 N 行日志。"""
-    from src.ui.project_tab import ProjectTab
-    tab: ProjectTab
-
-    log_widget = None
-    if tab._is_multi_module and module:
-        mod_names = [m[0] for m in tab.project_meta.spring_boot_modules]
-        if module not in mod_names:
-            return {"ok": False, "error": f"module not found: {module}"}
-        log_widget = tab.module_logs.get(module)
-    else:
-        log_widget = tab.log
-
-    if log_widget is None:
-        return {"lines": []}
-
-    doc = log_widget.edit.document()
-    total_blocks = doc.blockCount()
-    start = max(0, total_blocks - tail)
-    lines = []
-    block = doc.findBlockByNumber(start)
-    while block.isValid() and len(lines) < tail:
-        text = block.text()
-        if text:
-            lines.append(text)
-        block = block.next()
-    return {"lines": lines}
+def _cmd_git_status(tab) -> dict:
+    return git_context.summary_payload(tab.project_meta.path, include_files=True)
 
 
 def _get_health_markers(project_type: str) -> tuple[str, ...]:
@@ -509,7 +750,6 @@ def _get_health_markers(project_type: str) -> tuple[str, ...]:
 def _cmd_health_async(tab, module: str | None, timeout: int, sock: QLocalSocket) -> None:
     """异步等待模块启动完成，检测日志中的启动标记或端口监听。"""
     from src.ui.project_tab import ProjectTab
-    from src.core.process_runner import find_port_holder
     tab: ProjectTab
 
     start_time = time.time()
@@ -530,58 +770,45 @@ def _cmd_health_async(tab, module: str | None, timeout: int, sock: QLocalSocket)
             timer.deleteLater()
             return
 
-        # 检查日志中是否有启动标记
-        log_widget = None
-        if tab._is_multi_module and module:
-            log_widget = tab.module_logs.get(module)
-        else:
-            log_widget = tab.log
+        if tab._is_multi_module:
+            if module:
+                ok, detail = tab.service_controller.module_health_ok(module, markers)
+                if ok:
+                    elapsed_ms = int((time.time() - start_time) * 1000)
+                    payload = {"ok": True, "elapsed_ms": elapsed_ms}
+                    payload.update(detail)
+                    _send_response(sock, payload)
+                    timer.stop()
+                    timer.deleteLater()
+                    return
+            else:
+                details = []
+                all_ok = True
+                for mod_name, _path, _port, _cls in tab.project_meta.spring_boot_modules:
+                    ok, detail = tab.service_controller.module_health_ok(mod_name, markers)
+                    details.append(detail)
+                    all_ok = all_ok and ok
+                if details and all_ok:
+                    elapsed_ms = int((time.time() - start_time) * 1000)
+                    _send_response(sock, {
+                        "ok": True,
+                        "elapsed_ms": elapsed_ms,
+                        "modules": details,
+                    })
+                    timer.stop()
+                    timer.deleteLater()
+                    return
+            return
 
-        if log_widget:
-            doc = log_widget.edit.document()
-            # 只检查最近 50 行
-            total = doc.blockCount()
-            start = max(0, total - 50)
-            block = doc.findBlockByNumber(start)
-            while block.isValid():
-                text = block.text()
-                for m in markers:
-                    if m in text:
-                        elapsed_ms = int((time.time() - start_time) * 1000)
-                        _send_response(sock, {"ok": True, "elapsed_ms": elapsed_ms})
-                        timer.stop()
-                        timer.deleteLater()
-                        return
-                block = block.next()
-
-        # 检查端口监听（多模块）
-        if tab._is_multi_module and module:
-            if module in tab._module_ports:
-                elapsed_ms = int((time.time() - start_time) * 1000)
-                _send_response(sock, {"ok": True, "elapsed_ms": elapsed_ms})
-                timer.stop()
-                timer.deleteLater()
-                return
-            # 外部启动的进程：靠命令行匹配感知到也算健康
-            try:
-                external = tab._detect_external_modules()
-            except Exception:
-                external = {}
-            if module in external:
-                elapsed_ms = int((time.time() - start_time) * 1000)
-                _send_response(sock, {"ok": True, "elapsed_ms": elapsed_ms, "external": True})
-                timer.stop()
-                timer.deleteLater()
-                return
-        elif not tab._is_multi_module:
-            # 单模块：查端口快照（后台扫描器维护的全局快照，不阻塞）
-            default_port = tab.project_meta.default_port
-            if default_port and find_port_holder(default_port):
-                elapsed_ms = int((time.time() - start_time) * 1000)
-                _send_response(sock, {"ok": True, "elapsed_ms": elapsed_ms})
-                timer.stop()
-                timer.deleteLater()
-                return
+        ok, detail = tab.service_controller.single_project_health_ok(markers)
+        if ok:
+            elapsed_ms = int((time.time() - start_time) * 1000)
+            payload = {"ok": True, "elapsed_ms": elapsed_ms}
+            payload.update(detail)
+            _send_response(sock, payload)
+            timer.stop()
+            timer.deleteLater()
+            return
 
     timer = QTimer()
     timer.setInterval(100)
@@ -591,25 +818,68 @@ def _cmd_health_async(tab, module: str | None, timeout: int, sock: QLocalSocket)
     _check()
 
 
+def _active_modules(tab, module: str | None) -> list[str]:
+    return tab.service_controller.active_modules(module)
+
+
+def _target_modules(tab, module: str | None) -> list[str]:
+    return tab.service_controller.target_modules(module)
+
+
+def _cmd_ensure_running_async(
+    tab,
+    module: str | None,
+    timeout: int,
+    sock: QLocalSocket,
+) -> None:
+    invalid = _validate_module(tab, module)
+    if invalid:
+        _send_response(sock, invalid)
+        return
+    targets = _target_modules(tab, module)
+    active = set(_active_modules(tab, module))
+    already = all(name in active for name in targets)
+    if not already:
+        start_result = _cmd_start(tab, module)
+        if start_result.get("ok") is False and start_result.get("error") != "already running":
+            _send_response(sock, start_result)
+            return
+    _cmd_health_async(tab, module, timeout, sock)
+
+
+def _cmd_start_or_restart_wait_async(
+    tab,
+    action: str,
+    module: str | None,
+    timeout: int,
+    sock: QLocalSocket,
+) -> None:
+    invalid = _validate_module(tab, module)
+    if invalid:
+        _send_response(sock, invalid)
+        return
+    if action == "restart":
+        result = _cmd_restart(tab, module)
+    else:
+        result = _cmd_start(tab, module)
+    if result.get("ok") is False and result.get("error") != "already running":
+        _send_response(sock, result)
+        return
+    _cmd_health_async(tab, module, timeout, sock)
+
+
 def _cmd_compile_async(tab, sock: QLocalSocket, timeout: int = 300) -> None:
     """触发编译并等待完成。"""
     from src.ui.project_tab import ProjectTab
     tab: ProjectTab
 
-    compile_prof = tab._find_compile_profile()
-    if not compile_prof:
-        _send_response(sock, {"ok": False, "error": "no compile profile found"})
+    started = tab.service_controller.begin_compile()
+    if not started.get("ok"):
+        _send_response(sock, started)
         return
-
-    if tab.runner.is_running():
-        _send_response(sock, {"ok": False, "error": "another task is running"})
-        return
-
-    # 记录编译开始位置以便收集输出
-    doc = tab.log.edit.document()
-    start_block = doc.blockCount()
-
-    tab._start_profile(compile_prof)
+    runner = started["runner"]
+    doc = started["doc"]
+    start_block = started["start_block"]
 
     # 状态用 list 装，方便闭包改写；done 防止 finished 与超时重复响应
     state = {"done": False}
@@ -634,7 +904,7 @@ def _cmd_compile_async(tab, sock: QLocalSocket, timeout: int = 300) -> None:
         deadline_timer.stop()
         deadline_timer.deleteLater()
         try:
-            tab.runner.finished.disconnect(_on_finished)
+            runner.finished.disconnect(_on_finished)
         except (RuntimeError, TypeError):
             pass
         if sock.state() == QLocalSocket.LocalSocketState.ConnectedState:
@@ -649,7 +919,7 @@ def _cmd_compile_async(tab, sock: QLocalSocket, timeout: int = 300) -> None:
         # 超时：编译还在跑，返回超时（不强停编译，让它在 GUI 里继续）
         _finish({"ok": False, "error": "compile timeout", "output": _collect_output()})
 
-    tab.runner.finished.connect(_on_finished)
+    runner.finished.connect(_on_finished)
 
     deadline_timer = QTimer()
     deadline_timer.setSingleShot(True)

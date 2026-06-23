@@ -15,8 +15,13 @@ from PySide6.QtWidgets import (
     QStackedWidget, QTabWidget,
 )
 
-from src.core.config import AppConfig, ProjectEntry, WorkspaceEntry
+from src.core.config import AppConfig, ProjectEntry
 from src.core.project_detector import detect_project
+from src.core.service_state import STATE_RUNNING_EXTERNAL, STATE_RUNNING_MANAGED
+from src.core.workspace_manager import (
+    close_workspace_paths, ensure_workspace_candidates, mark_workspace_opened,
+    save_workspace,
+)
 from src.ui.empty_state import EmptyState
 from src.ui.project_tab import ProjectTab
 from src.util import app_log
@@ -161,7 +166,8 @@ class MainWindow(QMainWindow):
         self.workspace_menu.addAction(close_act)
         self.workspace_menu.addSeparator()
 
-        self._ensure_workspace_candidates()
+        if ensure_workspace_candidates(self.config):
+            self.config.save()
         if not self.config.workspaces:
             empty = QAction("(无工作区)", self)
             empty.setEnabled(False)
@@ -171,42 +177,6 @@ class MainWindow(QMainWindow):
             act = QAction(f"{ws.name}  ({len(ws.paths)} 项目)", self)
             act.triggered.connect(lambda _, name=ws.name: self.open_workspace(name))
             self.workspace_menu.addAction(act)
-
-    def _ensure_workspace_candidates(self) -> None:
-        groups: dict[str, list[str]] = {}
-        for p in self.config.recent_projects:
-            path = Path(p.path)
-            if not path.parent:
-                continue
-            parent = str(path.parent)
-            groups.setdefault(parent, []).append(p.path)
-        changed = False
-        for parent, paths in groups.items():
-            unique = []
-            for p in paths:
-                if p not in unique and Path(p).is_dir():
-                    unique.append(p)
-            if len(unique) < 2:
-                continue
-            if not self._looks_like_workspace_parent(unique):
-                continue
-            name = Path(parent).name
-            if self.config.find_workspace(name):
-                continue
-            self.config.upsert_workspace(WorkspaceEntry(
-                name=name, paths=unique, last_opened_at=0.0,
-            ))
-            changed = True
-        if changed:
-            self.config.save()
-
-    @staticmethod
-    def _looks_like_workspace_parent(paths: list[str]) -> bool:
-        names = {Path(p).name.lower() for p in paths}
-        has_backend = bool(names & {"server", "backend", "api"})
-        has_frontend = any(n.startswith("webapp") or n in {"frontend", "front", "ui"} for n in names)
-        has_gateway = "nginx" in names or "gateway" in names
-        return (has_backend and has_frontend) or (has_backend and has_gateway) or (has_frontend and has_gateway)
 
     def _save_current_tabs_as_workspace(self) -> None:
         paths = self._current_project_paths()
@@ -218,10 +188,7 @@ class MainWindow(QMainWindow):
         name = name.strip()
         if not ok or not name:
             return
-        self.config.upsert_workspace(WorkspaceEntry(
-            name=name, paths=paths, last_opened_at=time.time(),
-        ))
-        self.config.active_workspace_name = name
+        save_workspace(self.config, name, paths)
         self.config.save()
         self._rebuild_workspace_menu()
 
@@ -242,27 +209,17 @@ class MainWindow(QMainWindow):
         for path in ws.paths:
             if Path(path).is_dir() and self.open_project(path):
                 opened += 1
-        ws.last_opened_at = time.time()
-        self.config.active_workspace_name = name
-        self.config.upsert_workspace(ws)
+        mark_workspace_opened(self.config, ws)
         self.config.save()
         self._rebuild_workspace_menu()
         log.info("打开工作区: %s | %d/%d", name, opened, len(ws.paths))
 
     def _close_current_workspace(self) -> None:
-        current = self.config.active_workspace_name
-        paths: set[str]
-        if current and self.config.find_workspace(current):
-            paths = set(self.config.find_workspace(current).paths)  # type: ignore[union-attr]
-        else:
-            paths = set(self._current_project_paths())
+        paths = close_workspace_paths(self.config, self._current_project_paths())
         for i in range(self.tabs.count() - 1, -1, -1):
             w = self.tabs.widget(i)
             if isinstance(w, ProjectTab) and w.project_meta.path in paths:
                 self._close_tab(i)
-        self.config.active_workspace_name = ""
-        if self.config.startup_restore_mode == "workspace":
-            self.config.startup_restore_mode = "last_session"
         self.config.save()
         self._rebuild_workspace_menu()
 
@@ -312,11 +269,12 @@ class MainWindow(QMainWindow):
             return self.config.default_project_dir
         return str(Path.home())
 
-    def open_project(self, path: str) -> ProjectTab | None:
+    def open_project(self, path: str, quiet: bool = False) -> ProjectTab | None:
         p = Path(path)
         if not p.is_dir():
             log.warning("尝试打开无效路径: %s", path)
-            QMessageBox.warning(self, "路径无效", f"{path} 不是有效目录")
+            if not quiet:
+                QMessageBox.warning(self, "路径无效", f"{path} 不是有效目录")
             return None
 
         existing = self.find_tab_by_path(str(p))
@@ -328,7 +286,8 @@ class MainWindow(QMainWindow):
             meta = detect_project(str(p))
         except Exception:
             log.exception("项目识别失败: %s", p)
-            QMessageBox.warning(self, "识别失败", f"无法识别项目类型\n{p}")
+            if not quiet:
+                QMessageBox.warning(self, "识别失败", f"无法识别项目类型\n{p}")
             return None
         log.info("打开项目: %s | 类型=%s | port=%s | profiles=%s",
                  p, meta.project_type, meta.default_port, [x.name for x in meta.profiles])
@@ -371,6 +330,18 @@ class MainWindow(QMainWindow):
         self.tabs.removeTab(index)
         self._switch_view()
         self._save_tab_session()
+
+    def close_project_tab(self, tab: ProjectTab, quiet: bool = False) -> bool:
+        """CLI/GUI 共用的项目关闭入口；quiet=True 时不弹消息框。"""
+        idx = self.tabs.indexOf(tab)
+        if idx < 0:
+            return False
+        if not tab.request_close(confirm_running=not quiet, quiet=quiet):
+            return False
+        self.tabs.removeTab(idx)
+        self._switch_view()
+        self._save_tab_session()
+        return True
 
     # ---- 其他 ----
 
@@ -456,7 +427,10 @@ class MainWindow(QMainWindow):
         self._persist_tabs()
         self.config.save()
         if running:
-            kept = [x for x in running if not stop_running and x.get("state") == "running_external"]
+            kept = [
+                x for x in running
+                if not stop_running and x.get("state") == STATE_RUNNING_EXTERNAL
+            ]
             log.info(
                 "退出前服务处理：running=%d stop=%s kept_external=%d",
                 len(running), stop_running, len(kept),
@@ -480,13 +454,13 @@ class MainWindow(QMainWindow):
 
     def _confirm_close_with_services(self, items: list[dict]) -> str:
         """返回 stop / keep_external / cancel。"""
-        managed = [x for x in items if x.get("state") == "running_managed"]
-        external = [x for x in items if x.get("state") == "running_external"]
+        managed = [x for x in items if x.get("state") == STATE_RUNNING_MANAGED]
+        external = [x for x in items if x.get("state") == STATE_RUNNING_EXTERNAL]
         lines = []
         for item in items[:12]:
             port = f":{item.get('port')}" if item.get("port") else ""
             pid = f" PID {item.get('pid')}" if item.get("pid") else ""
-            label = "外部" if item.get("state") == "running_external" else "托管"
+            label = "外部" if item.get("state") == STATE_RUNNING_EXTERNAL else "托管"
             lines.append(
                 f"- [{label}] {item.get('project')} / {item.get('module')}{port}{pid}"
             )

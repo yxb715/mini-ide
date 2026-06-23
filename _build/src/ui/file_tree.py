@@ -6,9 +6,7 @@
 """
 from __future__ import annotations
 
-import shutil
 import subprocess
-import winreg
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QFile, QMimeData, QThread, QTimer, QUrl, Signal
@@ -22,6 +20,10 @@ from PySide6.QtWidgets import (
 from src.core.git_ops import (
     GIT_STATUS_ADDED, GIT_STATUS_CONFLICT, GIT_STATUS_DELETED,
     GIT_STATUS_MODIFIED, GIT_STATUS_UNTRACKED,
+)
+from src.core.file_actions import paste_paths
+from src.core.tool_launchers import (
+    CREATE_NO_WINDOW, open_in_cc_command, open_in_codex_args,
 )
 from src.ui.theme import (
     ACCENT_SUBTLE, BG_L2, BG_L4, FG_BRIGHT, FG_PRIMARY, GIT_ADD, GIT_CONFLICT,
@@ -69,106 +71,10 @@ QTreeWidget::branch:closed:has-children:has-siblings {{
 # 右键菜单"▶ 运行"显示的可执行脚本类型
 _RUNNABLE_SCRIPT_EXTS = {".bat", ".cmd", ".ps1", ".exe"}
 _CUT_MIME = "application/x-mini-ide-cut"
-_NO_WINDOW = 0x08000000  # CREATE_NO_WINDOW
 
 # 节点级 git 染色缓存：(color_hex, strikethrough, tooltip)，
 # 染色函数对比缓存值，相同则不调 setForeground/setFont/setToolTip，避免 viewport 误重绘
 _RENDER_CACHE_ROLE = Qt.ItemDataRole.UserRole + 2
-
-_CC_REGISTRY_COMMANDS = [
-    (winreg.HKEY_CURRENT_USER, r"Software\Classes\Directory\shell\Claude Code\command"),
-    (winreg.HKEY_CURRENT_USER, r"Software\Classes\Directory\Background\shell\Claude Code\command"),
-    (winreg.HKEY_CLASSES_ROOT, r"Directory\shell\Claude Code\command"),
-    (winreg.HKEY_CLASSES_ROOT, r"Directory\Background\shell\Claude Code\command"),
-]
-
-
-def _is_same_or_child(path: Path, parent: Path) -> bool:
-    try:
-        path_resolved = path.resolve()
-        parent_resolved = parent.resolve()
-    except OSError:
-        return False
-    if path_resolved == parent_resolved:
-        return True
-    try:
-        path_resolved.relative_to(parent_resolved)
-        return True
-    except ValueError:
-        return False
-
-
-def _copy_destination(target_dir: Path, src: Path) -> Path:
-    is_dir = src.is_dir()
-    base = src.name if is_dir else src.stem
-    suffix = "" if is_dir else src.suffix
-    candidate = target_dir / src.name
-    if not candidate.exists():
-        return candidate
-    candidate = target_dir / f"{base} - 副本{suffix}"
-    if not candidate.exists():
-        return candidate
-    index = 2
-    while True:
-        candidate = target_dir / f"{base} - 副本 {index}{suffix}"
-        if not candidate.exists():
-            return candidate
-        index += 1
-
-
-def _find_powershell() -> str:
-    for name in ("pwsh.exe", "pwsh", "powershell.exe", "powershell"):
-        found = shutil.which(name)
-        if found:
-            return found
-    return ""
-
-
-def _open_in_codex_args(target_dir: Path) -> list[str]:
-    """Build a portable Codex launcher for the current machine.
-
-    Do not reuse the Explorer registry command here: that command often embeds
-    a machine-local PowerShell path, which breaks when this project is copied to
-    another computer.
-    """
-    target = str(target_dir)
-    wt = shutil.which("wt.exe") or shutil.which("wt")
-    ps = _find_powershell()
-    if wt and ps:
-        return [wt, "-w", "0", "new-tab", "-d", target, ps, "-NoExit", "-NoLogo", "-Command", "codex"]
-
-    cmd = shutil.which("cmd.exe") or "cmd.exe"
-    if ps:
-        return [cmd, "/c", "start", "", "/D", target, ps, "-NoExit", "-NoLogo", "-Command", "codex"]
-    return [cmd, "/c", "start", "", "/D", target, cmd, "/k", "codex"]
-
-
-def _open_in_cc_command(target_dir: Path) -> str:
-    """返回打开 Claude Code 的启动命令（字符串，沿用注册表里现成的右键命令 / PowerShell 命令行）。"""
-    target = str(target_dir)
-    for hive, subkey in _CC_REGISTRY_COMMANDS:
-        try:
-            with winreg.OpenKey(hive, subkey) as key:
-                command, _kind = winreg.QueryValueEx(key, "")
-        except OSError:
-            continue
-        if command:
-            return command.replace("%1", target).replace("%V", target)
-
-    wt = shutil.which("wt.exe") or shutil.which("wt")
-    pwsh = shutil.which("pwsh.exe") or shutil.which("pwsh")
-    if wt and pwsh:
-        pwsh_name = Path(pwsh).name
-        return f'"{wt}" -d "{target}" {pwsh_name} -NoExit -Command claude'
-    ps = shutil.which("powershell.exe") or shutil.which("powershell")
-    if ps:
-        target_literal = "'" + target.replace("'", "''") + "'"
-        ps_command = f"Set-Location -LiteralPath {target_literal}; claude"
-        return (
-            f'"{ps}" -NoExit -NoLogo -NoProfile '
-            f'-ExecutionPolicy Bypass -Command "{ps_command}"'
-        )
-    return ""
 
 
 class _PasteWorker(QThread):
@@ -182,40 +88,7 @@ class _PasteWorker(QThread):
 
     def run(self) -> None:
         target_dir = Path(self._target_dir)
-        failed: list[str] = []
-        changed = 0
-        if not target_dir.exists() or not target_dir.is_dir():
-            self.done.emit(str(target_dir), changed, [f"目标目录不存在：{target_dir}"], self._move)
-            return
-        for raw in self._sources:
-            src = Path(raw)
-            if not src.exists():
-                failed.append(f"源路径不存在：{src}")
-                continue
-            try:
-                if src.is_dir():
-                    if _is_same_or_child(target_dir, src):
-                        failed.append(f"不能把目录粘贴到自身或子目录：{src}")
-                        continue
-                    if self._move:
-                        if src.parent.resolve() == target_dir.resolve():
-                            continue
-                        shutil.move(str(src), str(_copy_destination(target_dir, src)))
-                    else:
-                        shutil.copytree(src, _copy_destination(target_dir, src))
-                elif src.is_file():
-                    if self._move:
-                        if src.parent.resolve() == target_dir.resolve():
-                            continue
-                        shutil.move(str(src), str(_copy_destination(target_dir, src)))
-                    else:
-                        shutil.copy2(src, _copy_destination(target_dir, src))
-                else:
-                    failed.append(f"不支持的路径类型：{src}")
-                    continue
-                changed += 1
-            except OSError as e:
-                failed.append(f"{src}\n  {e}")
+        changed, failed = paste_paths([Path(raw) for raw in self._sources], target_dir, self._move)
         self.done.emit(str(target_dir), changed, failed, self._move)
 
 
@@ -1187,7 +1060,7 @@ class FileTree(QWidget):
 
     def _open_codex(self, target_dir: Path) -> None:
         """在当前目录打开 Codex，按当前电脑环境动态选择终端。"""
-        command = _open_in_codex_args(target_dir)
+        command = open_in_codex_args(target_dir)
         if not command:
             QMessageBox.warning(
                 self, "启动 codex 失败",
@@ -1198,7 +1071,7 @@ class FileTree(QWidget):
             subprocess.Popen(
                 command,
                 cwd=str(target_dir),
-                creationflags=_NO_WINDOW,
+                creationflags=CREATE_NO_WINDOW,
                 close_fds=True,
             )
         except OSError as e:
@@ -1206,7 +1079,7 @@ class FileTree(QWidget):
 
     def _open_cc(self, target_dir: Path) -> None:
         """在终端中打开 Claude Code (cc)。"""
-        command = _open_in_cc_command(target_dir)
+        command = open_in_cc_command(target_dir)
         if not command:
             QMessageBox.warning(
                 self, "启动 Claude Code 失败",
