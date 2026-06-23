@@ -74,6 +74,12 @@ class LogWidget(QWidget):
         self._log_file: Path | None = None
         self._persistent_fh = None
         self._last_diagnosis = ""
+        self._run_label = ""
+        self._run_started_at: float = 0.0
+        self._run_ended_at: float = 0.0
+        self._first_error = ""
+        self._ready_seen = False
+        self._external_running = False
 
         # 批量刷新：高吞吐日志（如 Gradle 初扫）会飙到 1000+行/秒，
         # 单行 insert 会卡主线程。把接收到的行先塞到队列，每 50ms 集中写入一次。
@@ -207,8 +213,16 @@ class LogWidget(QWidget):
         """一次运行开始：重置堆栈上下文并打开日志文件"""
         self.contentAdded.emit()
         self._ctx = lc.LineContext()
+        self._error_count = 0
+        self._warn_count = 0
         self._last_diagnosis = ""
         self._diagnosis_port = 0
+        self._run_label = label
+        self._run_started_at = time.time()
+        self._run_ended_at = 0.0
+        self._first_error = ""
+        self._ready_seen = False
+        self._external_running = False
         self.btn_port_diagnose.setVisible(False)
         self.diagnosis_bar.setVisible(False)
         self._close_log_file()
@@ -221,7 +235,63 @@ class LogWidget(QWidget):
             self._persistent_fh = None
 
     def end_run(self) -> None:
+        self._run_ended_at = time.time()
+        self._update_counts(None)
         self._close_log_file()
+
+    def mark_external_running(self, label: str, pid: int | None = None, port: int | None = None) -> None:
+        self._ctx = lc.LineContext()
+        self._error_count = 0
+        self._warn_count = 0
+        self._run_label = label
+        self._run_started_at = 0.0
+        self._run_ended_at = 0.0
+        self._first_error = ""
+        self._ready_seen = False
+        self._external_running = True
+        detail = f"{label} 正在 mini-ide 之外运行"
+        if pid:
+            detail += f"（PID {pid}"
+            if port:
+                detail += f"，端口 {port}"
+            detail += "）"
+        elif port:
+            detail += f"（端口 {port}）"
+        detail += "；当前 IDE 没有这次启动日志上下文。"
+        self._last_diagnosis = detail
+        self._diagnosis_port = 0
+        self.btn_port_diagnose.setVisible(False)
+        self._show_diagnosis(detail, 0)
+        self._update_counts(None)
+
+    def diagnosis_summary(self, max_chars: int = 4000) -> str:
+        status = "运行中" if self._run_started_at and not self._run_ended_at else "已结束"
+        if self._ready_seen:
+            status = "已启动"
+        if not self._run_started_at:
+            status = "无本次运行日志"
+        if self._external_running:
+            status = "外部运行（无当前 IDE 日志）"
+        lines = [
+            f"服务：{self._run_label or '(未知)'}",
+            f"状态：{status}",
+            f"错误数：{self._error_count}",
+            f"警告数：{self._warn_count}",
+        ]
+        if self._run_started_at:
+            lines.append(f"开始时间：{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(self._run_started_at))}")
+        if self._run_ended_at:
+            lines.append(f"结束时间：{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(self._run_ended_at))}")
+        if self._first_error:
+            lines.append(f"首条错误：{self._first_error}")
+        if self._last_diagnosis:
+            lines.append(f"诊断：{self._last_diagnosis}")
+        snippets = self.error_snippets(max_chars=max_chars)
+        if snippets:
+            lines.append("")
+            lines.append("关键日志：")
+            lines.append(snippets)
+        return "\n".join(lines)
 
     def _close_log_file(self) -> None:
         if self._persistent_fh:
@@ -276,8 +346,12 @@ class LogWidget(QWidget):
                 self._insert_block(display_line, meta, cls)
                 if cls.kind == "error" or cls.kind == "caused_by":
                     self._error_count += 1
+                    if not self._first_error:
+                        self._first_error = line
                 elif cls.kind == "warn":
                     self._warn_count += 1
+                if cls.kind == "startup_ready":
+                    self._ready_seen = True
                 if cls.diagnosis and cls.diagnosis != self._last_diagnosis:
                     self._last_diagnosis = cls.diagnosis
                     self._show_diagnosis(cls.diagnosis, cls.diagnosis_port)
@@ -309,6 +383,7 @@ class LogWidget(QWidget):
         self._warn_count = 0
         self._last_diagnosis = ""
         self._diagnosis_port = 0
+        self._external_running = False
         self.btn_port_diagnose.setVisible(False)
         self.diagnosis_bar.setVisible(False)
         self._update_counts(None)
@@ -448,6 +523,7 @@ class LogWidget(QWidget):
                     lambda p=j.path, ln=j.line, c=j.column: self.fileJumpRequested.emit(p, ln, c)
                 )
         menu.addSeparator()
+        menu.addAction("复制诊断给 AI", self._copy_diagnosis)
         menu.addAction("打开日志文件所在目录", self._open_log_dir)
         if self._log_file:
             menu.addAction("在默认编辑器打开完整日志", self._open_log_file)
@@ -463,6 +539,9 @@ class LogWidget(QWidget):
         if not txt:
             txt = self.error_snippets(max_chars=2000)
         QApplication.clipboard().setText(txt.replace("\u2029", "\n"))
+
+    def _copy_diagnosis(self) -> None:
+        QApplication.clipboard().setText(self.diagnosis_summary(max_chars=4000))
 
     def _open_log_dir(self) -> None:
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(LOG_DIR)))

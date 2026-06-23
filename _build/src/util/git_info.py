@@ -36,10 +36,10 @@ def _git(args: list[str], cwd: str) -> str:
     ).stdout
 
 
-def get_info(project_path: str) -> GitInfo | None:
+def get_info(project_path: str, changed_count: int | None = None) -> GitInfo | None:
     now = time.time()
     cached = _CACHE.get(project_path)
-    if cached and now - cached[0] < _TTL:
+    if changed_count is None and cached and now - cached[0] < _TTL:
         return cached[1]
 
     root = Path(project_path)
@@ -56,10 +56,13 @@ def get_info(project_path: str) -> GitInfo | None:
 
     try:
         branch = _git(["rev-parse", "--abbrev-ref", "HEAD"], str(root)).strip()
-        status = _git(["status", "--porcelain"], str(root))
-        status_lines = [ln for ln in status.splitlines() if ln.strip()]
-        dirty = bool(status_lines)
-        changed = len(status_lines)
+        if changed_count is None:
+            status = _git(["status", "--porcelain"], str(root))
+            status_lines = [ln for ln in status.splitlines() if ln.strip()]
+            changed = len(status_lines)
+        else:
+            changed = changed_count
+        dirty = changed > 0
         ahead = behind = 0
         try:
             cnt = _git(["rev-list", "--left-right", "--count", "@{u}...HEAD"], str(root)).strip()

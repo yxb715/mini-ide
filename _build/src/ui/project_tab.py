@@ -691,6 +691,19 @@ class ProjectTab(QWidget):
             if idx >= 0:
                 self.center_tabs.setCurrentIndex(idx)
                 return
+        pid = self._module_external_pids.get(module)
+        if pid is not None:
+            port = self._module_ports.get(module)
+            port_text = f"，端口 {port}" if port else ""
+            self.log.mark_external_running(module, pid=pid, port=port)
+            self.log.append_line(
+                "meta",
+                f"[提示] {module} 正在 mini-ide 之外运行（PID {pid}{port_text}）。"
+                "当前 IDE 没有这次启动的日志上下文；可停止后由 mini-ide 重新启动以接管日志。",
+            )
+            self._reveal_log_tab()
+            self.center_tabs.setCurrentWidget(self.log)
+            return
         # 模块还没启动过：提示用户先启动
         self.log.append_line(
             "meta",
@@ -787,6 +800,123 @@ class ProjectTab(QWidget):
 
     def _any_module_running(self) -> bool:
         return any(r.is_running() for r in self.module_runners.values())
+
+    def running_service_items(self, refresh_external: bool = True) -> list[dict]:
+        """返回当前项目仍在运行的服务/脚本清单，供退出检查和 CLI quit 复用。"""
+        items: list[dict] = []
+        if refresh_external and self._is_multi_module:
+            try:
+                self._detect_and_apply_external()
+            except Exception:
+                log.exception("刷新外部进程感知失败")
+
+        if self.runner.is_running():
+            pid = None
+            if self.runner._proc:
+                pid = int(self.runner._proc.processId())
+            items.append({
+                "project": self.project_meta.name,
+                "module": self.project_meta.name,
+                "kind": "project",
+                "state": "running_managed",
+                "source": "managed_runner",
+                "pid": pid if pid and pid > 0 else None,
+                "port": self.project_meta.default_port,
+                "reason": "当前 mini-ide 启动，日志上下文完整",
+            })
+
+        for mod_name, _path, expected_port, _cls in self.project_meta.spring_boot_modules:
+            runner = self.module_runners.get(mod_name)
+            if runner and runner.is_running():
+                pid = int(runner._proc.processId()) if runner._proc else None
+                items.append({
+                    "project": self.project_meta.name,
+                    "module": mod_name,
+                    "kind": "module",
+                    "state": "running_managed",
+                    "source": "managed_runner",
+                    "pid": pid if pid and pid > 0 else None,
+                    "port": self._module_ports.get(mod_name) or expected_port,
+                    "reason": "当前 mini-ide 启动，日志上下文完整",
+                })
+            elif mod_name in self._module_external_pids:
+                pid = self._module_external_pids.get(mod_name)
+                items.append({
+                    "project": self.project_meta.name,
+                    "module": mod_name,
+                    "kind": "module",
+                    "state": "running_external",
+                    "source": "external_detector",
+                    "pid": pid if pid and pid > 0 else None,
+                    "port": self._module_ports.get(mod_name) or expected_port,
+                    "reason": "外部进程，当前 IDE 没有启动日志上下文",
+                })
+
+        for key, runner in self._script_runners.items():
+            if not runner.is_running():
+                continue
+            pid = int(runner._proc.processId()) if runner._proc else None
+            items.append({
+                "project": self.project_meta.name,
+                "module": Path(key).name,
+                "kind": "script",
+                "state": "running_managed",
+                "source": "managed_runner",
+                "pid": pid if pid and pid > 0 else None,
+                "port": None,
+                "reason": "当前 mini-ide 启动的脚本进程",
+            })
+        return items
+
+    def stop_all_services(self, include_external: bool = True, silent: bool = True) -> int:
+        """停止当前项目内所有运行服务/脚本，返回发起停止的数量。"""
+        before = self.running_service_items(refresh_external=include_external)
+        count = 0
+        if self.runner.is_running():
+            self.runner.stop()
+            count += 1
+        if self._is_multi_module:
+            if include_external:
+                self._stop_all_modules(silent=silent)
+            else:
+                for runner in list(self.module_runners.values()):
+                    if runner.is_running():
+                        runner.stop()
+                        count += 1
+        for runner in list(self._script_runners.values()):
+            if runner.is_running():
+                runner.stop()
+                count += 1
+        if include_external:
+            count = max(count, len(before))
+        return count
+
+    def wait_services_stopped(self, timeout_ms: int = 12000) -> bool:
+        """等待当前项目托管/外部服务停止；超时返回 False。"""
+        import time
+        from PySide6.QtCore import QCoreApplication, QEventLoop
+
+        deadline = time.time() + timeout_ms / 1000.0
+        while time.time() < deadline:
+            active = False
+            if self.runner.state() in ("running", "stopping"):
+                active = True
+            if any(r.state() in ("running", "stopping") for r in self.module_runners.values()):
+                active = True
+            if any(r.state() in ("running", "stopping") for r in self._script_runners.values()):
+                active = True
+            try:
+                self._detect_and_apply_external()
+            except Exception:
+                log.exception("等待停止时刷新外部进程感知失败")
+            if self._module_external_pids:
+                active = True
+            if not active:
+                return True
+            QCoreApplication.processEvents(
+                QEventLoop.ProcessEventsFlag.AllEvents, 100,
+            )
+        return False
 
     # ---- 文件树「▶ 运行脚本」 ----
 
@@ -1005,6 +1135,7 @@ class ProjectTab(QWidget):
                             mod_name, STATE_RUNNING,
                             port=self._module_ports.get(mod_name),
                             elapsed_seconds=r.elapsed_seconds(),
+                            reason="当前 mini-ide 启动",
                         )
                     continue
                 # 非自管理：runner 处于 stopping 时不抢状态，交给状态机回调
@@ -1018,6 +1149,7 @@ class ProjectTab(QWidget):
                     if self.service_panel:
                         self.service_panel.update_state(
                             mod_name, STATE_RUNNING_EXTERNAL, port=port,
+                            pid=pid, reason="外部进程，当前 IDE 没有启动日志上下文",
                         )
                     continue
                 # 既非自管理也无外部进程：清掉外部标记，刷成 IDLE
@@ -1529,11 +1661,10 @@ class ProjectTab(QWidget):
         if not ok:
             self._show_preview(path, 0, 0)
 
-    def request_close(self) -> bool:
-        any_running = (self.runner.is_running()
-                       or self._any_module_running()
-                       or self._any_script_running())
-        if any_running:
+    def request_close(self, confirm_running: bool = True, stop_running: bool = True) -> bool:
+        running_items = self.running_service_items(refresh_external=True)
+        any_running = bool(running_items)
+        if any_running and confirm_running:
             ret = QMessageBox.question(
                 self, "项目正在运行",
                 f"{self.project_meta.name} 正在运行，关闭会停止所有进程。确认关闭？",
@@ -1561,15 +1692,15 @@ class ProjectTab(QWidget):
                 f"有 {len(failed_panes)} 个文件未能保存，已取消关闭项目。",
             )
             return False
-        if any_running:
-            if self.runner.is_running():
-                self.runner.stop()
-            for r in self.module_runners.values():
-                if r.is_running():
-                    r.stop()
-            for r in self._script_runners.values():
-                if r.is_running():
-                    r.stop()
+        if any_running and stop_running:
+            self.stop_all_services(include_external=True, silent=True)
+            if not self.wait_services_stopped():
+                QMessageBox.warning(
+                    self,
+                    "停止超时",
+                    f"{self.project_meta.name} 仍有服务未完全停止，已取消关闭。",
+                )
+                return False
         self._poll_timer.stop()
         self._fetch_timer.stop()
         self.indexer.stop()

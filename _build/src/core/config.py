@@ -47,8 +47,20 @@ class ProjectEntry:
 
 
 @dataclass
+class WorkspaceEntry:
+    """一组经常一起打开/关闭的项目"""
+    name: str
+    paths: list[str] = field(default_factory=list)
+    last_opened_at: float = 0.0
+
+
+@dataclass
 class AppConfig:
     recent_projects: list[ProjectEntry] = field(default_factory=list)
+    workspaces: list[WorkspaceEntry] = field(default_factory=list)
+    active_workspace_name: str = ""
+    # last_session：恢复上次 tab；workspace：恢复 active_workspace_name；none：不恢复
+    startup_restore_mode: str = "last_session"
     # 上次关闭时打开的 Tab，格式："project:<绝对路径>"
     active_tabs: list[str] = field(default_factory=list)
     active_tab_index: int = 0
@@ -86,10 +98,16 @@ class AppConfig:
             ProjectEntry(**{k: v for k, v in p.items() if k in entry_known})
             for p in raw.pop("recent_projects", [])
         ]
+        workspace_known = {f.name for f in fields(WorkspaceEntry)}
+        workspaces = [
+            WorkspaceEntry(**{k: v for k, v in w.items() if k in workspace_known})
+            for w in raw.pop("workspaces", [])
+        ]
         known = {f.name for f in fields(cls)}
         raw = {k: v for k, v in raw.items() if k in known}
         cfg = cls(**raw)
         cfg.recent_projects = recent
+        cfg.workspaces = workspaces
 
         # 老配置迁移：默认改成内置预览（用户反馈外部编辑器链路不符合预期）
         if cfg.file_open_mode == "auto":
@@ -117,3 +135,16 @@ class AppConfig:
 
     def find_project(self, path: str) -> ProjectEntry | None:
         return next((p for p in self.recent_projects if p.path == path), None)
+
+    def upsert_workspace(self, workspace: WorkspaceEntry) -> None:
+        paths: list[str] = []
+        for p in workspace.paths:
+            if p and p not in paths:
+                paths.append(p)
+        workspace.paths = paths
+        self.workspaces = [w for w in self.workspaces if w.name != workspace.name]
+        self.workspaces.insert(0, workspace)
+        self.workspaces = self.workspaces[:20]
+
+    def find_workspace(self, name: str) -> WorkspaceEntry | None:
+        return next((w for w in self.workspaces if w.name == name), None)

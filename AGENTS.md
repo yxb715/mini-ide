@@ -62,7 +62,10 @@ mini-ide.exe --log <project> [module] [--tail N]
 
 ## 工作流规则
 
-- **修改代码后必须重新打包**：跑 `_build\scripts\build.bat` 更新根目录 `mini-ide.exe` + `mini-ide-runtime\`（需先关闭正在运行的 mini-ide）
+- **修改代码后必须重新打包**：跑 `_build\scripts\build.bat` 更新根目录 `mini-ide.exe` + `mini-ide-runtime\`
+- **打包关闭 IDE 铁律**：重新打包前如果需要关闭正在运行的 mini-ide，必须先征得用户明确确认；没有用户同意，禁止自动关闭 mini-ide 或强杀进程。
+- **关闭 IDE 前先停服务铁律**：用户同意关闭 mini-ide 后，必须先通过 mini-ide 管理入口停止当前 IDE 中正在运行的所有服务，包括后端、前端、Python 等服务；确认服务都停掉后，才允许关闭 mini-ide 并继续打包。
+- **长期任务跟踪**：涉及状态可信度、工作区、安全退出、日志诊断、Git AI 上下文等中长期改造时，必须先看 `ROADMAP.md`，按其中任务拆分推进；每完成一项要更新文档状态，防止上下文压缩后丢失细节。
 - **冒烟测试**：改完代码先跑 `_smoke.py` 确认 30 模块 import + 0 hex hits
 - **禁止 hardcode 颜色**：所有颜色/圆角/间距从 `theme.py` token 拿
 - **子进程必须加 `CREATE_NO_WINDOW`**

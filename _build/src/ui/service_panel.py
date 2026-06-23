@@ -96,31 +96,56 @@ class _ServiceRow(QFrame):
         elif self._state == STATE_IDLE:
             self.startRequested.emit(self.module_name)
 
-    def set_state(self, state: str, port: int | None = None, elapsed_seconds: float = 0.0):
+    def set_state(
+        self, state: str, port: int | None = None, elapsed_seconds: float = 0.0,
+        pid: int | None = None, reason: str = "",
+    ):
         self._state = state
         # port 优先用本次传入的（启动后从日志抓的真实端口），否则用 application.yml 的默认值
         effective_port = port if port is not None else self.default_port
         port_str = f":{effective_port}" if effective_port else ""
-        # lbl_info 只显示端口号；运行/未启动/启动中/停止中一律靠左侧图标和右侧按钮表达，不放文字
-        self.lbl_info.setText(port_str)
+        detail = reason or ""
         if state == STATE_IDLE:
+            self.lbl_info.setText(port_str)
+            self.lbl_info.setStyleSheet(f"color:{FG_SECONDARY}; font-size:{FONT_PT_UI_SM}pt;")
             self.btn.setText("▶")
             self.btn.setToolTip(f"启动 {self.module_name}")
             self.btn.setEnabled(True)
             self.btn.setStyleSheet(_row_btn_qss(BORDER_SUBTLE, FG_DIM))
         elif state == STATE_STARTING:
+            self.lbl_info.setText(f"启动中 {port_str}".strip())
+            self.lbl_info.setStyleSheet(f"color:{COLOR_WARN}; font-size:{FONT_PT_UI_SM}pt;")
             self.btn.setText("◐")
             self.btn.setToolTip(f"{self.module_name} 正在启动")
             self.btn.setEnabled(False)
             self.btn.setStyleSheet(_row_btn_qss(COLOR_WARN, COLOR_WARN))
-        elif state in (STATE_RUNNING, STATE_RUNNING_EXTERNAL):
-            # 不分内部/外部：CLI 与界面操作的是同一个 mini-ide 实例，起来的服务一律
-            # 显示停止图标。外部进程（跨重启后靠端口感知到的）停止时仍走 kill pid。
+        elif state == STATE_RUNNING:
+            self.lbl_info.setText(f"运行 {port_str}".strip())
+            self.lbl_info.setStyleSheet(f"color:{COLOR_SUCCESS}; font-size:{FONT_PT_UI_SM}pt;")
             self.btn.setText("⏹")
-            self.btn.setToolTip(f"停止 {self.module_name}")
+            tip = f"{self.module_name} 由当前 mini-ide 启动，日志上下文完整。"
+            if effective_port:
+                tip += f"\n端口：{effective_port}"
+            self.btn.setToolTip(tip + "\n点击停止")
             self.btn.setEnabled(True)
             self.btn.setStyleSheet(_row_btn_qss(COLOR_SUCCESS, COLOR_SUCCESS))
+        elif state == STATE_RUNNING_EXTERNAL:
+            self.lbl_info.setText(f"外部 {port_str}".strip())
+            self.lbl_info.setStyleSheet(f"color:{COLOR_WARN}; font-size:{FONT_PT_UI_SM}pt;")
+            self.btn.setText("⏹")
+            tip = f"{self.module_name} 正在 mini-ide 之外运行，当前 IDE 没有启动日志上下文。"
+            if effective_port:
+                tip += f"\n端口：{effective_port}"
+            if pid:
+                tip += f"\nPID：{pid}"
+            if detail:
+                tip += f"\n{detail}"
+            self.btn.setToolTip(tip + "\n点击停止外部进程")
+            self.btn.setEnabled(True)
+            self.btn.setStyleSheet(_row_btn_qss(COLOR_WARN, COLOR_WARN))
         elif state == STATE_STOPPING:
+            self.lbl_info.setText(f"停止中 {port_str}".strip())
+            self.lbl_info.setStyleSheet(f"color:{COLOR_WARN}; font-size:{FONT_PT_UI_SM}pt;")
             self.btn.setText("◐")
             self.btn.setToolTip(f"{self.module_name} 正在停止")
             self.btn.setEnabled(False)
@@ -207,11 +232,14 @@ class ServicePanel(QWidget):
 
         root.addWidget(rows_wrap, 1)
 
-    def update_state(self, module: str, state: str,
-                     port: int | None = None, elapsed_seconds: float = 0.0) -> None:
+    def update_state(
+        self, module: str, state: str,
+        port: int | None = None, elapsed_seconds: float = 0.0,
+        pid: int | None = None, reason: str = "",
+    ) -> None:
         row = self._rows.get(module)
         if row:
-            row.set_state(state, port, elapsed_seconds)
+            row.set_state(state, port, elapsed_seconds, pid, reason)
         # 任意模块在 RUNNING/STARTING/外部运行 就允许「全部停止」
         any_active = any(
             r.current_state() in (STATE_RUNNING, STATE_RUNNING_EXTERNAL, STATE_STARTING)

@@ -11,11 +11,11 @@ from PySide6.QtGui import (
     QKeySequence, QShortcut,
 )
 from PySide6.QtWidgets import (
-    QApplication, QFileDialog, QLabel, QMainWindow, QMessageBox,
+    QApplication, QFileDialog, QInputDialog, QLabel, QMainWindow, QMessageBox,
     QStackedWidget, QTabWidget,
 )
 
-from src.core.config import AppConfig, ProjectEntry
+from src.core.config import AppConfig, ProjectEntry, WorkspaceEntry
 from src.core.project_detector import detect_project
 from src.ui.empty_state import EmptyState
 from src.ui.project_tab import ProjectTab
@@ -54,6 +54,8 @@ class MainWindow(QMainWindow):
         self.tabs.setTabsClosable(True)
         self.tabs.setMovable(True)
         self.tabs.tabCloseRequested.connect(self._close_tab)
+        self.tabs.tabBar().tabMoved.connect(lambda _from, _to: self._save_tab_session())
+        self.tabs.currentChanged.connect(lambda _index: self._save_tab_session())
         self.stack.addWidget(self.tabs)
 
         self._build_menu()
@@ -117,6 +119,8 @@ class MainWindow(QMainWindow):
 
         self.recent_menu = file_menu.addMenu("最近打开")
         self._rebuild_recent_menu()
+        self.workspace_menu = file_menu.addMenu("工作区")
+        self._rebuild_workspace_menu()
 
         file_menu.addSeparator()
         quit_act = QAction("退出", self)
@@ -146,6 +150,121 @@ class MainWindow(QMainWindow):
             empty_act = QAction("(无)", self)
             empty_act.setEnabled(False)
             self.recent_menu.addAction(empty_act)
+
+    def _rebuild_workspace_menu(self) -> None:
+        self.workspace_menu.clear()
+        save_act = QAction("保存当前 Tab 为工作区...", self)
+        save_act.triggered.connect(self._save_current_tabs_as_workspace)
+        self.workspace_menu.addAction(save_act)
+        close_act = QAction("关闭当前工作区", self)
+        close_act.triggered.connect(self._close_current_workspace)
+        self.workspace_menu.addAction(close_act)
+        self.workspace_menu.addSeparator()
+
+        self._ensure_workspace_candidates()
+        if not self.config.workspaces:
+            empty = QAction("(无工作区)", self)
+            empty.setEnabled(False)
+            self.workspace_menu.addAction(empty)
+            return
+        for ws in self.config.workspaces[:15]:
+            act = QAction(f"{ws.name}  ({len(ws.paths)} 项目)", self)
+            act.triggered.connect(lambda _, name=ws.name: self.open_workspace(name))
+            self.workspace_menu.addAction(act)
+
+    def _ensure_workspace_candidates(self) -> None:
+        groups: dict[str, list[str]] = {}
+        for p in self.config.recent_projects:
+            path = Path(p.path)
+            if not path.parent:
+                continue
+            parent = str(path.parent)
+            groups.setdefault(parent, []).append(p.path)
+        changed = False
+        for parent, paths in groups.items():
+            unique = []
+            for p in paths:
+                if p not in unique and Path(p).is_dir():
+                    unique.append(p)
+            if len(unique) < 2:
+                continue
+            if not self._looks_like_workspace_parent(unique):
+                continue
+            name = Path(parent).name
+            if self.config.find_workspace(name):
+                continue
+            self.config.upsert_workspace(WorkspaceEntry(
+                name=name, paths=unique, last_opened_at=0.0,
+            ))
+            changed = True
+        if changed:
+            self.config.save()
+
+    @staticmethod
+    def _looks_like_workspace_parent(paths: list[str]) -> bool:
+        names = {Path(p).name.lower() for p in paths}
+        has_backend = bool(names & {"server", "backend", "api"})
+        has_frontend = any(n.startswith("webapp") or n in {"frontend", "front", "ui"} for n in names)
+        has_gateway = "nginx" in names or "gateway" in names
+        return (has_backend and has_frontend) or (has_backend and has_gateway) or (has_frontend and has_gateway)
+
+    def _save_current_tabs_as_workspace(self) -> None:
+        paths = self._current_project_paths()
+        if not paths:
+            QMessageBox.information(self, "工作区", "当前没有打开的项目。")
+            return
+        default_name = Path(Path(paths[0]).parent).name if paths else "workspace"
+        name, ok = QInputDialog.getText(self, "保存工作区", "工作区名称：", text=default_name)
+        name = name.strip()
+        if not ok or not name:
+            return
+        self.config.upsert_workspace(WorkspaceEntry(
+            name=name, paths=paths, last_opened_at=time.time(),
+        ))
+        self.config.active_workspace_name = name
+        self.config.save()
+        self._rebuild_workspace_menu()
+
+    def _current_project_paths(self) -> list[str]:
+        paths: list[str] = []
+        for i in range(self.tabs.count()):
+            w = self.tabs.widget(i)
+            if isinstance(w, ProjectTab):
+                paths.append(w.project_meta.path)
+        return paths
+
+    def open_workspace(self, name: str) -> None:
+        ws = self.config.find_workspace(name)
+        if not ws:
+            QMessageBox.warning(self, "工作区", f"未找到工作区：{name}")
+            return
+        opened = 0
+        for path in ws.paths:
+            if Path(path).is_dir() and self.open_project(path):
+                opened += 1
+        ws.last_opened_at = time.time()
+        self.config.active_workspace_name = name
+        self.config.upsert_workspace(ws)
+        self.config.save()
+        self._rebuild_workspace_menu()
+        log.info("打开工作区: %s | %d/%d", name, opened, len(ws.paths))
+
+    def _close_current_workspace(self) -> None:
+        current = self.config.active_workspace_name
+        paths: set[str]
+        if current and self.config.find_workspace(current):
+            paths = set(self.config.find_workspace(current).paths)  # type: ignore[union-attr]
+        else:
+            paths = set(self._current_project_paths())
+        for i in range(self.tabs.count() - 1, -1, -1):
+            w = self.tabs.widget(i)
+            if isinstance(w, ProjectTab) and w.project_meta.path in paths:
+                self._close_tab(i)
+        self.config.active_workspace_name = ""
+        if self.config.startup_restore_mode == "workspace":
+            self.config.startup_restore_mode = "last_session"
+        self.config.save()
+        self._rebuild_workspace_menu()
 
     # ---- 状态栏 ----
 
@@ -227,7 +346,9 @@ class MainWindow(QMainWindow):
         self.tabs.setTabToolTip(idx, str(p))
         self.tabs.setCurrentIndex(idx)
         self._rebuild_recent_menu()
+        self._rebuild_workspace_menu()
         self._switch_view()
+        self._save_tab_session()
         return tab
 
     def find_tab_by_path(self, path: str):
@@ -249,6 +370,7 @@ class MainWindow(QMainWindow):
                 return
         self.tabs.removeTab(index)
         self._switch_view()
+        self._save_tab_session()
 
     # ---- 其他 ----
 
@@ -315,20 +437,92 @@ class MainWindow(QMainWindow):
                 break
 
     def closeEvent(self, e: QCloseEvent) -> None:
+        running = self._collect_running_services()
+        stop_running = True
+        if running:
+            choice = self._confirm_close_with_services(running)
+            if choice == "cancel":
+                e.ignore()
+                return
+            stop_running = choice == "stop"
+
         for i in range(self.tabs.count()):
             w = self.tabs.widget(i)
             if w and hasattr(w, "request_close"):
-                if not w.request_close():
+                if not w.request_close(confirm_running=False, stop_running=stop_running):
                     e.ignore()
                     return
         self._persist_geometry()
         self._persist_tabs()
         self.config.save()
+        if running:
+            kept = [x for x in running if not stop_running and x.get("state") == "running_external"]
+            log.info(
+                "退出前服务处理：running=%d stop=%s kept_external=%d",
+                len(running), stop_running, len(kept),
+            )
         super().closeEvent(e)
         # 强制退出进程：notify.py 创建的 QSystemTrayIcon 在一次系统通知后会
         # 永远持有，Qt 不会因为主窗口关闭而 quit，导致进程残留（pythonw.exe 一直在）。
         # 单实例机制看到残留进程又会把新启动转发给它，用户感觉"代码改了没生效"。
         QApplication.quit()
+
+    def _collect_running_services(self) -> list[dict]:
+        items: list[dict] = []
+        for i in range(self.tabs.count()):
+            w = self.tabs.widget(i)
+            if isinstance(w, ProjectTab):
+                try:
+                    items.extend(w.running_service_items(refresh_external=True))
+                except Exception:
+                    log.exception("收集运行服务失败: %s", w.project_meta.name)
+        return items
+
+    def _confirm_close_with_services(self, items: list[dict]) -> str:
+        """返回 stop / keep_external / cancel。"""
+        managed = [x for x in items if x.get("state") == "running_managed"]
+        external = [x for x in items if x.get("state") == "running_external"]
+        lines = []
+        for item in items[:12]:
+            port = f":{item.get('port')}" if item.get("port") else ""
+            pid = f" PID {item.get('pid')}" if item.get("pid") else ""
+            label = "外部" if item.get("state") == "running_external" else "托管"
+            lines.append(
+                f"- [{label}] {item.get('project')} / {item.get('module')}{port}{pid}"
+            )
+        if len(items) > 12:
+            lines.append(f"... 还有 {len(items) - 12} 个")
+        msg = (
+            "当前仍有服务在运行：\n\n"
+            + "\n".join(lines)
+            + "\n\n选择「全部停止后退出」会先停止这些服务；"
+        )
+        if external and not managed:
+            msg += "也可以选择「保留外部服务退出」。"
+        elif external and managed:
+            msg += "托管服务必须停止；外部服务如需保留，请先手动停止托管服务后再退出。"
+        else:
+            msg += "当前没有可保留的外部服务。"
+
+        box = QMessageBox(self)
+        box.setWindowTitle("退出前检查")
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setText(msg)
+        stop_btn = box.addButton("全部停止后退出", QMessageBox.ButtonRole.AcceptRole)
+        keep_btn = None
+        if external and not managed:
+            keep_btn = box.addButton("保留外部服务退出", QMessageBox.ButtonRole.DestructiveRole)
+        cancel_btn = box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(stop_btn)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is stop_btn:
+            return "stop"
+        if keep_btn is not None and clicked is keep_btn:
+            return "keep_external"
+        if clicked is cancel_btn:
+            return "cancel"
+        return "cancel"
 
     # ---- Tab 会话持久化 ----
 
@@ -343,9 +537,17 @@ class MainWindow(QMainWindow):
         self.config.active_tab_index = max(0, self.tabs.currentIndex())
         log.info("保存 Tab 会话: %d 个 (current=%d)", len(active), self.config.active_tab_index)
 
+    def _save_tab_session(self) -> None:
+        """Tab 增删、切换、拖动后立即保存，避免异常退出时恢复旧会话。"""
+        self._persist_tabs()
+        self.config.save()
+
     def _startup_finalize(self) -> None:
         """事件循环起来后的收尾：先恢复上次会话，再打开命令行传入的初始项目。"""
-        if self.config.restore_tabs_on_startup and self.config.active_tabs:
+        if self.config.startup_restore_mode == "workspace" and self.config.active_workspace_name:
+            self.open_workspace(self.config.active_workspace_name)
+        elif (self.config.startup_restore_mode == "last_session"
+              and self.config.restore_tabs_on_startup and self.config.active_tabs):
             self._restore_tabs()
         if self.pending_initial_project:
             self.open_project(self.pending_initial_project)

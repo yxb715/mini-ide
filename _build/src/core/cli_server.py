@@ -138,8 +138,8 @@ def _find_project_tab(window: "MainWindow", key: str):
 
 # ---- 命令实现 ----
 
-def _stop_tab_all(tab) -> int:
-    """停掉一个 ProjectTab 下所有运行中的服务，返回停掉的服务数。
+def _stop_tab_all(tab) -> tuple[int, bool]:
+    """停掉一个 ProjectTab 下所有运行中的服务，返回 (服务数, 是否全部停净)。
 
     覆盖三类进程，与关闭窗口时的清理保持一致：
       1. mini-ide 自己拉起的（单模块主 runner / 多模块 module_runners / 脚本 runner）
@@ -148,35 +148,11 @@ def _stop_tab_all(tab) -> int:
     """
     from src.ui.project_tab import ProjectTab
     tab: ProjectTab
-    count = 0
-
-    # 项目级任务（compile/clean 等）不属于多模块服务，但也由 ProjectTab 的主
-    # runner 管理；CLI quit 必须能清掉它，否则 compile 超时后会继续占着 GUI。
-    if tab.runner.is_running():
-        tab._stop()
-        count += 1
-
-    if tab._is_multi_module:
-        # 先刷新外部感知，让 _stop_all_modules 能把孤儿进程也算进去
-        try:
-            tab._detect_and_apply_external()
-        except Exception:
-            log.exception("刷新外部进程感知失败")
-        running = sum(1 for r in tab.module_runners.values() if r.is_running())
-        running += len(getattr(tab, "_module_external_pids", {}))
-        if running:
-            tab._stop_all_modules(silent=True)
-            count += running
-    else:
-        pass
-
-    # 文件树「▶ 运行脚本」起的进程（nginx/.bat 等），两类项目都可能有
-    for r in list(getattr(tab, "_script_runners", {}).values()):
-        if r.is_running():
-            r.stop()
-            count += 1
-
-    return count
+    count = tab.stop_all_services(include_external=True, silent=True)
+    stopped = True
+    if count:
+        stopped = tab.wait_services_stopped(timeout_ms=15000)
+    return count, stopped
 
 
 def _cmd_quit(window: "MainWindow") -> dict:
@@ -191,18 +167,40 @@ def _cmd_quit(window: "MainWindow") -> dict:
 
     stopped_total = 0
     projects = []
+    timed_out = []
     for i in range(window.tabs.count()):
         w = window.tabs.widget(i)
         if not isinstance(w, ProjectTab):
             continue
         try:
-            n = _stop_tab_all(w)
+            running_items = w.running_service_items(refresh_external=True)
+            n, stopped = _stop_tab_all(w)
         except Exception:
             log.exception("停止项目服务失败: %s", w.project_meta.name)
             n = 0
+            stopped = False
         if n:
-            projects.append({"name": w.project_meta.name, "stopped": n})
+            projects.append({
+                "name": w.project_meta.name,
+                "stopped": n,
+                "services": running_items,
+            })
             stopped_total += n
+        if not stopped:
+            timed_out.append({
+                "name": w.project_meta.name,
+                "services": running_items,
+            })
+
+    if timed_out:
+        log.warning("CLI quit：停止超时，取消退出；projects=%s", timed_out)
+        return {
+            "ok": False,
+            "error": "stop timeout",
+            "stopped": stopped_total,
+            "projects": projects,
+            "timed_out": timed_out,
+        }
 
     # 持久化窗口几何 + Tab 会话，下次启动能恢复（与 closeEvent 行为一致）
     try:
@@ -212,7 +210,7 @@ def _cmd_quit(window: "MainWindow") -> dict:
     except Exception:
         log.exception("退出前持久化失败")
 
-    log.info("CLI quit：停止 %d 个服务，准备退出", stopped_total)
+    log.info("CLI quit：停止 %d 个服务，准备退出；projects=%s", stopped_total, projects)
     # 延迟退出，确保响应已写回客户端
     QTimer.singleShot(300, QApplication.quit)
     return {"ok": True, "stopped": stopped_total, "projects": projects}
@@ -239,35 +237,84 @@ def _cmd_list_modules(tab) -> list:
     from src.ui.project_tab import ProjectTab
     tab: ProjectTab
     modules = []
+    checked_at = int(time.time())
+    try:
+        tab._detect_and_apply_external()
+    except Exception:
+        log.exception("刷新外部进程感知失败")
     external = getattr(tab, "_module_external_pids", {})
-    for mod_name, _path, _port, _cls in tab.project_meta.spring_boot_modules:
+    ports = getattr(tab, "_module_ports", {})
+    for mod_name, _path, expected_port, _cls in tab.project_meta.spring_boot_modules:
         runner = tab.module_runners.get(mod_name)
-        state = runner.state() if runner else "stopped"
         pid = None
-        running = False
+        port = ports.get(mod_name) or None
+        log_attached = mod_name in tab.module_logs
+        source = "none"
+        detail_state = "stopped"
+        reason = "未检测到运行进程"
         if runner and runner.is_running() and runner._proc:
             pid = runner._proc.processId()
-            running = True
+            detail_state = "running_managed"
+            source = "managed_runner"
+            reason = "当前 mini-ide 启动，日志上下文完整"
         elif mod_name in external:
             # 外部启动（AI / 终端 / IDE）的进程，按命令行感知到
             pid = external[mod_name]
-            running = True
+            detail_state = "running_external"
+            source = "external_detector"
+            reason = "外部进程，当前 IDE 没有启动日志上下文"
+            log_attached = False
+        elif runner and runner.state() == "stopping":
+            detail_state = "stopping"
+            source = "managed_runner"
+            reason = "正在停止"
+        elif runner and runner.state() == "running":
+            detail_state = "running_managed"
+            source = "managed_runner"
+            reason = "当前 mini-ide 启动，日志上下文完整"
         modules.append({
             "name": mod_name,
-            "state": "running" if running else "stopped",
-            "external": mod_name in external and not (runner and runner.is_running()),
+            # 兼容旧协议：旧客户端只认 running/stopped。
+            "state": "running" if detail_state in ("running_managed", "running_external") else "stopped",
+            "detail_state": detail_state,
+            "source": source,
+            "external": detail_state == "running_external",
             "pid": pid if pid and pid > 0 else None,
+            "port": port,
+            "expected_port": expected_port if isinstance(expected_port, int) else None,
+            "log_attached": log_attached,
+            "checked_at": checked_at,
+            "reason": reason,
         })
     # 单模块项目没有 spring_boot_modules，返回主 runner 状态
     if not modules:
-        state = tab.runner.state()
+        runner_state = tab.runner.state()
         pid = None
+        detail_state = "stopped"
+        source = "none"
+        reason = "未检测到运行进程"
+        if runner_state == "running":
+            detail_state = "running_managed"
+            source = "managed_runner"
+            reason = "当前 mini-ide 启动，日志上下文完整"
+        elif runner_state == "stopping":
+            detail_state = "stopping"
+            source = "managed_runner"
+            reason = "正在停止"
         if tab.runner.is_running() and tab.runner._proc:
             pid = tab.runner._proc.processId()
         modules.append({
             "name": tab.project_meta.name,
-            "state": "running" if state == "running" else "stopped",
+            "state": "running" if detail_state == "running_managed" else "stopped",
+            "detail_state": detail_state,
+            "source": source,
+            "external": False,
             "pid": pid if pid and pid > 0 else None,
+            "port": tab.project_meta.default_port,
+            "expected_port": tab.project_meta.default_port,
+            "log_attached": detail_state == "running_managed",
+            "checked_at": checked_at,
+            "reason": reason,
         })
     return modules
 

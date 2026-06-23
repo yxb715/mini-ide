@@ -86,5 +86,7 @@ class GitStatusWorker(QThread):
         statuses = file_status_map(self.cwd, files=changed)
         ignored = list_ignored_files(self.cwd)
         deleted = list_deleted_paths(self.cwd, files=changed)
-        info = git_info.get_info(self.cwd)
+        # 状态栏改动数必须复用本轮新查到的 git status 结果，避免短缓存让
+        # 外层显示"有改动"而 GitViewer 重新查询后显示干净。
+        info = git_info.get_info(self.cwd, changed_count=len(changed))
         self.done.emit(statuses, ignored, deleted, info)
