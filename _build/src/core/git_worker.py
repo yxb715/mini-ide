@@ -39,6 +39,38 @@ class GitCheckoutWorker(QThread):
         self.done.emit(ok, msg)
 
 
+class GitCheckoutRemoteWorker(QThread):
+    """后台切到远程分支。done(ok, error_msg)"""
+
+    done = Signal(bool, str)
+
+    def __init__(self, cwd: str, remote_branch: str, parent=None):
+        super().__init__(parent)
+        self.cwd = cwd
+        self.remote_branch = remote_branch
+
+    def run(self) -> None:
+        from src.core.git_ops import git_checkout_remote_branch
+        ok, msg = git_checkout_remote_branch(self.cwd, self.remote_branch)
+        self.done.emit(ok, msg)
+
+
+class GitDeleteLocalBranchWorker(QThread):
+    """后台安全删除本地分支。done(ok, msg)"""
+
+    done = Signal(bool, str)
+
+    def __init__(self, cwd: str, branch: str, parent=None):
+        super().__init__(parent)
+        self.cwd = cwd
+        self.branch = branch
+
+    def run(self) -> None:
+        from src.core.git_ops import git_delete_local_branch
+        ok, msg = git_delete_local_branch(self.cwd, self.branch)
+        self.done.emit(ok, msg)
+
+
 class GitMergePushWorker(QThread):
     """后台执行 fetch + merge 远程分支 + push。done(ok, msg)"""
 

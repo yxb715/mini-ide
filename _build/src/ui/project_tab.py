@@ -19,7 +19,8 @@ from PySide6.QtWidgets import (
 from src.core.config import AppConfig, ProjectEntry
 from src.core.file_index import FileIndexer
 from src.core.git_worker import (
-    GitCheckoutWorker, GitFetchWorker, GitMergePushWorker, GitStatusWorker,
+    GitCheckoutRemoteWorker, GitCheckoutWorker, GitDeleteLocalBranchWorker,
+    GitFetchWorker, GitMergePushWorker, GitStatusWorker,
 )
 from src.core.process_runner import ProcessRunner, RunContext
 from src.core.project_detector import ProjectMeta, RunProfile
@@ -80,10 +81,10 @@ def _status_btn_base_qss() -> str:
 
 
 class _BranchMenu(QMenu):
-    """分支下拉菜单：点击本地分支切换，右键复制分支名。"""
+    """分支下拉菜单：点击本地分支切换，右键做分支操作。"""
 
-    switchRequested = Signal(str)
-    mergeRequested = Signal()
+    localDeleteRequested = Signal(str)
+    remoteCheckoutRequested = Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -94,14 +95,32 @@ class _BranchMenu(QMenu):
 
     def contextMenuEvent(self, event):  # type: ignore[override]
         action = self.actionAt(event.pos())
-        branch = action.data() if action is not None else None
+        data = action.data() if action is not None else None
+        kind = "copy"
+        branch = ""
+        if isinstance(data, tuple) and len(data) == 2:
+            kind, branch = data
+        elif isinstance(data, str):
+            branch = data
         if not branch:
             super().contextMenuEvent(event)
             return
         ctx = QMenu(self)
-        copy_act = ctx.addAction("📋 复制分支名")
+        checkout_act = None
+        delete_act = None
+        if kind == "remote":
+            checkout_act = ctx.addAction("切到这个分支")
+            ctx.addSeparator()
+        if kind == "local" and branch != self._current_branch:
+            delete_act = ctx.addAction("删除本地分支")
+            ctx.addSeparator()
+        copy_act = ctx.addAction("复制分支名")
         chosen = ctx.exec(event.globalPos())
-        if chosen is copy_act:
+        if chosen is checkout_act:
+            self.remoteCheckoutRequested.emit(branch)
+        elif chosen is delete_act:
+            self.localDeleteRequested.emit(branch)
+        elif chosen is copy_act:
             QApplication.clipboard().setText(branch)
         event.accept()
 
@@ -179,6 +198,8 @@ class ProjectTab(QWidget):
         self._pending_restart: RunProfile | None = None
         self._git_fetch_worker: GitFetchWorker | None = None
         self._git_checkout_worker: GitCheckoutWorker | None = None
+        self._git_checkout_remote_worker: GitCheckoutRemoteWorker | None = None
+        self._git_delete_branch_worker: GitDeleteLocalBranchWorker | None = None
         self._git_merge_worker: GitMergePushWorker | None = None
         self._git_status_worker: GitStatusWorker | None = None
         self._git_viewer = None
@@ -366,6 +387,8 @@ class ProjectTab(QWidget):
         )
         self._branch_menu = _BranchMenu(self.btn_branch)
         self._branch_menu.aboutToShow.connect(self._populate_branch_menu)
+        self._branch_menu.localDeleteRequested.connect(self._do_delete_local_branch)
+        self._branch_menu.remoteCheckoutRequested.connect(self._do_checkout_remote_branch)
         self.btn_branch.setMenu(self._branch_menu)
         self.btn_branch.setVisible(False)   # 没有 git 信息时隐藏
         lay.addWidget(self.btn_branch)
@@ -1600,16 +1623,16 @@ class ProjectTab(QWidget):
 
         if cur:
             act = menu.addAction(f"📋 复制当前分支：{cur}")
-            act.setData(cur)
+            act.setData(("copy", cur))
             act.triggered.connect(lambda _=False, br=cur: QApplication.clipboard().setText(br))
             menu.addSeparator()
         if local:
-            head = menu.addAction("本地分支（点击切换 / 右键复制）")
+            head = menu.addAction("本地分支（点击切换 / 右键操作）")
             head.setEnabled(False)
             for b in local:
                 label = ("● " if b == cur else "    ") + b
                 act = menu.addAction(label)
-                act.setData(b)
+                act.setData(("local", b))
                 if b == cur:
                     act.setEnabled(False)
                 else:
@@ -1617,11 +1640,11 @@ class ProjectTab(QWidget):
         menu.addSeparator()
         menu.addAction("🔄 刷新远程分支", self._manual_fetch_remote)
         if remote:
-            head = menu.addAction("远程分支（右键复制）")
+            head = menu.addAction("远程分支（右键切换 / 复制）")
             head.setEnabled(False)
             for b in remote:
                 act = menu.addAction("    " + b)
-                act.setData(b)
+                act.setData(("remote", b))
                 act.triggered.connect(lambda _=False, br=b: QApplication.clipboard().setText(br))
 
     def _manual_fetch_remote(self) -> None:
@@ -1699,6 +1722,64 @@ class ProjectTab(QWidget):
             notify.notify_success("分支已切换", f"当前分支：{branch}")
         else:
             QMessageBox.warning(self, "切换失败", msg)
+
+    def _do_checkout_remote_branch(self, remote_branch: str) -> None:
+        from src.core.git_ops import is_dirty
+        path = self.project_meta.path
+        if is_dirty(path):
+            ret = QMessageBox.question(
+                self, "切换分支",
+                f"本地有未提交的改动，仍要切换到 {remote_branch} 吗？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if ret != QMessageBox.StandardButton.Yes:
+                return
+        if self._git_checkout_remote_worker and self._git_checkout_remote_worker.isRunning():
+            return
+        self._git_checkout_remote_worker = GitCheckoutRemoteWorker(path, remote_branch, parent=self)
+        self._git_checkout_remote_worker.done.connect(self._on_checkout_remote_done)
+        self._git_checkout_remote_worker.finished.connect(self._git_checkout_remote_worker.deleteLater)
+        self._git_checkout_remote_worker.start()
+
+    def _on_checkout_remote_done(self, ok: bool, msg: str) -> None:
+        if self.sender() is self._git_checkout_remote_worker:
+            self._git_checkout_remote_worker = None
+        git_info.invalidate(self.project_meta.path)
+        self._refresh_status_row()
+        if ok:
+            info = git_info.get_info(self.project_meta.path)
+            branch = info.branch if info else ""
+            notify.notify_success("分支已切换", f"当前分支：{branch}")
+        else:
+            QMessageBox.warning(self, "切换失败", msg)
+
+    def _do_delete_local_branch(self, branch: str) -> None:
+        ret = QMessageBox.question(
+            self, "删除本地分支",
+            f"确定删除本地分支 {branch} 吗？\n\n未合并的分支不会被强制删除。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if ret != QMessageBox.StandardButton.Yes:
+            return
+        if self._git_delete_branch_worker and self._git_delete_branch_worker.isRunning():
+            return
+        path = self.project_meta.path
+        self._git_delete_branch_worker = GitDeleteLocalBranchWorker(path, branch, parent=self)
+        self._git_delete_branch_worker.done.connect(self._on_delete_local_branch_done)
+        self._git_delete_branch_worker.finished.connect(self._git_delete_branch_worker.deleteLater)
+        self._git_delete_branch_worker.start()
+
+    def _on_delete_local_branch_done(self, ok: bool, msg: str) -> None:
+        if self.sender() is self._git_delete_branch_worker:
+            self._git_delete_branch_worker = None
+        git_info.invalidate(self.project_meta.path)
+        self._refresh_status_row()
+        if ok:
+            notify.notify_success("本地分支已删除", msg)
+        else:
+            QMessageBox.warning(self, "删除失败", msg)
 
     def _show_merge_dialog(self) -> None:
         from src.core.git_ops import current_branch, list_remote_branches
@@ -1806,7 +1887,8 @@ class ProjectTab(QWidget):
         # GC 销毁，若某 QThread 仍在运行会触发「QThread destroyed while still
         # running」崩溃。都很短命，给个短超时等一下即可。
         for w in (self._git_status_worker, self._git_fetch_worker,
-                  self._git_checkout_worker, self._git_merge_worker):
+                  self._git_checkout_worker, self._git_checkout_remote_worker,
+                  self._git_delete_branch_worker, self._git_merge_worker):
             if w is not None and w.isRunning():
                 w.wait(2000)
         return True

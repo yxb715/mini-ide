@@ -280,6 +280,52 @@ def git_checkout(cwd: str, branch: str) -> tuple[bool, str]:
     return False, (err or out).strip()
 
 
+def _local_name_from_remote(remote_branch: str) -> str:
+    if "/" not in remote_branch:
+        return ""
+    return remote_branch.split("/", 1)[1].strip()
+
+
+def git_checkout_remote_branch(cwd: str, remote_branch: str) -> tuple[bool, str]:
+    """切到远程分支：本地已有同名分支就切过去，否则创建跟踪分支。"""
+    remote_branch = remote_branch.strip()
+    local_branch = _local_name_from_remote(remote_branch)
+    if not local_branch:
+        return False, f"远程分支名不正确：{remote_branch}"
+
+    data = list_branches(cwd)
+    if remote_branch not in data["remote"]:
+        return False, f"没有找到远程分支：{remote_branch}"
+
+    if local_branch in data["local"]:
+        return git_checkout(cwd, local_branch)
+
+    rc, out, err = _run(["checkout", "--track", "-b", local_branch, remote_branch], cwd, timeout=30)
+    if rc == 0:
+        return True, ""
+    return False, (err or out).strip()
+
+
+def git_delete_local_branch(cwd: str, branch: str) -> tuple[bool, str]:
+    """安全删除本地分支。使用 -d，不强删未合并分支。"""
+    branch = branch.strip()
+    if not branch:
+        return False, "分支名为空。"
+
+    cur = current_branch(cwd)
+    if branch == cur:
+        return False, "不能删除当前正在使用的分支。"
+
+    data = list_branches(cwd, include_remote=False)
+    if branch not in data["local"]:
+        return False, f"没有找到本地分支：{branch}"
+
+    rc, out, err = _run(["branch", "-d", branch], cwd, timeout=30)
+    if rc == 0:
+        return True, (out or f"已删除本地分支：{branch}").strip()
+    return False, (err or out).strip()
+
+
 def git_merge_remote_branch(cwd: str, remote_branch: str) -> tuple[bool, str]:
     """fetch + merge 远程分支到当前分支 + push。返回 (成功, 结果信息)。
     remote_branch 格式如 'origin/main'。
