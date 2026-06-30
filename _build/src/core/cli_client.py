@@ -96,10 +96,18 @@ def _safe_write(stream, text: str) -> None:
             stream.write(text)
             stream.flush()
             return
-    except OSError:
+    except Exception:
         pass
     kind = _STD_ERROR_HANDLE if stream is sys.stderr else _STD_OUTPUT_HANDLE
-    _win_write_std(kind, text)
+    if _win_write_std(kind, text):
+        return
+    try:
+        if stream and hasattr(stream, "write"):
+            safe_text = text.encode("ascii", errors="backslashreplace").decode("ascii")
+            stream.write(safe_text)
+            stream.flush()
+    except Exception:
+        pass
 
 
 def _attach_console():

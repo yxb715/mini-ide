@@ -12,8 +12,26 @@ def _is_cli_mode() -> bool:
 
 
 if _is_cli_mode():
-    from src.core.cli_client import run_cli
-    sys.exit(run_cli(sys.argv))
+    try:
+        from src.core.cli_client import run_cli
+        sys.exit(run_cli(sys.argv))
+    except SystemExit:
+        raise
+    except Exception as e:
+        try:
+            import json
+            from src.core.cli_client import _safe_write
+
+            _safe_write(
+                sys.stderr,
+                json.dumps(
+                    {"ok": False, "error": f"cli failed: {type(e).__name__}: {e}"},
+                    ensure_ascii=True,
+                ) + "\n",
+            )
+        except Exception:
+            pass
+        sys.exit(1)
 
 
 from PySide6.QtWidgets import QApplication

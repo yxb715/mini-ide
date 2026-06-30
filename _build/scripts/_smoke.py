@@ -141,6 +141,49 @@ def cli_parse_check() -> list[str]:
     return failed
 
 
+def cli_output_encoding_check() -> list[str]:
+    """验证 CLI 输出中文时不会被 Windows 英文代码页打崩。"""
+    from src.core import cli_client
+
+    class AsciiOnlyStream:
+        def __init__(self) -> None:
+            self.parts: list[str] = []
+            self.fail_next = True
+
+        def write(self, text: str) -> None:
+            if self.fail_next:
+                self.fail_next = False
+                text.encode("cp1252")
+            text.encode("ascii")
+            self.parts.append(text)
+
+        def flush(self) -> None:
+            pass
+
+    failed: list[str] = []
+    stream = AsciiOnlyStream()
+    original_win_write = cli_client._win_write_std
+    cli_client._win_write_std = lambda kind, text: False
+    try:
+        cli_client._safe_write(stream, '{"ok": true, "message": "中文✅"}\n')
+    except UnicodeEncodeError as e:
+        failed.append(f"_safe_write should swallow UnicodeEncodeError, got {e!r}")
+    except Exception as e:
+        failed.append(f"_safe_write should not raise, got {type(e).__name__}: {e}")
+    finally:
+        cli_client._win_write_std = original_win_write
+
+    if not stream.parts:
+        failed.append("_safe_write should fall back to escaped ASCII text")
+
+    if failed:
+        for msg in failed:
+            print(f"[FAIL] cli_output_encoding: {msg}", flush=True)
+    else:
+        print("[OK]   cli_output_encoding fallback", flush=True)
+    return failed
+
+
 def file_action_check() -> list[str]:
     """验证文件树粘贴命名和安全边界的纯逻辑。"""
     import tempfile
@@ -280,6 +323,7 @@ if __name__ == "__main__":
     failed = import_check()
     model_failed = service_state_check()
     cli_failed = cli_parse_check()
+    cli_encoding_failed = cli_output_encoding_check()
     file_failed = file_action_check()
     preview_failed = file_preview_model_check()
     git_failed = git_context_check()
@@ -299,7 +343,8 @@ if __name__ == "__main__":
 
     total_fail = (
         len(failed) + len(model_failed) + len(cli_failed)
-        + len(file_failed) + len(preview_failed) + len(git_failed) + len(hex_hits)
+        + len(cli_encoding_failed) + len(file_failed) + len(preview_failed)
+        + len(git_failed) + len(hex_hits)
     )
     print()
     print(f"Result: imports {len(modules) - len(failed)}/{len(modules)}, "
