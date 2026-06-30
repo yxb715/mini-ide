@@ -528,9 +528,14 @@ class MainWindow(QMainWindow):
 
     def activate_and_open(self, path: str | None) -> None:
         """单实例 IPC 入口：老实例收到新请求后的响应。"""
+        from PySide6.QtCore import Qt
         if path:
             self.open_project(path)
-        self.showNormal()
+        # 只清掉「最小化」标志把窗口唤回前台，不能无脑 showNormal——
+        # 那会把最大化的窗口一并降级成普通大小（用户从空目录右键 open ide
+        # 时窗口突然缩小就是这么来的）。最大化/普通状态原样保留。
+        if self.isMinimized():
+            self.setWindowState(self.windowState() & ~Qt.WindowState.WindowMinimized)
         self.raise_()
         self.activateWindow()
 
