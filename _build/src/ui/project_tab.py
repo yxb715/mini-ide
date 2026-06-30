@@ -788,8 +788,8 @@ class ProjectTab(QWidget):
         self._module_current.pop(module, None)
         if exit_code not in (0, -1):
             notify.notify_error(
-                f"✗ {self.project_meta.name} / {module} 退出",
-                f"退出码 {exit_code}",
+                f"{self.project_meta.name} / {module} 异常停止",
+                f"服务非正常退出（错误码 {exit_code}），点日志查看原因",
             )
         # 如果是"关 tab 触发的停止"，在这里把 tab 真正移除
         if module in self._closing_modules:
@@ -1191,16 +1191,16 @@ class ProjectTab(QWidget):
                 self._pending_after_compile = None
                 self.log.append_line("stderr", "[已取消] 编译失败，跳过启动")
                 notify.notify_error(
-                    f"✗ {self.project_meta.name} 编译失败",
-                    "点击日志查看错误详情；已取消后续启动",
+                    f"{self.project_meta.name} 编译失败",
+                    "已取消启动，点日志查看错误详情",
                 )
                 return
 
         # 运行任务异常退出
         if prof and prof.kind == "run" and exit_code not in (0, -1):
             notify.notify_error(
-                f"✗ {self.project_meta.name} 退出",
-                f"退出码 {exit_code}，查看日志定位原因",
+                f"{self.project_meta.name} 异常停止",
+                f"服务非正常退出（错误码 {exit_code}），点日志查看原因",
             )
         self._startup_phase_marked = False
 

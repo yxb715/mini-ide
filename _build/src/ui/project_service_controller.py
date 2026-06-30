@@ -148,10 +148,14 @@ class ProjectServiceController:
         return {"ok": True}
 
     def wait_runner_stop(self, runner, timeout_ms: int) -> bool:
+        # 必须等进程真正退出（状态回到 idle）才算停好，不能一离开 running 就返回。
+        # stop() 会先把状态置为 stopping、再到后台慢慢杀进程树；若这里只看
+        # is_running()（stopping 时即为 False）就提前返回，调用方会立刻重启并把
+        # 「手动停止」标记清掉，等旧进程真正退出时就被误判成异常崩溃，弹红框。
         deadline = time.time() + timeout_ms / 1000.0
-        while runner.is_running() and time.time() < deadline:
+        while runner.state() in ("running", "stopping") and time.time() < deadline:
             QCoreApplication.processEvents(QEventLoop.ProcessEventsFlag.AllEvents, 100)
-        return not runner.is_running()
+        return runner.state() not in ("running", "stopping")
 
     def target_modules(self, module: str | None) -> list[str]:
         if self.tab._is_multi_module:
