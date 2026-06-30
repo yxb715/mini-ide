@@ -48,6 +48,7 @@ modules = [
     "src.ui.port_dialog",
     "src.ui.env_panel",
     "src.ui.main_window",
+    "src.ui.toast",
     "src.util.editor",
     "src.util.git_info",
     "src.util.notify",

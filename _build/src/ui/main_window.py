@@ -24,7 +24,7 @@ from src.core.workspace_manager import (
 )
 from src.ui.empty_state import EmptyState
 from src.ui.project_tab import ProjectTab
-from src.util import app_log
+from src.util import app_log, notify
 from src.util.editor import open_folder
 
 log = app_log.get_logger("main_window")
@@ -50,6 +50,7 @@ class MainWindow(QMainWindow):
 
         self.stack = QStackedWidget()
         self.setCentralWidget(self.stack)
+        notify.install(self.stack)
 
         self.empty = EmptyState(config)
         self.empty.projectRequested.connect(self.open_project)
@@ -436,9 +437,7 @@ class MainWindow(QMainWindow):
                 len(running), stop_running, len(kept),
             )
         super().closeEvent(e)
-        # 强制退出进程：notify.py 创建的 QSystemTrayIcon 在一次系统通知后会
-        # 永远持有，Qt 不会因为主窗口关闭而 quit，导致进程残留（pythonw.exe 一直在）。
-        # 单实例机制看到残留进程又会把新启动转发给它，用户感觉"代码改了没生效"。
+        # 主窗口关闭后退出事件循环，避免后台对象残留。
         QApplication.quit()
 
     def _collect_running_services(self) -> list[dict]:
