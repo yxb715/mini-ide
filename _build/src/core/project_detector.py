@@ -654,13 +654,51 @@ def _detect_go(root: Path) -> ProjectMeta | None:
     )
 
 
+def _detect_nginx(root: Path) -> ProjectMeta | None:
+    exe = root / "nginx.exe"
+    conf = (root / "nginx.conf") if (root / "nginx.conf").is_file() else (root / "conf" / "nginx.conf")
+    if not exe.is_file() or not conf.is_file():
+        return None
+
+    return ProjectMeta(
+        path=str(root),
+        name=root.name,
+        project_type="nginx",
+        display_type="Nginx",
+        icon="📦",
+        package_manager="nginx",
+        default_port=None,
+        ignored_dirs=["logs", "temp", ".git", ".idea", ".vscode"],
+        notes=["检测到 nginx.exe 和 nginx.conf"],
+        profiles=[
+            RunProfile(
+                "start",
+                "启动",
+                [str(exe), "-c", str(conf)],
+                kind="run",
+                icon="▶",
+                primary=True,
+                description="启动 Nginx",
+            ),
+            RunProfile(
+                "stop",
+                "停止",
+                [str(exe), "-s", "stop", "-c", str(conf)],
+                kind="run",
+                icon="⏹",
+                description="停止 Nginx",
+            ),
+        ],
+    )
+
+
 # ---------- 对外入口 ----------
 
 def detect_project(path: str) -> ProjectMeta:
     """按优先级探测项目类型，识别不出时返回 generic。"""
     root = Path(path)
 
-    for detector in (_detect_gradle, _detect_maven, _detect_node, _detect_python, _detect_go):
+    for detector in (_detect_gradle, _detect_maven, _detect_node, _detect_python, _detect_go, _detect_nginx):
         meta = detector(root)
         if meta:
             return meta

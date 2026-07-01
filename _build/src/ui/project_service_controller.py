@@ -43,6 +43,13 @@ class ProjectServiceController:
 
     def start(self, module: str | None = None) -> dict:
         tab = self.tab
+        if tab.project_meta.project_type == "nginx":
+            if module and module != tab.project_meta.name:
+                return {"ok": False, "error": f"module not found: {module}"}
+            if tab._detect_nginx_status().running:
+                return {"ok": False, "error": "already running"}
+            return {"ok": bool(tab._start_nginx())}
+
         if tab._is_multi_module:
             if module:
                 invalid = self.validate_module(module)
@@ -67,6 +74,13 @@ class ProjectServiceController:
 
     def stop(self, module: str | None = None) -> dict:
         tab = self.tab
+        if tab.project_meta.project_type == "nginx":
+            if module and module != tab.project_meta.name:
+                return {"ok": False, "error": f"module not found: {module}"}
+            if not tab._detect_nginx_status().running:
+                return {"ok": False, "error": "not running"}
+            return {"ok": bool(tab._stop_nginx_external())}
+
         if tab._is_multi_module:
             try:
                 tab._detect_and_apply_external()
@@ -113,6 +127,13 @@ class ProjectServiceController:
 
     def restart(self, module: str | None = None) -> dict:
         tab = self.tab
+        if tab.project_meta.project_type == "nginx":
+            if module and module != tab.project_meta.name:
+                return {"ok": False, "error": f"module not found: {module}"}
+            if tab._detect_nginx_status().running:
+                tab._stop_nginx_external()
+            return {"ok": bool(tab._start_nginx())}
+
         if tab._is_multi_module:
             if module:
                 invalid = self.validate_module(module)
@@ -178,6 +199,17 @@ class ProjectServiceController:
         from src.core.process_runner import is_port_listening
 
         tab = self.tab
+        if tab.project_meta.project_type == "nginx":
+            status = tab._detect_nginx_status()
+            if status.running and status.ports:
+                return True, {
+                    "module": module,
+                    "source": "nginx",
+                    "pid": status.master_pid,
+                    "ports": status.ports,
+                }
+            return False, {"module": module, "source": "pending"}
+
         runner = tab.module_runners.get(module)
         if runner and runner.is_running() and self._log_has_marker(tab.module_logs.get(module), markers):
             return True, {"module": module, "source": "log"}
@@ -197,6 +229,12 @@ class ProjectServiceController:
         from src.core.process_runner import find_port_holder
 
         tab = self.tab
+        if tab.project_meta.project_type == "nginx":
+            status = tab._detect_nginx_status()
+            if status.running and status.ports:
+                return True, {"source": "nginx", "pid": status.master_pid, "ports": status.ports}
+            return False, {"source": "pending"}
+
         if tab.runner.is_running() and self._log_has_marker(tab.log, markers):
             return True, {"source": "log"}
         default_port = tab.project_meta.default_port

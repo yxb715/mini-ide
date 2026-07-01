@@ -177,6 +177,7 @@ class ProjectTab(QWidget):
         # 「外部启动感知」：非 mini-ide 拉起、但端口快照里按 cmdline 匹配到的模块 → pid。
         # 这些模块面板显示「运行中(外部)」，停止按钮走 kill_pid 而非 runner.stop()。
         self._module_external_pids: dict[str, int] = {}
+        self._nginx_status = None
         # 外部进程感知器：构造时一次性预算各模块的 match keys（模块列表不变），
         # 之后每轮刷新只做匹配。从 ProjectTab 抽到 core.external_detector 便于单测。
         from src.core.external_detector import ExternalProcessDetector
@@ -251,8 +252,8 @@ class ProjectTab(QWidget):
         self.file_tree.fileCreated.connect(self._on_file_created)
         self.file_tree.scriptRunRequested.connect(self._run_script)
 
-        # 多模块项目：左侧垂直 splitter，上是服务面板、下是文件树
-        # 单模块项目：左侧只有文件树（行为不变）
+        # 多模块项目：左侧垂直 splitter，上是服务面板、下是文件树。
+        # 单模块项目：左侧只有文件树（行为不变）。
         self.service_panel: ServicePanel | None = None
         if self._is_multi_module:
             left_wrap = QSplitter(Qt.Orientation.Vertical)
@@ -462,6 +463,14 @@ class ProjectTab(QWidget):
 
     def _on_main_clicked(self) -> None:
         """主按钮点击：根据当前状态决定启动 or 停止"""
+        if self.project_meta.project_type == "nginx":
+            status = self._detect_nginx_status()
+            if status.running or self.runner.is_running():
+                self._stop_nginx_external()
+            else:
+                self._start_nginx()
+            self._refresh_status_row()
+            return
         if self.runner.is_running():
             self._stop()
         elif self._primary_profile:
@@ -845,11 +854,39 @@ class ProjectTab(QWidget):
                 self._detect_and_apply_external()
             except Exception:
                 log.exception("刷新外部进程感知失败")
+        nginx_status = None
+        if refresh_external and self.project_meta.project_type == "nginx":
+            try:
+                nginx_status = self._detect_nginx_status()
+            except Exception:
+                log.exception("刷新 nginx 进程感知失败")
+        elif self.project_meta.project_type == "nginx":
+            nginx_status = self._nginx_status
 
         checked_at = int(time.time())
         states: list[ServiceState] = []
 
-        if self.runner.is_running():
+        if self.project_meta.project_type == "nginx" and nginx_status is not None and nginx_status.running:
+            port = nginx_status.ports[0] if nginx_status.ports else None
+            managed = self.runner.is_running()
+            pid = None
+            if managed and self.runner._proc:
+                pid = int(self.runner._proc.processId())
+            states.append(ServiceState(
+                project=self.project_meta.name,
+                module=self.project_meta.name,
+                kind=KIND_PROJECT,
+                state=SERVICE_RUNNING_MANAGED if managed else SERVICE_RUNNING_EXTERNAL,
+                source=SOURCE_MANAGED_RUNNER if managed else SOURCE_EXTERNAL_DETECTOR,
+                pid=(pid if pid and pid > 0 else nginx_status.master_pid),
+                port=port,
+                ports=nginx_status.ports,
+                expected_port=None,
+                log_attached=managed,
+                checked_at=checked_at,
+                reason="当前 mini-ide 启动，日志上下文完整" if managed else "检测到本目录的 nginx.exe 进程",
+            ))
+        elif self.runner.is_running():
             pid = None
             if self.runner._proc:
                 pid = int(self.runner._proc.processId())
@@ -989,6 +1026,10 @@ class ProjectTab(QWidget):
         if self.runner.is_running():
             self.runner.stop()
             count += 1
+        if include_external and self.project_meta.project_type == "nginx":
+            status = self._nginx_status
+            if status is not None and status.running and self._stop_nginx_external():
+                count += 1
         if self._is_multi_module:
             if include_external:
                 self._stop_all_modules(silent=silent)
@@ -1025,6 +1066,13 @@ class ProjectTab(QWidget):
                 log.exception("等待停止时刷新外部进程感知失败")
             if self._module_external_pids:
                 active = True
+            if self.project_meta.project_type == "nginx":
+                try:
+                    status = self._detect_nginx_status()
+                    if status.running:
+                        active = True
+                except Exception:
+                    log.exception("等待停止时刷新 nginx 进程感知失败")
             if not active:
                 return True
             QCoreApplication.processEvents(
@@ -1214,6 +1262,53 @@ class ProjectTab(QWidget):
         from src.core.process_runner import port_snapshot
         return self._external_detector.detect(port_snapshot())
 
+    def _detect_nginx_status(self):
+        from src.core.nginx_detector import detect_nginx
+        from src.core.process_runner import port_snapshot
+        self._nginx_status = detect_nginx(self.project_meta.path, port_snapshot())
+        return self._nginx_status
+
+    def _stop_nginx_external(self) -> bool:
+        from src.core.process_runner import kill_pid
+        from pathlib import Path
+        import time
+        status = self._nginx_status or self._detect_nginx_status()
+        pid = status.master_pid if status and status.running else None
+        if not pid:
+            return False
+        ok = kill_pid(pid)
+        if ok:
+            self._nginx_status = None
+            deadline = time.time() + 5.0
+            while time.time() < deadline:
+                if not self._detect_nginx_status().running:
+                    pid_file = Path(self.project_meta.path) / "running.pid"
+                    try:
+                        pid_file.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    return True
+                QApplication.processEvents()
+                time.sleep(0.2)
+        return False
+
+    def _start_nginx(self) -> bool:
+        if self.project_meta.project_type != "nginx":
+            return False
+        status = self._detect_nginx_status()
+        if status.running:
+            return True
+        primary = next((p for p in self.project_meta.profiles if p.primary), None)
+        if not primary:
+            return False
+        self.log.begin_run(f"{self.project_meta.name}-nginx")
+        ctx = RunContext(cwd=self.project_meta.path, env={}, jvm_opts="", spring_profile="", extra_args=[])
+        ok = self.runner.start(list(primary.command), ctx)
+        if not ok:
+            self.log.append_line("stderr", "[启动失败] 无法启动 Nginx")
+            return False
+        return True
+
     def _detect_and_apply_external(self) -> None:
         """刷新 _module_external_pids（不碰面板，仅供批量启动前去重用）。
 
@@ -1279,6 +1374,24 @@ class ProjectTab(QWidget):
                         self.service_panel.update_state(mod_name, STATE_IDLE)
             total = len(self.project_meta.spring_boot_modules)
             self.lbl_elapsed.setText(f"已运行 {running}/{total}" if running else "")
+        elif self.project_meta.project_type == "nginx":
+            try:
+                status = self._detect_nginx_status()
+            except Exception:
+                log.exception("刷新 nginx 状态展示失败")
+                status = None
+            if status and status.running:
+                ports = " ".join(f":{p}" for p in status.ports)
+                self.lbl_elapsed.setText(f"运行 {ports}".strip())
+                tip = f"PID：{status.master_pid}" if status.master_pid else ""
+                if status.conf_path:
+                    tip = (tip + "\n" if tip else "") + f"配置：{status.conf_path}"
+                self.lbl_elapsed.setToolTip(tip)
+                self._update_main_button("running")
+            else:
+                self.lbl_elapsed.setText("")
+                self.lbl_elapsed.setToolTip("")
+                self._update_main_button("idle")
         elif self.runner.is_running():
             elapsed = self.runner.elapsed_seconds()
             m, s = divmod(int(elapsed), 60)

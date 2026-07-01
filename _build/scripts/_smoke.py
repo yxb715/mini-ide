@@ -26,6 +26,7 @@ modules = [
     "src.core.log_classifier",
     "src.core.git_worker",
     "src.core.external_detector",
+    "src.core.nginx_detector",
     "src.ui.theme",
     "src.ui.styles",
     "src.ui.log_widget",
@@ -81,7 +82,7 @@ def service_state_check() -> list[str]:
     )
     external = ServiceState(
         project="p", module="m", kind=KIND_MODULE,
-        state=STATE_RUNNING_EXTERNAL, pid=1234, port=8080,
+        state=STATE_RUNNING_EXTERNAL, pid=1234, port=8080, ports=[8080, 8443],
     )
     cli_stopped = stopped.to_cli_module()
     cli_external = external.to_cli_module()
@@ -89,6 +90,8 @@ def service_state_check() -> list[str]:
         failed.append("stopped service should keep legacy stopped output")
     if cli_external["state"] != "running" or not cli_external["external"]:
         failed.append("external service should keep legacy running output")
+    if cli_external["ports"] != [8080, 8443]:
+        failed.append("service state should expose all detected ports")
     if running_items([stopped, external]) != [external.to_running_item()]:
         failed.append("running_items should filter inactive services")
 
@@ -97,6 +100,40 @@ def service_state_check() -> list[str]:
             print(f"[FAIL] service_state: {msg}", flush=True)
     else:
         print("[OK]   service_state compatibility", flush=True)
+    return failed
+
+
+def nginx_detector_check() -> list[str]:
+    """验证 nginx 目录识别和配置端口解析。"""
+    import tempfile
+
+    from src.core.nginx_detector import detect_nginx, is_nginx_dir
+    from src.core.project_detector import detect_project
+
+    failed: list[str] = []
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "nginx.exe").write_bytes(b"")
+        (root / "nginx.conf").write_text(
+            "events {}\nhttp {\n"
+            "  server { listen 9888; listen 0.0.0.0:9443 ssl; }\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        if not is_nginx_dir(root):
+            failed.append("nginx dir should require nginx.exe and nginx.conf")
+        meta = detect_project(str(root))
+        if meta.project_type != "nginx" or meta.display_type != "Nginx":
+            failed.append(f"nginx dir should be detected as nginx, got {meta.project_type}")
+        status = detect_nginx(root, {})
+        if status.configured_ports != [9443, 9888]:
+            failed.append(f"nginx configured ports mismatch: {status.configured_ports}")
+
+    if failed:
+        for msg in failed:
+            print(f"[FAIL] nginx_detector: {msg}", flush=True)
+    else:
+        print("[OK]   nginx_detector rules", flush=True)
     return failed
 
 
@@ -327,6 +364,7 @@ if __name__ == "__main__":
     file_failed = file_action_check()
     preview_failed = file_preview_model_check()
     git_failed = git_context_check()
+    nginx_failed = nginx_detector_check()
 
     print()
     print("Hex hardcode scan (CLAUDE.md hard rule 15):")
@@ -344,7 +382,7 @@ if __name__ == "__main__":
     total_fail = (
         len(failed) + len(model_failed) + len(cli_failed)
         + len(cli_encoding_failed) + len(file_failed) + len(preview_failed)
-        + len(git_failed) + len(hex_hits)
+        + len(git_failed) + len(nginx_failed) + len(hex_hits)
     )
     print()
     print(f"Result: imports {len(modules) - len(failed)}/{len(modules)}, "

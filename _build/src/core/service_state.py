@@ -35,6 +35,7 @@ class ServiceState:
     source: str = SOURCE_NONE
     pid: int | None = None
     port: int | None = None
+    ports: list[int] | None = None
     expected_port: int | None = None
     log_attached: bool = False
     checked_at: int = 0
@@ -75,6 +76,7 @@ class ServiceState:
             "source": self.source,
             "pid": self.pid if self.pid and self.pid > 0 else None,
             "port": self.port,
+            "ports": list(self.ports or []),
             "expected_port": self.expected_port,
             "log_attached": self.log_attached,
             "checked_at": self.checked_at,
@@ -91,6 +93,7 @@ class ServiceState:
             "external": self.external,
             "pid": self.pid if self.pid and self.pid > 0 else None,
             "port": self.port,
+            "ports": list(self.ports or []),
             "expected_port": self.expected_port,
             "log_attached": self.log_attached,
             "checked_at": self.checked_at,

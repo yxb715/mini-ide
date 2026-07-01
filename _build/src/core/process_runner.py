@@ -416,12 +416,13 @@ def _scan_once() -> dict[int, list[dict]]:
         try:
             proc = psutil.Process(pid)
             name = proc.name()
+            exe = proc.exe()
             # 全量 cmdline（截断到 2000 字符）：模块路径 / classpath / jar 名通常在靠后的参数里，
             # 只取前 5 段会丢掉用于匹配模块的关键信息（外部启动感知依赖它）。
             cmdline = " ".join(proc.cmdline())[:2000]
         except psutil.Error:
-            name, cmdline = "?", ""
-        holder = {"pid": pid, "name": name, "cmdline": cmdline}
+            name, exe, cmdline = "?", "", ""
+        holder = {"pid": pid, "name": name, "exe": exe, "cmdline": cmdline}
         for p in ports:
             port_map.setdefault(p, []).append(holder)
     return port_map

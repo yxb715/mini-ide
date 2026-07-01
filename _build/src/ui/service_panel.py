@@ -98,12 +98,15 @@ class _ServiceRow(QFrame):
 
     def set_state(
         self, state: str, port: int | None = None, elapsed_seconds: float = 0.0,
-        pid: int | None = None, reason: str = "",
+        pid: int | None = None, reason: str = "", ports: list[int] | None = None,
     ):
         self._state = state
         # port 优先用本次传入的（启动后从日志抓的真实端口），否则用 application.yml 的默认值
         effective_port = port if port is not None else self.default_port
-        port_str = f":{effective_port}" if effective_port else ""
+        if ports:
+            port_str = " ".join(f":{p}" for p in ports)
+        else:
+            port_str = f":{effective_port}" if effective_port else ""
         detail = reason or ""
         if state == STATE_IDLE:
             self.lbl_info.setText(port_str)
@@ -134,7 +137,9 @@ class _ServiceRow(QFrame):
             self.lbl_info.setStyleSheet(f"color:{COLOR_WARN}; font-size:{FONT_PT_UI_SM}pt;")
             self.btn.setText("⏹")
             tip = f"{self.module_name} 正在 mini-ide 之外运行，当前 IDE 没有启动日志上下文。"
-            if effective_port:
+            if ports:
+                tip += f"\n端口：{', '.join(str(p) for p in ports)}"
+            elif effective_port:
                 tip += f"\n端口：{effective_port}"
             if pid:
                 tip += f"\nPID：{pid}"
@@ -235,11 +240,11 @@ class ServicePanel(QWidget):
     def update_state(
         self, module: str, state: str,
         port: int | None = None, elapsed_seconds: float = 0.0,
-        pid: int | None = None, reason: str = "",
+        pid: int | None = None, reason: str = "", ports: list[int] | None = None,
     ) -> None:
         row = self._rows.get(module)
         if row:
-            row.set_state(state, port, elapsed_seconds, pid, reason)
+            row.set_state(state, port, elapsed_seconds, pid, reason, ports)
         # 任意模块在 RUNNING/STARTING/外部运行 就允许「全部停止」
         any_active = any(
             r.current_state() in (STATE_RUNNING, STATE_RUNNING_EXTERNAL, STATE_STARTING)
