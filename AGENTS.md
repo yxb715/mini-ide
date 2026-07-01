@@ -19,7 +19,7 @@ mini-ide 是本机开发指挥台：用一个 GUI 管理多个项目的启动、
 
 ## CLI 能力
 
-外部 AI 工具可以通过根目录 `mini-ide.exe` 调用 CLI。输出统一为 stdout JSON。
+外部 AI 工具可以通过根目录 `mini-ide.exe` 调用 CLI。连上 GUI 后 stdout 返回 JSON；参数错误、mini-ide 未运行、等待超时等客户端侧错误可能写到 stderr。
 
 常用命令：
 
@@ -58,6 +58,7 @@ mini-ide.exe --quit
 ## 必守规则
 
 - **修改代码后要重新打包发布**：跑 `_build\scripts\build.bat` 更新根目录 `mini-ide.exe` 和 `mini-ide-runtime/`。
+- **更新 mini-ide 能力后要同步检查全局 skill**：如果 CLI、服务启停、日志、诊断、编译、打包前检查等行为有变化，必须检查 `C:\Users\Administrator\.claude\skills\mini-ide\SKILL.md` 是否需要同步更新。
 - **未经用户明确同意，禁止关闭 mini-ide**。
 - **用户同意关闭后，必须先通过 mini-ide 停止当前 IDE 中正在运行的所有服务**，包括后端、前端、Python、脚本等；确认停净后，才允许关闭 IDE 和打包。
 - **服务启停、日志诊断、编译、工作区管理都必须走 mini-ide CLI 或 GUI 能力**，不要直接运行 `gradle/mvn/npm/python` 启动业务项目。
