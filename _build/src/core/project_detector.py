@@ -579,7 +579,9 @@ def _detect_python(root: Path) -> ProjectMeta | None:
             if self_runner:
                 run_cmd = py_cmd.split() + [self_runner]
             else:
-                run_cmd = py_cmd.split() + ["-m", "uvicorn", f"{Path(entry_script).stem}:app" if entry_script else "main:app", "--reload"]
+                # Windows 下 uvicorn 带 --reload 会强制用 SelectorEventLoop，无法启动子进程，
+                # 导致 Playwright 等需要子进程的库抛 NotImplementedError；本机工具去掉 --reload。
+                run_cmd = py_cmd.split() + ["-m", "uvicorn", f"{Path(entry_script).stem}:app" if entry_script else "main:app"]
             port = 8000
         elif has_flask:
             ptype, disp, icon = "flask", "Flask", "🐍"
