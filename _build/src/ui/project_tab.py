@@ -1065,15 +1065,29 @@ class ProjectTab(QWidget):
         """等待当前项目托管/外部服务停止；超时返回 False。"""
         import time
         from PySide6.QtCore import QCoreApplication, QEventLoop
+        from src.core.process_runner import is_port_listening
+
+        def runner_busy(runner: ProcessRunner) -> bool:
+            if runner.state() in ("running", "stopping"):
+                return True
+            cleanup_pending = getattr(runner, "stop_cleanup_pending", None)
+            return bool(cleanup_pending and cleanup_pending())
 
         deadline = time.time() + timeout_ms / 1000.0
         while time.time() < deadline:
             active = False
-            if self.runner.state() in ("running", "stopping"):
+            if runner_busy(self.runner):
                 active = True
-            if any(r.state() in ("running", "stopping") for r in self.module_runners.values()):
+            if self.project_meta.default_port and is_port_listening(self.project_meta.default_port):
                 active = True
-            if any(r.state() in ("running", "stopping") for r in self._script_runners.values()):
+            if any(runner_busy(r) for r in self.module_runners.values()):
+                active = True
+            for mod_name, _path, expected_port, _cls in self.project_meta.spring_boot_modules:
+                port = self._module_ports.get(mod_name) or expected_port
+                if port and is_port_listening(port):
+                    active = True
+                    break
+            if any(runner_busy(r) for r in self._script_runners.values()):
                 active = True
             try:
                 self._detect_and_apply_external()

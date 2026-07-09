@@ -114,7 +114,7 @@ _DIAGNOSIS_RULES: list[tuple[re.Pattern[str], str, bool]] = [
     (re.compile(r"ClassNotFoundException:\s*([\w.$]+)", re.I),
      "类未找到：检查依赖是否引入，或是否需要 clean 后重新编译", False),
     (re.compile(r"NoClassDefFoundError", re.I),
-     "运行时类缺失：依赖 scope 可能是 provided/compileOnly，或打包时被剔除", False),
+     "运行时类缺失：若只在自动重启后偶发，优先检查旧进程/编译缓存是否清干净；稳定复现再查依赖 scope/clean 编译", False),
     (re.compile(r"cannot find symbol", re.I),
      "编译错误：符号未定义，常见原因是拼写错误或缺少 import", False),
     (re.compile(r"LOMBOK|lombok.*not.*install", re.I),

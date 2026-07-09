@@ -52,6 +52,7 @@ class ProcessRunner(QObject):
         self._manually_stopped = False
         self._stdout_buf = b""
         self._stderr_buf = b""
+        self._stop_thread: threading.Thread | None = None
 
     # ---- public API ----
 
@@ -60,6 +61,11 @@ class ProcessRunner(QObject):
 
     def state(self) -> str:
         return self._state
+
+    def stop_cleanup_pending(self) -> bool:
+        """后台进程树清理线程是否仍在收尾。"""
+        t = self._stop_thread
+        return bool(t and t.is_alive())
 
     def elapsed_seconds(self) -> float:
         if not self._started_at:
@@ -136,6 +142,7 @@ class ProcessRunner(QObject):
                 target=_kill_tree, args=(pid, graceful),
                 name=f"kill-tree-{pid}", daemon=True,
             )
+            self._stop_thread = t
             t.start()
         else:
             self._proc.kill()
@@ -384,6 +391,12 @@ def _kill_tree(pid: int, graceful_timeout: float = 3.0) -> None:
             p.kill()
         except psutil.Error:
             pass
+    if alive:
+        psutil.wait_procs(alive, timeout=2.0)
+    try:
+        invalidate_port_cache()
+    except Exception:
+        pass
 
 
 # ---------- 端口工具 ----------

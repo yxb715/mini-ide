@@ -96,33 +96,51 @@ class ProjectServiceController:
                 external = module in tab._module_external_pids
                 if not running and not external:
                     return {"ok": False, "error": "not running"}
+                port = self.module_port(module)
                 if running:
                     runner.stop()
-                    self.wait_runner_stop(runner, 10000)
+                    if not self.wait_module_stopped(module, 10000, port):
+                        return {"ok": False, "error": "stop timeout"}
                 if module in tab._module_external_pids:
-                    tab._takeover_external(module)
+                    if not tab._takeover_external(module):
+                        return {"ok": False, "error": "stop timeout"}
+                    if not self.wait_module_stopped(module, 8000, port):
+                        return {"ok": False, "error": "stop timeout"}
                 tab._refresh_status_row()
                 return {"ok": True}
 
+            ports = {
+                mod_name: self.module_port(mod_name)
+                for mod_name, _path, _port, _cls in tab.project_meta.spring_boot_modules
+            }
             if tab.runner.is_running():
                 tab._stop()
-                self.wait_runner_stop(tab.runner, 10000)
+                if not self.wait_runner_stop(tab.runner, 10000):
+                    return {"ok": False, "error": "stop timeout"}
             tab._stop_all_modules(silent=True)
             for runner in list(tab.module_runners.values()):
                 if runner.is_running():
-                    self.wait_runner_stop(runner, 10000)
+                    if not self.wait_runner_stop(runner, 10000):
+                        return {"ok": False, "error": "stop timeout"}
             try:
                 tab._detect_and_apply_external()
                 for mod_name in list(tab._module_external_pids):
-                    tab._takeover_external(mod_name)
+                    if not tab._takeover_external(mod_name):
+                        return {"ok": False, "error": "stop timeout"}
             except Exception:
                 pass
+            for mod_name, port in ports.items():
+                if not self.wait_module_stopped(mod_name, 8000, port):
+                    return {"ok": False, "error": "stop timeout"}
             tab._refresh_status_row()
             return {"ok": True}
 
         if not tab.runner.is_running():
             return {"ok": False, "error": "not running"}
+        port = tab.project_meta.default_port
         tab._stop()
+        if not self.wait_project_stopped(10000, port):
+            return {"ok": False, "error": "stop timeout"}
         return {"ok": True}
 
     def restart(self, module: str | None = None) -> dict:
@@ -140,27 +158,50 @@ class ProjectServiceController:
                 if invalid:
                     return invalid
                 runner = tab.module_runners.get(module)
+                port = self.module_port(module)
                 if runner and runner.is_running():
                     runner.stop()
-                    if not self.wait_runner_stop(runner, 10000):
+                    if not self.wait_module_stopped(module, 15000, port):
                         return {"ok": False, "error": "stop timeout"}
                 tab._detect_and_apply_external()
+                if module in tab._module_external_pids:
+                    if not tab._takeover_external(module):
+                        return {"ok": False, "error": "stop timeout"}
+                    if not self.wait_module_stopped(module, 8000, port):
+                        return {"ok": False, "error": "stop timeout"}
                 tab._start_module(module, silent=True)
                 return {"ok": True}
 
+            ports = {
+                mod_name: self.module_port(mod_name)
+                for mod_name, _path, _port, _cls in tab.project_meta.spring_boot_modules
+            }
             for runner in list(tab.module_runners.values()):
                 if runner.is_running():
                     runner.stop()
-            deadline = time.time() + 10
+            deadline = time.time() + 15
             for runner in list(tab.module_runners.values()):
                 remaining = max(0, int((deadline - time.time()) * 1000))
-                self.wait_runner_stop(runner, remaining)
+                if remaining <= 0 or not self.wait_runner_stop(runner, remaining):
+                    return {"ok": False, "error": "stop timeout"}
+            try:
+                tab._detect_and_apply_external()
+                for mod_name in list(tab._module_external_pids):
+                    if not tab._takeover_external(mod_name):
+                        return {"ok": False, "error": "stop timeout"}
+            except Exception:
+                pass
+            for mod_name, port in ports.items():
+                remaining = max(0, int((deadline - time.time()) * 1000))
+                if remaining <= 0 or not self.wait_module_stopped(mod_name, remaining, port):
+                    return {"ok": False, "error": "stop timeout"}
             tab._start_all_modules(silent=True)
             return {"ok": True}
 
+        port = tab.project_meta.default_port
         if tab.runner.is_running():
             tab.runner.stop()
-            if not self.wait_runner_stop(tab.runner, 10000):
+            if not self.wait_project_stopped(15000, port):
                 return {"ok": False, "error": "stop timeout"}
         primary = next((p for p in tab.project_meta.profiles if p.primary), None)
         if not primary:
@@ -174,9 +215,63 @@ class ProjectServiceController:
         # is_running()（stopping 时即为 False）就提前返回，调用方会立刻重启并把
         # 「手动停止」标记清掉，等旧进程真正退出时就被误判成异常崩溃，弹红框。
         deadline = time.time() + timeout_ms / 1000.0
-        while runner.state() in ("running", "stopping") and time.time() < deadline:
+        while self.runner_busy(runner) and time.time() < deadline:
             QCoreApplication.processEvents(QEventLoop.ProcessEventsFlag.AllEvents, 100)
-        return runner.state() not in ("running", "stopping")
+        return not self.runner_busy(runner)
+
+    def runner_busy(self, runner) -> bool:
+        if runner.state() in ("running", "stopping"):
+            return True
+        cleanup_pending = getattr(runner, "stop_cleanup_pending", None)
+        return bool(cleanup_pending and cleanup_pending())
+
+    def module_port(self, module: str) -> int | None:
+        if module in self.tab._module_ports:
+            return self.tab._module_ports.get(module)
+        for mod_name, _path, expected_port, _cls in self.tab.project_meta.spring_boot_modules:
+            if mod_name == module:
+                return expected_port
+        return None
+
+    def wait_module_stopped(
+        self,
+        module: str,
+        timeout_ms: int,
+        port: int | None = None,
+    ) -> bool:
+        from src.core.process_runner import is_port_listening
+
+        tab = self.tab
+        deadline = time.time() + timeout_ms / 1000.0
+        while time.time() < deadline:
+            runner = tab.module_runners.get(module)
+            active = bool(runner and self.runner_busy(runner))
+            try:
+                tab._detect_and_apply_external()
+            except Exception:
+                pass
+            if module in tab._module_external_pids:
+                active = True
+            if port and is_port_listening(port):
+                active = True
+            if not active:
+                return True
+            QCoreApplication.processEvents(QEventLoop.ProcessEventsFlag.AllEvents, 100)
+        return False
+
+    def wait_project_stopped(self, timeout_ms: int, port: int | None = None) -> bool:
+        from src.core.process_runner import is_port_listening
+
+        tab = self.tab
+        deadline = time.time() + timeout_ms / 1000.0
+        while time.time() < deadline:
+            active = self.runner_busy(tab.runner)
+            if port and is_port_listening(port):
+                active = True
+            if not active:
+                return True
+            QCoreApplication.processEvents(QEventLoop.ProcessEventsFlag.AllEvents, 100)
+        return False
 
     def target_modules(self, module: str | None) -> list[str]:
         if self.tab._is_multi_module:
