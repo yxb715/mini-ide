@@ -12,6 +12,7 @@
 - focusRequested(module_name)
 - startRequested / stopRequested(module_name)
 - startAllRequested / stopAllRequested
+- clearLogsRequested
 """
 from __future__ import annotations
 
@@ -21,10 +22,10 @@ from PySide6.QtWidgets import (
 )
 
 from src.ui.theme import (
-    ACCENT, BG_BTN_DANGER, BG_BTN_DANGER_HOVER, BG_BTN_PRIMARY,
+    ACCENT, BG_BTN, BG_BTN_HOVER, BG_BTN_DANGER, BG_BTN_DANGER_HOVER, BG_BTN_PRIMARY,
     BG_BTN_PRIMARY_HOVER, BG_L0, BG_L1, BG_L2, BG_L4, BORDER_SUBTLE,
     COLOR_SUCCESS, COLOR_WARN, FG_BRIGHT, FG_DIM, FG_PRIMARY,
-    FG_SECONDARY, FONT_PT_UI, FONT_PT_UI_SM, RADIUS_SM,
+    FG_SECONDARY, FONT_PT_UI, FONT_PT_UI_SM, H_BTN_SM, RADIUS_SM,
 )
 
 
@@ -168,6 +169,7 @@ class ServicePanel(QWidget):
     stopRequested = Signal(str)
     startAllRequested = Signal()
     stopAllRequested = Signal()
+    clearLogsRequested = Signal()
 
     def __init__(self, modules: list[tuple[str, int | None]], parent=None):
         """modules: [(module_name, default_port_or_None)]"""
@@ -190,6 +192,19 @@ class ServicePanel(QWidget):
         title.setStyleSheet(f"color:{FG_PRIMARY}; font-size:{FONT_PT_UI}pt;")
         h_lay.addWidget(title)
         h_lay.addStretch(1)
+
+        self.btn_clear_logs = QPushButton("清空日志")
+        self.btn_clear_logs.setFixedHeight(H_BTN_SM)
+        self.btn_clear_logs.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_clear_logs.setToolTip("清空当前项目所有服务控制台日志")
+        self.btn_clear_logs.setStyleSheet(
+            f"QPushButton {{ background:{BG_BTN}; color:{FG_PRIMARY};"
+            f" border:1px solid {BORDER_SUBTLE}; border-radius:{RADIUS_SM}px;"
+            f" font-size:{FONT_PT_UI_SM}pt; padding:2px 8px; }}"
+            f"QPushButton:hover {{ background:{BG_BTN_HOVER}; }}"
+        )
+        self.btn_clear_logs.clicked.connect(self.clearLogsRequested.emit)
+        h_lay.addWidget(self.btn_clear_logs)
 
         self.btn_start_all = QPushButton("▶ 全部启动")
         self.btn_start_all.setFixedHeight(22)

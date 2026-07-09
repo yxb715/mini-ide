@@ -267,6 +267,7 @@ class ProjectTab(QWidget):
             self.service_panel.focusRequested.connect(self._focus_module_log)
             self.service_panel.startAllRequested.connect(self._start_all_modules)
             self.service_panel.stopAllRequested.connect(self._stop_all_modules)
+            self.service_panel.clearLogsRequested.connect(self.clear_all_logs)
             left_wrap.addWidget(self.service_panel)
             left_wrap.addWidget(self.file_tree)
             left_wrap.setSizes([220, 500])
@@ -725,6 +726,20 @@ class ProjectTab(QWidget):
                 self.log.append_line("stderr", f"[停止失败] 无法结束 {module} (PID {pid})")
         # 刷新一次，把真实状态同步回面板
         self._refresh_status_row()
+
+    def clear_all_logs(self) -> None:
+        """清空当前项目内所有控制台日志，不影响正在运行的进程。"""
+        widgets = [self.log, *self.module_logs.values(), *self._script_logs.values()]
+        seen: set[int] = set()
+        cleared = 0
+        for widget in widgets:
+            marker = id(widget)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            widget.clear()
+            cleared += 1
+        notify.notify_success("日志已清空", f"已清空 {cleared} 个控制台")
 
     def _focus_module_log(self, module: str) -> None:
         lw = self.module_logs.get(module)
@@ -2099,7 +2114,7 @@ class ProjectTab(QWidget):
         commands.append(("🎯  接口地址跳转", "Ctrl+\\  定位 Controller 方法", self.open_endpoint_picker))
         commands.append(("⏱  最近打开的文件", "Ctrl+E", self.open_recent_files))
         commands.append(("📁  打开项目目录", "用资源管理器", lambda: open_folder(self.project_meta.path)))
-        commands.append(("🧹  清空日志", "", self.log.clear))
+        commands.append(("🧹  清空所有日志", "项目日志、服务日志、脚本日志", self.clear_all_logs))
         commands.append(("🌿  Git 改动", "实时查看当前分支改动文件", self.open_git_viewer))
         commands.append(("🔌  端口占用查询", "查看指定端口被哪个进程占用 / kill", lambda: self.open_port_dialog(0)))
         commands.append(("📋  环境/配置文件", ".env / application*.yml 等集中查看", self.open_env_panel))

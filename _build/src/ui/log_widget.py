@@ -377,12 +377,17 @@ class LogWidget(QWidget):
                 pass
 
     def clear(self) -> None:
+        if self._flush_timer.isActive():
+            self._flush_timer.stop()
+        self._pending.clear()
+        self._ctx = lc.LineContext()
         self.edit.clear()
         self._lines.clear()
         self._error_count = 0
         self._warn_count = 0
         self._last_diagnosis = ""
         self._diagnosis_port = 0
+        self._first_error = ""
         self._external_running = False
         self.btn_port_diagnose.setVisible(False)
         self.diagnosis_bar.setVisible(False)
