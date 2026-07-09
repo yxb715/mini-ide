@@ -217,7 +217,6 @@ class SearchWorker(QThread):
                 total += added
                 if capped:
                     self.match_found.emit(batch)
-                    self.files_collected.emit(collected)
                     self.done.emit(scanned, total)
                     return
 
@@ -478,6 +477,8 @@ class ContentSearchDialog(QDialog):
         self._worker.start()
 
     def _on_files_collected(self, files: list) -> None:
+        if self.sender() is not self._worker:
+            return
         # 仅首次 walk 的 worker 会发这个信号；缓存住供后续输入复用
         self._file_cache = files
 

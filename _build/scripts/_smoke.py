@@ -286,6 +286,44 @@ def file_preview_model_check() -> list[str]:
     return failed
 
 
+def content_search_cache_check() -> list[str]:
+    """验证命中上限提前结束时，不会缓存半截文件清单。"""
+    import tempfile
+
+    import src.ui.content_search as content_search
+
+    failed: list[str] = []
+    original_max = content_search.MAX_MATCHES
+    emitted: list[list[str]] = []
+    try:
+        content_search.MAX_MATCHES = 1
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "hit.txt").write_text("needle\n", encoding="utf-8")
+            (root / "later.yml").write_text("target: needle\n", encoding="utf-8")
+            worker = content_search.SearchWorker(
+                root=str(root),
+                query="needle",
+                case_sensitive=False,
+                whole_word=False,
+                use_regex=False,
+                include_exts=[],
+            )
+            worker.files_collected.connect(lambda files: emitted.append(files))
+            worker.run()
+        if emitted:
+            failed.append("content search should not cache partial file list after match cap")
+    finally:
+        content_search.MAX_MATCHES = original_max
+
+    if failed:
+        for msg in failed:
+            print(f"[FAIL] content_search: {msg}", flush=True)
+    else:
+        print("[OK]   content_search cache rules", flush=True)
+    return failed
+
+
 def git_context_check() -> list[str]:
     """验证 Git AI 上下文的标签、排序和摘要格式。"""
     from src.core.git_context import build_ai_text, sort_changed_files, status_label, summary_from_changes
@@ -363,6 +401,7 @@ if __name__ == "__main__":
     cli_encoding_failed = cli_output_encoding_check()
     file_failed = file_action_check()
     preview_failed = file_preview_model_check()
+    search_failed = content_search_cache_check()
     git_failed = git_context_check()
     nginx_failed = nginx_detector_check()
 
@@ -382,7 +421,7 @@ if __name__ == "__main__":
     total_fail = (
         len(failed) + len(model_failed) + len(cli_failed)
         + len(cli_encoding_failed) + len(file_failed) + len(preview_failed)
-        + len(git_failed) + len(nginx_failed) + len(hex_hits)
+        + len(search_failed) + len(git_failed) + len(nginx_failed) + len(hex_hits)
     )
     print()
     print(f"Result: imports {len(modules) - len(failed)}/{len(modules)}, "
