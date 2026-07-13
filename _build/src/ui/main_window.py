@@ -526,6 +526,10 @@ class MainWindow(QMainWindow):
             self.open_project(self.pending_initial_project)
             self.pending_initial_project = None
 
+        # 启动资源守卫（后台线程，监控内存和 node 进程数，防止 OOM）
+        from src.core.resource_guard import ensure_started as _start_resource_guard
+        _start_resource_guard()
+
     def activate_and_open(self, path: str | None) -> None:
         """单实例 IPC 入口：老实例收到新请求后的响应。"""
         from PySide6.QtCore import Qt
