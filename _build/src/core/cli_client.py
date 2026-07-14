@@ -136,6 +136,17 @@ EXIT_NOT_RUNNING = 3
 EXIT_TIMEOUT = 4
 
 
+def _decode_response(response_buf: bytes):
+    """解析服务端首行响应；空响应和坏 JSON 都必须是显式失败。"""
+    if not response_buf.strip():
+        return None, "empty response"
+    line = response_buf.split(b"\n", 1)[0]
+    try:
+        return json.loads(line), None
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None, "invalid response"
+
+
 def _parse_args(argv: list[str]) -> dict | None:
     """解析 CLI 参数为 JSON 命令 dict。返回 None 表示参数错误。"""
     args = argv[1:]  # 跳过程序名
@@ -413,15 +424,12 @@ def run_cli(argv: list[str]) -> int:
 
     sock.disconnectFromServer()
 
-    if not response_buf.strip():
-        _safe_write(sys.stderr, json.dumps({"ok": False, "error": "empty response"}) + "\n")
-        return EXIT_FAIL
-
-    line = response_buf.split(b"\n", 1)[0]
-    try:
-        result = json.loads(line)
-    except json.JSONDecodeError:
-        _safe_write(sys.stderr, json.dumps({"ok": False, "error": "invalid response"}) + "\n")
+    result, response_error = _decode_response(response_buf)
+    if response_error:
+        _safe_write(
+            sys.stderr,
+            json.dumps({"ok": False, "error": response_error}) + "\n",
+        )
         return EXIT_FAIL
 
     _safe_write(sys.stdout, json.dumps(result, ensure_ascii=False) + "\n")

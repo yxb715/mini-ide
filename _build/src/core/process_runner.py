@@ -42,7 +42,7 @@ class ProcessRunner(QObject):
     outputLine = Signal(str, str)        # (stream, line)
     started = Signal()
     finished = Signal(int)               # exit_code（-1 表示手动杀掉）
-    stateChanged = Signal(str)           # idle | running | stopping
+    stateChanged = Signal(str)           # idle | starting | running | stopping
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -62,6 +62,16 @@ class ProcessRunner(QObject):
     def state(self) -> str:
         return self._state
 
+    def process_id(self) -> int | None:
+        """返回本轮 QProcess 的根 PID；未启动或已退出时返回 None。"""
+        if self._proc is None:
+            return None
+        try:
+            pid = int(self._proc.processId())
+        except (RuntimeError, TypeError, ValueError):
+            return None
+        return pid if pid > 0 else None
+
     def stop_cleanup_pending(self) -> bool:
         """后台进程树清理线程是否仍在收尾。"""
         t = self._stop_thread
@@ -74,10 +84,17 @@ class ProcessRunner(QObject):
 
     def start(self, command: list[str], ctx: RunContext) -> bool:
         """启动进程。返回是否启动成功（已在运行时返回 False）"""
-        if self.is_running():
+        # stopping 时 is_running() 已是 False，但旧进程树的后台清理还没结束。
+        # 此时复用 runner 会覆盖 self._proc，并让旧、新进程的 finished 信号串台。
+        # 只有完全回到 idle 且清理线程结束，才允许下一轮启动。
+        if self._state != "idle" or self.stop_cleanup_pending():
             return False
 
         env = _build_child_env(ctx)
+
+        # 在任何可能让 Qt 处理事件的启动等待之前先占住 runner。否则
+        # waitForStarted() 期间另一个 CLI 请求仍会看到 idle，并复用同一 runner。
+        self._set_state("starting")
 
         full_cmd = list(command) + list(ctx.extra_args or [])
         display = " ".join(shlex.quote(c) if " " in c else c for c in full_cmd)
@@ -131,7 +148,7 @@ class ProcessRunner(QObject):
         信号仍在主线程触发 _on_finished 收回 idle，CLI 端 _wait_runner_stop 的
         processEvents 轮询照常工作（只是不再阻塞在 wait_procs 上）。
         """
-        if not self._proc or self._state != "running":
+        if not self._proc or self._state not in ("starting", "running"):
             return
         self._set_state("stopping")
         self._manually_stopped = True

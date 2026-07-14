@@ -74,7 +74,9 @@ def _start_local_server(window: MainWindow) -> QLocalServer | None:
         return None
 
     def _on_new_connection():
-        from src.core.cli_server import handle_cli_request, handle_async_cli_request
+        from src.core.cli_server import (
+            _send_response, handle_async_cli_request, handle_cli_request,
+        )
         import json
 
         sock = server.nextPendingConnection()
@@ -98,6 +100,13 @@ def _start_local_server(window: MainWindow) -> QLocalServer | None:
                         return
             except json.JSONDecodeError:
                 pass
+            except Exception as exc:
+                app_log.get_logger("main").exception("异步 CLI 命令执行异常")
+                _send_response(sock, {
+                    "ok": False,
+                    "error": f"cli command failed: {type(exc).__name__}: {exc}",
+                })
+                return
 
         # 老协议：打开项目路径
         window.activate_and_open(data or None)

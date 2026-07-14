@@ -731,23 +731,18 @@ def _cmd_git_status(tab) -> dict:
 
 
 def _get_health_markers(project_type: str) -> tuple[str, ...]:
-    """按项目类型返回就绪检测关键字。"""
-    if project_type.startswith("spring-boot") or project_type in ("gradle-java", "maven-java"):
-        return ("Started ", "Netty started on port", "Tomcat started on port",
-                "Undertow started on port", "Jetty started on port")
-    if project_type in ("vue", "react", "next", "nuxt", "svelte", "node"):
-        return ("Compiled successfully", "compiled successfully", "ready in ",
-                "running here", "Local:", "VITE", "webpack compiled")
-    if project_type in ("fastapi", "django", "flask", "python", "python-poetry"):
-        return ("Uvicorn running", "Application startup complete",
-                "Starting development server", "Running on http")
-    # 通用兜底
-    return ("Started ", "ready in ", "compiled successfully",
-            "Compiled successfully", "running here", "Local:",
-            "Uvicorn running", "Application startup complete")
+    """兼容旧内部调用；标记的唯一来源在 launch_tracker。"""
+    from src.core.launch_tracker import health_markers
+    return health_markers(project_type)
 
 
-def _cmd_health_async(tab, module: str | None, timeout: int, sock: QLocalSocket) -> None:
+def _cmd_health_async(
+    tab,
+    module: str | None,
+    timeout: int,
+    sock: QLocalSocket,
+    generations: dict[str, int | None] | None = None,
+) -> None:
     """异步等待模块启动完成，检测日志中的启动标记或端口监听。"""
     from src.ui.project_tab import ProjectTab
     tab: ProjectTab
@@ -755,7 +750,22 @@ def _cmd_health_async(tab, module: str | None, timeout: int, sock: QLocalSocket)
     start_time = time.time()
     deadline = start_time + timeout
 
-    markers = _get_health_markers(tab.project_meta.project_type)
+    if generations is None:
+        generations = tab.service_controller.snapshot_launch_generations(module)
+
+    def _generation(target: str) -> int | None:
+        return generations.get(target) if generations else None
+
+    def _terminal_error(detail: dict) -> bool:
+        error = detail.get("error")
+        if not error:
+            return False
+        payload = {"ok": False, "error": error}
+        payload.update(detail)
+        _send_response(sock, payload)
+        timer.stop()
+        timer.deleteLater()
+        return True
 
     def _check():
         now = time.time()
@@ -772,7 +782,9 @@ def _cmd_health_async(tab, module: str | None, timeout: int, sock: QLocalSocket)
 
         if tab._is_multi_module:
             if module:
-                ok, detail = tab.service_controller.module_health_ok(module, markers)
+                ok, detail = tab.service_controller.module_health_ok(
+                    module, _generation(module),
+                )
                 if ok:
                     elapsed_ms = int((time.time() - start_time) * 1000)
                     payload = {"ok": True, "elapsed_ms": elapsed_ms}
@@ -781,13 +793,27 @@ def _cmd_health_async(tab, module: str | None, timeout: int, sock: QLocalSocket)
                     timer.stop()
                     timer.deleteLater()
                     return
+                if _terminal_error(detail):
+                    return
             else:
                 details = []
                 all_ok = True
                 for mod_name, _path, _port, _cls in tab.project_meta.spring_boot_modules:
-                    ok, detail = tab.service_controller.module_health_ok(mod_name, markers)
+                    ok, detail = tab.service_controller.module_health_ok(
+                        mod_name, _generation(mod_name),
+                    )
                     details.append(detail)
                     all_ok = all_ok and ok
+                    if not ok and detail.get("error"):
+                        _send_response(sock, {
+                            "ok": False,
+                            "error": detail["error"],
+                            "module": mod_name,
+                            "modules": details,
+                        })
+                        timer.stop()
+                        timer.deleteLater()
+                        return
                 if details and all_ok:
                     elapsed_ms = int((time.time() - start_time) * 1000)
                     _send_response(sock, {
@@ -800,7 +826,10 @@ def _cmd_health_async(tab, module: str | None, timeout: int, sock: QLocalSocket)
                     return
             return
 
-        ok, detail = tab.service_controller.single_project_health_ok(markers)
+        target = tab.project_meta.name
+        ok, detail = tab.service_controller.single_project_health_ok(
+            _generation(target),
+        )
         if ok:
             elapsed_ms = int((time.time() - start_time) * 1000)
             payload = {"ok": True, "elapsed_ms": elapsed_ms}
@@ -808,6 +837,8 @@ def _cmd_health_async(tab, module: str | None, timeout: int, sock: QLocalSocket)
             _send_response(sock, payload)
             timer.stop()
             timer.deleteLater()
+            return
+        if _terminal_error(detail):
             return
 
     timer = QTimer()
@@ -844,7 +875,8 @@ def _cmd_ensure_running_async(
         if start_result.get("ok") is False and start_result.get("error") != "already running":
             _send_response(sock, start_result)
             return
-    _cmd_health_async(tab, module, timeout, sock)
+    generations = tab.service_controller.snapshot_launch_generations(module)
+    _cmd_health_async(tab, module, timeout, sock, generations)
 
 
 def _cmd_start_or_restart_wait_async(
@@ -865,7 +897,8 @@ def _cmd_start_or_restart_wait_async(
     if result.get("ok") is False and result.get("error") != "already running":
         _send_response(sock, result)
         return
-    _cmd_health_async(tab, module, timeout, sock)
+    generations = tab.service_controller.snapshot_launch_generations(module)
+    _cmd_health_async(tab, module, timeout, sock, generations)
 
 
 def _cmd_compile_async(tab, sock: QLocalSocket, timeout: int = 300) -> None:
@@ -873,29 +906,25 @@ def _cmd_compile_async(tab, sock: QLocalSocket, timeout: int = 300) -> None:
     from src.ui.project_tab import ProjectTab
     tab: ProjectTab
 
-    started = tab.service_controller.begin_compile()
-    if not started.get("ok"):
-        _send_response(sock, started)
+    prepared = tab.service_controller.prepare_compile()
+    if not prepared.get("ok"):
+        _send_response(sock, prepared)
         return
-    runner = started["runner"]
-    doc = started["doc"]
-    start_block = started["start_block"]
+    runner = prepared["runner"]
 
-    # 状态用 list 装，方便闭包改写；done 防止 finished 与超时重复响应
+    # finished/output 信号必须在 runner.start 之前连接。极快命令可能在 start 返回前
+    # 就结束，先启动再 connect 会永远收不到 finished，只能错误地等到超时。
     state = {"done": False}
+    output_lines: list[str] = []
 
     def _collect_output() -> str:
-        end_block = doc.blockCount()
-        output_lines = []
-        block = doc.findBlockByNumber(start_block)
-        count = 0
-        while block.isValid() and count < (end_block - start_block):
-            text = block.text()
-            if text:
-                output_lines.append(text)
-            block = block.next()
-            count += 1
-        return "\n".join(output_lines[-200:])  # 最多 200 行
+        return "\n".join(output_lines[-200:])
+
+    def _on_output(_stream: str, line: str) -> None:
+        if line:
+            output_lines.append(line)
+            if len(output_lines) > 200:
+                del output_lines[:-200]
 
     def _finish(payload: dict) -> None:
         if state["done"]:
@@ -905,6 +934,10 @@ def _cmd_compile_async(tab, sock: QLocalSocket, timeout: int = 300) -> None:
         deadline_timer.deleteLater()
         try:
             runner.finished.disconnect(_on_finished)
+        except (RuntimeError, TypeError):
+            pass
+        try:
+            runner.outputLine.disconnect(_on_output)
         except (RuntimeError, TypeError):
             pass
         if sock.state() == QLocalSocket.LocalSocketState.ConnectedState:
@@ -919,10 +952,20 @@ def _cmd_compile_async(tab, sock: QLocalSocket, timeout: int = 300) -> None:
         # 超时：编译还在跑，返回超时（不强停编译，让它在 GUI 里继续）
         _finish({"ok": False, "error": "compile timeout", "output": _collect_output()})
 
-    runner.finished.connect(_on_finished)
-
     deadline_timer = QTimer()
     deadline_timer.setSingleShot(True)
     deadline_timer.setInterval(max(1, timeout) * 1000)
     deadline_timer.timeout.connect(_on_deadline)
     deadline_timer.start()
+
+    runner.outputLine.connect(_on_output)
+    runner.finished.connect(_on_finished)
+    try:
+        started = tab.service_controller.start_prepared_compile(prepared)
+    except Exception as exc:
+        tab.service_controller.abort_prepared_compile()
+        log.exception("CLI compile start failed")
+        _finish({"ok": False, "error": f"failed to start compile: {exc}"})
+        return
+    if not started.get("ok"):
+        _finish(started)

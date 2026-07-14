@@ -17,6 +17,7 @@ modules = [
     "src.core.config",
     "src.core.project_detector",
     "src.core.process_runner",
+    "src.core.launch_tracker",
     "src.core.file_actions",
     "src.core.file_preview_model",
     "src.core.git_context",
@@ -286,6 +287,253 @@ def file_preview_model_check() -> list[str]:
     return failed
 
 
+def launch_and_operation_guard_check() -> list[str]:
+    """验证旧启动日志隔离、代次切换以及项目级编译/启停互斥。"""
+    from types import SimpleNamespace
+
+    from src.core.launch_tracker import LaunchTracker
+    from src.core.process_runner import ProcessRunner, RunContext
+    from src.ui.project_service_controller import ProjectServiceController
+
+    failed: list[str] = []
+    tracker = LaunchTracker("spring-boot-gradle")
+    tracker.record_output("application", "Started OldApplication in 1.0 seconds")
+    first = tracker.begin("application")
+    state = tracker.state("application", first)
+    if state is None or state.ready:
+        failed.append("a marker emitted before begin must not satisfy a new launch")
+    tracker.record_output("application", "preparing context")
+    if tracker.state("application", first).ready:
+        failed.append("non-ready output must not mark launch ready")
+    tracker.record_output("application", "Started NewApplication in 2.0 seconds")
+    if not tracker.state("application", first).ready:
+        failed.append("a marker emitted after begin should satisfy that generation")
+    second = tracker.begin("application")
+    if not tracker.is_superseded("application", first):
+        failed.append("a newer restart must supersede the previous generation")
+    if tracker.state("application", second).ready:
+        failed.append("new generation must not inherit the previous ready marker")
+    gateway = tracker.begin("gateway")
+    tracker.record_output("application", "Started NewerApplication")
+    if tracker.state("gateway", gateway).ready:
+        failed.append("module launch readiness must be independent")
+
+    real_runner = ProcessRunner()
+    for busy_state in ("starting", "running", "stopping"):
+        real_runner._state = busy_state
+        if real_runner.start(["must-not-run"], RunContext(cwd=str(ROOT))):
+            failed.append(f"ProcessRunner must reject reentry while {busy_state}")
+    real_runner._state = "idle"
+
+    class FakeRunner:
+        def __init__(self, state: str = "idle"):
+            self._state = state
+
+        def state(self) -> str:
+            return self._state
+
+        def is_running(self) -> bool:
+            return self._state == "running"
+
+        def stop_cleanup_pending(self) -> bool:
+            return False
+
+    profile = SimpleNamespace(kind="compile", name="compile")
+
+    class FakeTab:
+        _is_multi_module = True
+        project_meta = SimpleNamespace(
+            project_type="spring-boot-gradle",
+            name="demo",
+            spring_boot_modules=[("application", "", None, "")],
+        )
+        runner = FakeRunner()
+        module_runners = {"application": FakeRunner("running")}
+        _module_ports: dict[str, int] = {}
+        _module_external_pids: dict[str, int] = {}
+        _current_profile = None
+
+        def _detect_and_apply_external(self) -> None:
+            pass
+
+        def _find_compile_profile(self):
+            return profile
+
+    tab = FakeTab()
+    controller = ProjectServiceController(tab)
+    conflict = controller.prepare_compile()
+    if conflict.get("code") != "services_running":
+        failed.append(f"compile must reject a managed running module, got {conflict!r}")
+
+    tab.module_runners["application"]._state = "idle"
+    tab._module_external_pids["application"] = 1234
+    conflict = controller.prepare_compile()
+    if conflict.get("code") != "services_running":
+        failed.append(f"compile must reject an external running module, got {conflict!r}")
+
+    tab._module_external_pids.clear()
+    prepared = controller.prepare_compile()
+    if not prepared.get("ok"):
+        failed.append(f"compile should reserve when all services are stopped: {prepared!r}")
+    start_conflict = controller.service_start_error()
+    if start_conflict is None or start_conflict.get("code") != "build_in_progress":
+        failed.append("start/restart must be blocked while compile is reserved")
+    controller.abort_prepared_compile()
+
+    tab.runner._state = "running"
+    tab._current_profile = profile
+    start_conflict = controller.service_start_error()
+    if start_conflict is None or start_conflict.get("code") != "build_in_progress":
+        failed.append("start/restart must be blocked while project build runner is active")
+
+    if failed:
+        for msg in failed:
+            print(f"[FAIL] launch_guard: {msg}", flush=True)
+    else:
+        print("[OK]   launch generation and operation guard", flush=True)
+    return failed
+
+
+def compile_wait_check() -> list[str]:
+    """验证 compile 在启动进程前挂监听，且只有真实 finished 才响应成功。"""
+    from types import SimpleNamespace
+
+    from PySide6.QtNetwork import QLocalSocket
+
+    from src.core import cli_server
+
+    failed: list[str] = []
+
+    class FakeSignal:
+        def __init__(self):
+            self.callbacks = []
+
+        def connect(self, callback) -> None:
+            self.callbacks.append(callback)
+
+        def disconnect(self, callback) -> None:
+            if callback not in self.callbacks:
+                raise TypeError("not connected")
+            self.callbacks.remove(callback)
+
+        def emit(self, *args) -> None:
+            for callback in list(self.callbacks):
+                callback(*args)
+
+    class FakeTimer:
+        def __init__(self):
+            self.timeout = FakeSignal()
+            self.running = False
+
+        def setSingleShot(self, _value) -> None:
+            pass
+
+        def setInterval(self, _value) -> None:
+            pass
+
+        def start(self) -> None:
+            self.running = True
+
+        def stop(self) -> None:
+            self.running = False
+
+        def deleteLater(self) -> None:
+            pass
+
+    class FakeRunner:
+        def __init__(self):
+            self.outputLine = FakeSignal()
+            self.finished = FakeSignal()
+
+    class FakeSocket:
+        def state(self):
+            return QLocalSocket.LocalSocketState.ConnectedState
+
+    class FakeController:
+        def __init__(self, runner, finish_inside_start: bool):
+            self.runner = runner
+            self.finish_inside_start = finish_inside_start
+            self.listener_was_ready = False
+
+        def prepare_compile(self):
+            return {"ok": True, "runner": self.runner, "profile": object()}
+
+        def start_prepared_compile(self, _prepared):
+            self.listener_was_ready = bool(self.runner.finished.callbacks)
+            self.runner.outputLine.emit("stdout", "BUILD SUCCESSFUL")
+            if self.finish_inside_start:
+                self.runner.finished.emit(0)
+            return {"ok": True}
+
+        def abort_prepared_compile(self) -> None:
+            pass
+
+    original_timer = cli_server.QTimer
+    original_send = cli_server._send_response
+    sent: list[dict] = []
+    cli_server.QTimer = FakeTimer
+    cli_server._send_response = lambda _sock, payload: sent.append(payload)
+    try:
+        runner = FakeRunner()
+        controller = FakeController(runner, finish_inside_start=True)
+        tab = SimpleNamespace(service_controller=controller)
+        cli_server._cmd_compile_async(tab, FakeSocket(), timeout=30)
+        if not controller.listener_was_ready:
+            failed.append("finished listener must be connected before compile starts")
+        if len(sent) != 1 or not sent[0].get("ok") or "BUILD SUCCESSFUL" not in sent[0].get("output", ""):
+            failed.append(f"synchronous finish should return one success response: {sent!r}")
+
+        sent.clear()
+        runner = FakeRunner()
+        controller = FakeController(runner, finish_inside_start=False)
+        tab = SimpleNamespace(service_controller=controller)
+        cli_server._cmd_compile_async(tab, FakeSocket(), timeout=30)
+        if sent:
+            failed.append("compile must not respond before runner.finished")
+        runner.finished.emit(1)
+        if len(sent) != 1 or sent[0].get("ok") is not False or sent[0].get("exit_code") != 1:
+            failed.append(f"non-zero finished must return one failure response: {sent!r}")
+    finally:
+        cli_server.QTimer = original_timer
+        cli_server._send_response = original_send
+
+    if failed:
+        for msg in failed:
+            print(f"[FAIL] compile_wait: {msg}", flush=True)
+    else:
+        print("[OK]   compile waits for the current runner.finished", flush=True)
+    return failed
+
+
+def cli_response_and_packaging_check() -> list[str]:
+    """验证空响应失败语义和独立 console CLI 的打包约束。"""
+    from src.core.cli_client import _decode_response
+
+    failed: list[str] = []
+    result, error = _decode_response(b"")
+    if result is not None or error != "empty response":
+        failed.append("empty CLI response must be an explicit failure")
+    result, error = _decode_response(b"not-json\n")
+    if result is not None or error != "invalid response":
+        failed.append("invalid CLI response must be an explicit failure")
+    result, error = _decode_response(b'{"ok": true}\n')
+    if result != {"ok": True} or error is not None:
+        failed.append("valid CLI response should decode normally")
+
+    build_text = (ROOT / "scripts" / "build.bat").read_text(encoding="utf-8")
+    if "--name mini-ide-cli" not in build_text or "--console" not in build_text:
+        failed.append("build must produce a console-subsystem mini-ide-cli.exe")
+    if not (ROOT / "cli_main.py").is_file():
+        failed.append("console CLI entrypoint is missing")
+
+    if failed:
+        for msg in failed:
+            print(f"[FAIL] cli_reliability: {msg}", flush=True)
+    else:
+        print("[OK]   CLI response and console packaging reliability", flush=True)
+    return failed
+
+
 def content_search_cache_check() -> list[str]:
     """验证命中上限提前结束时，不会缓存半截文件清单。"""
     import tempfile
@@ -399,6 +647,9 @@ if __name__ == "__main__":
     model_failed = service_state_check()
     cli_failed = cli_parse_check()
     cli_encoding_failed = cli_output_encoding_check()
+    launch_guard_failed = launch_and_operation_guard_check()
+    compile_wait_failed = compile_wait_check()
+    cli_reliability_failed = cli_response_and_packaging_check()
     file_failed = file_action_check()
     preview_failed = file_preview_model_check()
     search_failed = content_search_cache_check()
@@ -420,7 +671,9 @@ if __name__ == "__main__":
 
     total_fail = (
         len(failed) + len(model_failed) + len(cli_failed)
-        + len(cli_encoding_failed) + len(file_failed) + len(preview_failed)
+        + len(cli_encoding_failed) + len(launch_guard_failed)
+        + len(compile_wait_failed) + len(cli_reliability_failed)
+        + len(file_failed) + len(preview_failed)
         + len(search_failed) + len(git_failed) + len(nginx_failed) + len(hex_hits)
     )
     print()

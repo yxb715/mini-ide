@@ -18,6 +18,7 @@ _build/pyinstaller-work/
 _build/dist/
 _build/*.spec
 mini-ide.exe
+mini-ide-cli.exe
 mini-ide-runtime/
 *.manifest
 
