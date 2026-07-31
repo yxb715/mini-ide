@@ -21,6 +21,10 @@ modules = [
     "src.core.file_actions",
     "src.core.file_preview_model",
     "src.core.git_context",
+    "src.core.path_utils",
+    "src.core.aggregate_workspace",
+    "src.core.aggregate_workspace_manager",
+    "src.core.development_workspace_service",
     "src.core.service_state",
     "src.core.tool_launchers",
     "src.core.workspace_manager",
@@ -36,6 +40,10 @@ modules = [
     "src.ui.service_panel",
     "src.ui.project_tab",
     "src.ui.empty_state",
+    "src.ui.aggregate_project_dialog",
+    "src.ui.aggregate_project_tab",
+    "src.ui.development_workspace_dialog",
+    "src.ui.workspace_review_dialog",
     "src.ui.file_tree",
     "src.ui.file_preview",
     "src.ui.syntax_highlighter",
@@ -52,6 +60,7 @@ modules = [
     "src.ui.main_window",
     "src.ui.toast",
     "src.util.editor",
+    "src.util.git_executable",
     "src.util.git_info",
     "src.util.notify",
 ]
@@ -140,15 +149,25 @@ def nginx_detector_check() -> list[str]:
 
 def cli_parse_check() -> list[str]:
     """验证公开 CLI 的关键参数能解析成稳定 JSON 命令。"""
-    from src.core.cli_client import _parse_args
+    from src.core.cli_client import _parse_args, _response_timeout_ms
 
     cases = [
         (["mini-ide.exe", "--status"], {"cmd": "status"}),
         (["mini-ide.exe", "--open", r"E:\demo"], {"cmd": "open", "path": r"E:\demo"}),
         (["mini-ide.exe", "--close", "server"], {"cmd": "close", "project": "server"}),
         (["mini-ide.exe", "--list-workspaces"], {"cmd": "list-workspaces"}),
-        (["mini-ide.exe", "--open-workspace", "race", "dev"], {"cmd": "open-workspace", "name": "race dev"}),
+        (["mini-ide.exe", "--open-workspace", "race", "dev"], {"cmd": "open-workspace", "target": "race dev"}),
         (["mini-ide.exe", "--close-workspace"], {"cmd": "close-workspace"}),
+        (["mini-ide.exe", "--list-aggregates"], {"cmd": "list-aggregates"}),
+        (["mini-ide.exe", "--open-aggregate", "race"],
+         {"cmd": "open-aggregate", "target": "race"}),
+        (["mini-ide.exe", "--create-development-workspace", "race", "certificate",
+          "--projects", "server,webapp-tenant", "--description", "证书功能"],
+         {"cmd": "create-development-workspace", "aggregate": "race",
+          "name": "certificate", "projects": ["server", "webapp-tenant"],
+          "description": "证书功能"}),
+        (["mini-ide.exe", "--workspace-delete-check", "certificate"],
+         {"cmd": "workspace-delete-check", "target": "certificate"}),
         (["mini-ide.exe", "--start", "server", "gateway", "--wait", "--timeout", "90"],
          {"cmd": "start", "project": "server", "module": "gateway", "wait": True, "timeout": 90}),
         (["mini-ide.exe", "--ensure-running", "server", "gateway", "--timeout", "120"],
@@ -170,6 +189,11 @@ def cli_parse_check() -> list[str]:
             failed.append(f"{argv[1]} parsed as {actual!r}, expected {expected!r}")
     if _parse_args(["mini-ide.exe", "--unknown"]) is not None:
         failed.append("unknown command should fail parsing")
+    for action in ("create-development-workspace",):
+        if _response_timeout_ms({"cmd": action}) < 605000:
+            failed.append(f"{action} should allow a complete workspace operation")
+    if _parse_args(["mini-ide.exe", "--start-profile", "race"]) is not None:
+        failed.append("removed runtime profile commands must not remain public")
 
     if failed:
         for msg in failed:
@@ -180,7 +204,7 @@ def cli_parse_check() -> list[str]:
 
 
 def cli_output_encoding_check() -> list[str]:
-    """验证 CLI 输出中文时不会被 Windows 英文代码页打崩。"""
+    """验证 CLI 输出中文时固定使用 UTF-8，并能兼容受限标准流。"""
     from src.core import cli_client
 
     class AsciiOnlyStream:
@@ -199,6 +223,34 @@ def cli_output_encoding_check() -> list[str]:
             pass
 
     failed: list[str] = []
+
+    class ReconfigurableStream:
+        def __init__(self) -> None:
+            self.encoding = "gbk"
+            self.errors = "strict"
+            self.data = bytearray()
+
+        def reconfigure(self, *, encoding: str, errors: str) -> None:
+            self.encoding = encoding
+            self.errors = errors
+
+        def write(self, text: str) -> None:
+            self.data.extend(text.encode(self.encoding, errors=self.errors))
+
+        def flush(self) -> None:
+            pass
+
+    utf8_stream = ReconfigurableStream()
+    cli_client._configure_stream_utf8(utf8_stream)
+    cli_client._safe_write(utf8_stream, '{"display_type": "Spring Boot (Gradle) · 多模块"}\n')
+    try:
+        utf8_output = bytes(utf8_stream.data).decode("utf-8")
+    except UnicodeDecodeError as e:
+        failed.append(f"configured CLI stream should emit UTF-8, got {e!r}")
+    else:
+        if "Spring Boot (Gradle) · 多模块" not in utf8_output:
+            failed.append("configured CLI stream should preserve Chinese output")
+
     stream = AsciiOnlyStream()
     original_win_write = cli_client._win_write_std
     cli_client._win_write_std = lambda kind, text: False
@@ -219,6 +271,906 @@ def cli_output_encoding_check() -> list[str]:
             print(f"[FAIL] cli_output_encoding: {msg}", flush=True)
     else:
         print("[OK]   cli_output_encoding fallback", flush=True)
+    return failed
+
+
+def external_launcher_check() -> list[str]:
+    """验证 Codex 右键入口使用参数数组且保留目标目录。"""
+    from src.core import tool_launchers
+
+    failed: list[str] = []
+    target = Path(r"E:\race workspace\certificate")
+    original_which = tool_launchers.shutil.which
+
+    def fake_which(name: str) -> str | None:
+        values = {
+            "wt.exe": r"C:\Windows\wt.exe",
+            "pwsh.exe": r"C:\Program Files\PowerShell\7\pwsh.exe",
+        }
+        return values.get(name)
+
+    tool_launchers.shutil.which = fake_which
+    try:
+        args = tool_launchers.open_in_codex_args(target)
+    finally:
+        tool_launchers.shutil.which = original_which
+
+    if not isinstance(args, list) or str(target) not in args:
+        failed.append("Codex launcher must preserve the target directory in argv")
+    if not args or args[-1] != "codex":
+        failed.append("Codex launcher must invoke the codex command")
+    if tool_launchers.CREATE_NO_WINDOW != 0x08000000:
+        failed.append("Codex launcher subprocess must keep CREATE_NO_WINDOW")
+
+    if failed:
+        for msg in failed:
+            print(f"[FAIL] external_launcher: {msg}", flush=True)
+    else:
+        print("[OK]   Codex external launcher", flush=True)
+    return failed
+
+
+def git_executable_resolution_check() -> list[str]:
+    """Verify Git for Windows launcher paths resolve to the real binary."""
+    import tempfile
+
+    from src.util import git_executable
+
+    failed: list[str] = []
+    if sys.platform != "win32":
+        print("[OK]   git executable resolution (non-Windows skip)", flush=True)
+        return failed
+
+    original_which = git_executable.shutil.which
+    with tempfile.TemporaryDirectory() as tmp:
+        install_root = Path(tmp) / "Git"
+        wrapper = install_root / "cmd" / "git.exe"
+        real_git = install_root / "mingw64" / "bin" / "git.exe"
+        wrapper.parent.mkdir(parents=True)
+        real_git.parent.mkdir(parents=True)
+        wrapper.touch()
+        real_git.touch()
+        try:
+            git_executable.shutil.which = lambda _name: str(wrapper)
+            git_executable.resolve_git_executable.cache_clear()
+            resolved = git_executable.resolve_git_executable()
+        finally:
+            git_executable.shutil.which = original_which
+            git_executable.resolve_git_executable.cache_clear()
+
+    if Path(resolved) != real_git:
+        failed.append(f"Git wrapper should resolve to the real binary: {resolved}")
+
+    if failed:
+        for msg in failed:
+            print(f"[FAIL] git_executable: {msg}", flush=True)
+    else:
+        print("[OK]   Git executable resolution", flush=True)
+    return failed
+
+
+def aggregate_workspace_model_check() -> list[str]:
+    """验证聚合项目/开发工作区模型、迁移和路径安全边界。"""
+    import json
+    import subprocess
+    import tempfile
+
+    from src.core.aggregate_workspace import (
+        AggregateConfigError, AggregateProject, DevelopmentWorkspace,
+        load_aggregate_project, load_development_workspace,
+        save_aggregate_project, save_development_workspace,
+    )
+    from src.core.path_utils import PathBoundaryError, normalized_path_key
+    from src.util.git_executable import resolve_git_executable
+
+    failed: list[str] = []
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "race"
+        for name in ("server", "nginx"):
+            (root / name).mkdir(parents=True)
+
+        config = {
+            "id": "race",
+            "name": "race",
+            "kind": "aggregate",
+            "workspaceDirectory": "workspace",
+            "components": [
+                {"id": "server", "path": "server", "type": "java"},
+                {
+                    "id": "nginx", "path": "nginx", "type": "nginx",
+                    "shared": True,
+                },
+            ],
+            "profiles": [{
+                "id": "daily",
+                "name": "日常开发",
+                "startGroups": [["server"], ["nginx"]],
+            }],
+        }
+        project = AggregateProject.from_dict(root, config)
+        if project.schema_version != 1:
+            failed.append("unversioned aggregate draft should migrate to schemaVersion 1")
+        if project.component("SERVER") is None:
+            failed.append("stable component id lookup should be case-insensitive")
+        if project.profiles[0].start_groups != (("server",), ("nginx",)):
+            failed.append("runtime profile groups should preserve stage boundaries")
+
+        config_path = save_aggregate_project(project)
+        saved = json.loads(config_path.read_text(encoding="utf-8"))
+        if saved.get("schemaVersion") != 1:
+            failed.append("saved aggregate config should contain schemaVersion 1")
+        loaded = load_aggregate_project(root)
+        if loaded.to_dict() != project.to_dict():
+            failed.append("aggregate config should round-trip without semantic changes")
+
+        creationflags = 0x08000000 if sys.platform == "win32" else 0
+        git_exe = resolve_git_executable()
+
+        def git(*args: str) -> str:
+            result = subprocess.run(
+                [git_exe, *args],
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                capture_output=True,
+                creationflags=creationflags,
+                check=False,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(result.stderr.strip() or result.stdout.strip())
+            return result.stdout.strip()
+
+        source_repo = root / "server"
+        (source_repo / "README.md").write_text("seed\n", encoding="utf-8")
+        git("init", "-b", "main", str(source_repo))
+        git("-C", str(source_repo), "config", "user.name", "mini-ide smoke")
+        git("-C", str(source_repo), "config", "user.email", "smoke@mini-ide.local")
+        git("-C", str(source_repo), "add", "README.md")
+        git("-C", str(source_repo), "commit", "-m", "seed")
+        base_commit = git("-C", str(source_repo), "rev-parse", "HEAD")
+
+        duplicate = dict(config)
+        duplicate["components"] = list(config["components"]) + [
+            {"id": "SERVER", "path": "server", "type": "java"},
+        ]
+        try:
+            AggregateProject.from_dict(root, duplicate)
+            failed.append("component ids must be unique case-insensitively")
+        except AggregateConfigError:
+            pass
+
+        unknown_profile = dict(config)
+        unknown_profile["profiles"] = [{
+            "id": "bad", "name": "bad", "startGroups": [["missing"]],
+        }]
+        try:
+            AggregateProject.from_dict(root, unknown_profile)
+            failed.append("runtime profiles must not reference unknown components")
+        except AggregateConfigError:
+            pass
+
+        escaped = dict(config)
+        escaped["components"] = [
+            {"id": "server", "path": "../outside", "type": "java"},
+        ]
+        try:
+            AggregateProject.from_dict(root, escaped)
+            failed.append("aggregate component path must not escape the project root")
+        except PathBoundaryError:
+            pass
+
+        workspace_root = root / "workspace" / "certificate"
+        workspace_root.mkdir(parents=True)
+        git(
+            "-C", str(source_repo), "worktree", "add", "-b",
+            "feature/certificate-server", str(workspace_root / "server"),
+            base_commit,
+        )
+        workspace_data = {
+            "schemaVersion": 1,
+            "id": "certificate",
+            "name": "certificate",
+            "createdAt": "2026-07-29T18:00:00+08:00",
+            "aggregateProjectPath": str(root),
+            "status": "active",
+            "components": [
+                {
+                    "id": "server",
+                    "sourceRepositoryPath": str(root / "server"),
+                    "worktreePath": "server",
+                    "baseBranch": "main",
+                    "baseCommit": base_commit,
+                    "taskBranch": "feature/certificate-server",
+                    "mode": "worktree",
+                },
+                {
+                    "id": "nginx",
+                    "sourceRepositoryPath": str(root / "nginx"),
+                    "mode": "shared",
+                },
+            ],
+            "lastProfileId": "daily",
+            "runtimeStateRef": "race/certificate",
+        }
+        workspace = DevelopmentWorkspace.from_dict(
+            workspace_root, workspace_data, aggregate_project=project,
+        )
+        server = next(item for item in workspace.components if item.id == "server")
+        if normalized_path_key(server.worktree_path) != normalized_path_key(
+            workspace_root / "server"
+        ):
+            failed.append("worktree path should be normalized inside the task root")
+        if not (Path(server.worktree_path) / ".git").is_file():
+            failed.append("temporary Git fixture should use a real linked Worktree")
+
+        workspace_path = save_development_workspace(
+            workspace, aggregate_project=project,
+        )
+        if not workspace_path.is_file():
+            failed.append("development workspace config should be written atomically")
+        reloaded_workspace = load_development_workspace(
+            workspace_root, aggregate_project=project,
+        )
+        if reloaded_workspace.to_dict() != workspace.to_dict():
+            failed.append("development workspace config should round-trip")
+
+        escaped_workspace = dict(workspace_data)
+        escaped_components = [dict(item) for item in workspace_data["components"]]
+        escaped_components[0]["worktreePath"] = "../event/server"
+        escaped_workspace["components"] = escaped_components
+        try:
+            DevelopmentWorkspace.from_dict(
+                workspace_root, escaped_workspace, aggregate_project=project,
+            )
+            failed.append("worktree path must not escape the task root")
+        except PathBoundaryError:
+            pass
+
+    if failed:
+        for msg in failed:
+            print(f"[FAIL] aggregate_workspace: {msg}", flush=True)
+    else:
+        print("[OK]   aggregate workspace models and path boundaries", flush=True)
+    return failed
+
+
+def development_workspace_lifecycle_check() -> list[str]:
+    """用真实临时 Git 仓库验证创建、失败回滚、Review 和保守删除。"""
+    import subprocess
+    import tempfile
+
+    from src.core.aggregate_workspace import AggregateProject, load_development_workspace
+    from src.core import development_workspace_service as service
+    from src.util.git_executable import resolve_git_executable
+
+    failed: list[str] = []
+    creationflags = 0x08000000 if sys.platform == "win32" else 0
+    git_exe = resolve_git_executable()
+
+    def git(*args: str) -> str:
+        result = subprocess.run(
+            [git_exe, *args], capture_output=True, text=True,
+            encoding="utf-8", errors="replace", creationflags=creationflags,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or result.stdout.strip())
+        return result.stdout.strip()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "suite"
+        repo_one = root / "server"
+        repo_two = root / "webapp"
+        shared = root / "nginx"
+        for repo in (repo_one, repo_two):
+            repo.mkdir(parents=True)
+            (repo / "README.md").write_text(f"{repo.name}\n", encoding="utf-8")
+            git("init", "-b", "main", str(repo))
+            git("-C", str(repo), "config", "user.name", "mini-ide smoke")
+            git("-C", str(repo), "config", "user.email", "smoke@mini-ide.local")
+            git("-C", str(repo), "add", "README.md")
+            git("-C", str(repo), "commit", "-m", "seed")
+        shared.mkdir(parents=True)
+        project = AggregateProject.from_dict(root, {
+            "schemaVersion": 1,
+            "id": "suite",
+            "name": "suite",
+            "kind": "aggregate",
+            "workspaceDirectory": "workspace",
+            "components": [
+                {"id": "server", "path": "server", "type": "java"},
+                {"id": "webapp", "path": "webapp", "type": "frontend"},
+                {"id": "nginx", "path": "nginx", "type": "nginx", "shared": True},
+            ],
+            "profiles": [{
+                "id": "daily", "name": "日常开发",
+                "startGroups": [["server", "webapp"], ["nginx"]],
+            }],
+        })
+
+        remote_task_branch = "feature/remote-conflict-server"
+        git(
+            "-C", str(repo_one), "update-ref",
+            f"refs/remotes/origin/{remote_task_branch}", "HEAD",
+        )
+        try:
+            service.build_workspace_creation_plan(
+                project, "remote-conflict", "远端分支冲突", ["server"],
+            )
+            failed.append("cached remote task branch must block workspace creation")
+        except service.WorkspaceOperationError:
+            pass
+        finally:
+            git(
+                "-C", str(repo_one), "update-ref", "-d",
+                f"refs/remotes/origin/{remote_task_branch}",
+            )
+
+        # 主工作目录有未提交内容不阻止从明确 HEAD 创建 Worktree。
+        (repo_one / "LOCAL_ONLY.txt").write_text("dirty source\n", encoding="utf-8")
+        plan = service.build_workspace_creation_plan(
+            project, "certificate", "证书任务", ["server"],
+        )
+        result = service.create_development_workspace(plan)
+        if not result.ok or result.workspace is None:
+            failed.append(f"workspace creation should succeed: {result.error}")
+        else:
+            workspace = result.workspace
+            if not (Path(workspace.root_path) / "server" / ".git").is_file():
+                failed.append("selected Git component should be a linked Worktree")
+            if (Path(workspace.root_path) / "webapp").exists():
+                failed.append("unselected repository must not be copied")
+            if (Path(workspace.root_path) / "nginx").exists():
+                failed.append("shared component must not be copied")
+            agents = (Path(workspace.root_path) / "AGENTS.md").read_text(encoding="utf-8")
+            required_agents_text = (
+                "证书任务", project.root_path, plan.components[0].source_path,
+                plan.components[0].base_branch,
+                plan.components[0].base_commit, plan.components[0].task_branch,
+                plan.components[0].target_path, "webapp", "nginx", "AGENTS.md", "mini-ide",
+            )
+            if any(text not in agents for text in required_agents_text):
+                failed.append(
+                    "task AGENTS.md should preserve source, base, branch, merge and edit boundaries"
+                )
+            if workspace.description != "证书任务":
+                failed.append("workspace description should round-trip")
+
+            untracked = Path(workspace.root_path) / "server" / "UNTRACKED.txt"
+            untracked.write_text("block delete\n", encoding="utf-8")
+            delete_plan = service.inspect_workspace_delete(workspace)
+            if delete_plan.can_delete or not any("未提交" in item for item in delete_plan.blockers):
+                failed.append("dirty Worktree must block the whole deletion")
+            untracked.unlink()
+
+            worktree = Path(workspace.root_path) / "server"
+            (worktree / "README.md").write_text("feature\n", encoding="utf-8")
+            git("-C", str(worktree), "add", "README.md")
+            git("-C", str(worktree), "commit", "-m", "feature")
+            review = service.review_development_workspace(workspace)
+            if len(review) != 1 or not review[0].commits:
+                failed.append("workspace Review should include task commits by component")
+            elif any(
+                value != "未记录"
+                for value in (
+                    review[0].compile_result,
+                    review[0].health_result,
+                    review[0].test_result,
+                )
+            ):
+                failed.append("unrecorded verification results must be explicit")
+            reviewed_workspace = load_development_workspace(
+                workspace.root_path, aggregate_project=project,
+            )
+            if reviewed_workspace.status != "reviewing":
+                failed.append("Review should move an active workspace to reviewing")
+            merge_dirty = worktree / "MERGE_DIRTY.txt"
+            merge_dirty.write_text("block merge\n", encoding="utf-8")
+            dirty_merge = service.merge_development_workspace(workspace)
+            if dirty_merge.ok or "工作区有未提交" not in dirty_merge.error:
+                failed.append("workspace merge must block dirty task Worktrees")
+            merge_dirty.unlink()
+            delete_plan = service.inspect_workspace_delete(workspace)
+            if delete_plan.can_delete or not any("未合并" in item for item in delete_plan.blockers):
+                failed.append("unmerged and unpushed task branch must block deletion")
+
+            if not (repo_one / "LOCAL_ONLY.txt").is_file():
+                failed.append("workspace creation and Review must preserve source dirty files")
+            base_head = git("-C", str(repo_one), "rev-parse", "HEAD")
+            blocked_merge = service.merge_development_workspace(workspace)
+            if blocked_merge.ok or "源目录有未提交" not in blocked_merge.error:
+                failed.append("workspace merge must block a dirty source checkout")
+            if git("-C", str(repo_one), "rev-parse", "HEAD") != base_head:
+                failed.append("blocked workspace merge must not move the base branch")
+            (repo_one / "LOCAL_ONLY.txt").unlink()
+            merge_result = service.merge_development_workspace(workspace)
+            if not merge_result.ok or not all(item.merged for item in merge_result.components):
+                failed.append(f"clean workspace should fast-forward merge: {merge_result.error}")
+            merged_workspace = load_development_workspace(
+                workspace.root_path, aggregate_project=project,
+            )
+            if merged_workspace.status != "merged":
+                failed.append("successful workspace merge should mark the workspace merged")
+            unknown = Path(workspace.root_path) / "unknown.txt"
+            unknown.write_text("keep\n", encoding="utf-8")
+            delete_plan = service.inspect_workspace_delete(workspace)
+            if delete_plan.can_delete or not delete_plan.unknown_paths:
+                failed.append("unknown task-root files must block deletion")
+            unknown.unlink()
+            delete_plan = service.inspect_workspace_delete(workspace)
+            if not delete_plan.can_delete:
+                failed.append(f"merged clean workspace should be deletable: {delete_plan.blockers!r}")
+            else:
+                ok, kept, error = service.delete_development_workspace(delete_plan)
+                if not ok or error or Path(workspace.root_path).exists():
+                    failed.append(f"safe workspace deletion failed: {error}; kept={kept!r}")
+        # 第二个仓库创建失败时，只回滚本次已创建且仍干净的 Worktree。
+        partial_plan = service.build_workspace_creation_plan(
+            project, "partial", "失败回滚", ["server", "webapp"],
+        )
+        original_run_git = service._run_git
+
+        def fail_second(cwd, args, timeout=30):
+            if args[:2] == ["worktree", "add"] and str(args[4]).endswith("webapp"):
+                return 1, "", "injected failure"
+            return original_run_git(cwd, args, timeout)
+
+        service._run_git = fail_second
+        try:
+            partial = service.create_development_workspace(partial_plan)
+        finally:
+            service._run_git = original_run_git
+        if partial.ok or "server" not in partial.rolled_back_components:
+            failed.append(f"partial failure should roll back the first clean Worktree: {partial!r}")
+        if Path(partial_plan.root_path).exists():
+            failed.append("fully rolled-back partial workspace root should be removed")
+
+    if failed:
+        for msg in failed:
+            print(f"[FAIL] development_workspace_lifecycle: {msg}", flush=True)
+    else:
+        print("[OK]   development workspace create/review/delete lifecycle", flush=True)
+    return failed
+
+
+def aggregate_runtime_ui_check() -> list[str]:
+    """验证一个聚合目录 Tab 内含项目和需求工作区，且项目单独启停。"""
+    import tempfile
+    import time
+    from types import SimpleNamespace
+
+    from PySide6.QtWidgets import QApplication, QTableWidgetItem
+
+    from src.core.aggregate_workspace import AggregateProject
+    from src.core.cli_server import _find_project_tab
+    from src.core.config import AppConfig
+    from src.ui.aggregate_project_tab import AggregateProjectTab
+
+    failed: list[str] = []
+    app = QApplication.instance() or QApplication([])
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "suite"
+        (root / "server").mkdir(parents=True)
+        (root / "webapp").mkdir(parents=True)
+        project = AggregateProject.from_dict(root, {
+            "schemaVersion": 1,
+            "id": "suite",
+            "name": "suite",
+            "kind": "aggregate",
+            "workspaceDirectory": "workspace",
+            "components": [
+                {"id": "server", "path": "server", "type": "java"},
+                {"id": "webapp", "path": "webapp", "type": "frontend"},
+            ],
+            "profiles": [],
+        })
+        tab = AggregateProjectTab(project, AppConfig())
+        deadline = time.time() + 5
+        while tab._prepare_worker is not None and time.time() < deadline:
+            worker = tab._prepare_worker
+            app.processEvents()
+            if worker is not None:
+                worker.wait(50)
+        app.processEvents()
+        if tab.project_meta.project_type != "aggregate":
+            failed.append("aggregate root must open as aggregate environment, not generic project")
+        if tab.project_table.rowCount() != 2 or set(tab.component_tabs) != {"server", "webapp"}:
+            failed.append("aggregate tab must keep all projects inside one top-level workbench")
+        if tab.view_tabs.count() != 2 or tab.view_tabs.tabText(1) != "需求工作区":
+            failed.append("aggregate tab must contain its own workspace panel")
+        if tab.detail_stack.count() != 3:
+            failed.append("project details should remain internal to the aggregate tab")
+        if (
+            tab.project_codex_button.text() != "在 Codex 中打开"
+            or tab.project_cc_button.text() != "在 cc 中打开"
+        ):
+            failed.append("project view must expose Codex and cc for the current environment")
+        if tab._current_environment_root() != Path(project.root_path):
+            failed.append("project tools must open the aggregate root in source mode")
+        if hasattr(tab, "enter_workspace_button") or hasattr(tab, "review_button"):
+            failed.append("workspace toolbar must rely on double-click and omit Review")
+        if tab.merge_button.text() != "合并代码" or tab.delete_button.text() != "删除":
+            failed.append("workspace toolbar must expose concise merge and delete actions")
+        double_clicks: list[bool] = []
+        tab._activate_selected_workspace = lambda: double_clicks.append(True)
+        tab.workspace_table.itemDoubleClicked.emit(QTableWidgetItem("workspace"))
+        if double_clicks != [True]:
+            failed.append("double-clicking a workspace row must enter that workspace")
+        if not tab.exit_workspace_button.isHidden():
+            failed.append("exit workspace action must stay hidden in aggregate source mode")
+        workspace_root = root / "workspace" / "certificate"
+        tab.workspace = SimpleNamespace(
+            root_path=str(workspace_root),
+            name="certificate",
+        )
+        tab._set_context_label()
+        if tab.exit_workspace_button.isHidden():
+            failed.append("active workspace must expose its exit action in the header")
+        if "当前需求：certificate" != tab.context_label.text():
+            failed.append("aggregate header must identify the active workspace")
+        if tab._current_environment_root() != workspace_root:
+            failed.append("project tools must open the active workspace root")
+        tab.workspace = None
+        tab._set_context_label()
+
+        class TopTabs:
+            def count(self):
+                return 1
+
+            def widget(self, _index):
+                return tab
+
+        matched, match_error = _find_project_tab(
+            SimpleNamespace(tabs=TopTabs()), "server",
+        )
+        if matched is not tab._project_tabs.get("server") or match_error is not None:
+            failed.append("project CLI must resolve projects inside aggregate tabs")
+
+        # 单独启动一个项目时不能连带启动其它项目。
+        original_tabs = tab._project_tabs
+        tab._refresh_timer.stop()
+        attempts: list[str] = []
+
+        class FakeController:
+            def __init__(self, component_id: str):
+                self.component_id = component_id
+
+            def start(self):
+                attempts.append(self.component_id)
+                return {"ok": True}
+
+        class FakeTab:
+            _is_multi_module = False
+
+            def __init__(self, component_id: str):
+                self.project_meta = SimpleNamespace(name=component_id)
+                self.service_controller = FakeController(component_id)
+
+            def service_states(self, refresh_external=True):
+                return []
+
+        tab._project_tabs = {
+            "server": FakeTab("server"),
+            "webapp": FakeTab("webapp"),
+        }
+        tab.start_component("server")
+        if attempts != ["server"]:
+            failed.append(f"starting one project must not start another project: {attempts!r}")
+        tab._project_tabs = original_tabs
+        if not tab.request_close(confirm_running=False, stop_running=True, quiet=True):
+            failed.append("aggregate tab should close all internal component tabs safely")
+        tab.deleteLater()
+        app.processEvents()
+
+    if failed:
+        for msg in failed:
+            print(f"[FAIL] aggregate_runtime_ui: {msg}", flush=True)
+    else:
+        print("[OK]   aggregate single-tab runtime workbench", flush=True)
+    return failed
+
+
+def aggregate_dashboard_check() -> list[str]:
+    """验证固定管理页快照会保留有效项、临时工作区和配置错误。"""
+    import tempfile
+
+    from src.core.aggregate_workspace import (
+        AggregateProject, DevelopmentWorkspace, save_aggregate_project,
+        save_development_workspace,
+    )
+    from src.core.aggregate_workspace_manager import build_workspace_dashboard_snapshot
+    from src.core.config import AppConfig
+
+    failed: list[str] = []
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "race"
+        nginx = root / "nginx"
+        nginx.mkdir(parents=True)
+        project = AggregateProject.from_dict(root, {
+            "schemaVersion": 1,
+            "id": "race",
+            "name": "race",
+            "kind": "aggregate",
+            "workspaceDirectory": "workspace",
+            "components": [{
+                "id": "nginx", "path": "nginx", "type": "nginx", "shared": True,
+            }],
+            "profiles": [],
+        })
+        save_aggregate_project(project)
+
+        task_root = project.workspace_root / "certificate"
+        task_root.mkdir(parents=True)
+        workspace = DevelopmentWorkspace.from_dict(task_root, {
+            "schemaVersion": 1,
+            "id": "certificate",
+            "name": "certificate",
+            "createdAt": "2026-07-30T10:00:00+08:00",
+            "aggregateProjectPath": str(root),
+            "status": "created",
+            "components": [{
+                "id": "nginx",
+                "sourceRepositoryPath": str(nginx),
+                "mode": "shared",
+            }],
+        }, aggregate_project=project)
+        save_development_workspace(workspace, aggregate_project=project)
+
+        config = AppConfig()
+        config.register_aggregate_project(str(root))
+        config.register_aggregate_project(str(root))
+        if len(config.aggregate_project_paths) != 1:
+            failed.append("aggregate project registry must deduplicate normalized paths")
+
+        missing = root / "missing"
+        snapshot = build_workspace_dashboard_snapshot([
+            *config.aggregate_project_paths, str(missing),
+        ])
+        valid = [item for item in snapshot.aggregate_projects if item.project is not None]
+        invalid = [item for item in snapshot.aggregate_projects if item.error]
+        if len(valid) != 1 or valid[0].component_count != 1:
+            failed.append("dashboard must load registered aggregate definitions")
+        if len(invalid) != 1 or invalid[0].root_path != str(missing):
+            failed.append("dashboard must surface invalid registered definitions")
+        if len(snapshot.development_workspaces) != 1:
+            failed.append("dashboard must discover workspace.json under workspaceDirectory")
+        elif snapshot.development_workspaces[0].component_ids != ("nginx",):
+            failed.append("development workspace summary must preserve component ids")
+
+    if failed:
+        for msg in failed:
+            print(f"[FAIL] aggregate_dashboard: {msg}", flush=True)
+    else:
+        print("[OK]   aggregate workspace dashboard snapshot", flush=True)
+    return failed
+
+
+def legacy_workspace_migration_check() -> list[str]:
+    """验证旧 WorkspaceEntry 显式迁移不会改写原记录，并提示遗漏目录。"""
+    import tempfile
+
+    from src.core.aggregate_workspace import save_aggregate_project
+    from src.core.aggregate_workspace_manager import (
+        build_legacy_workspace_candidate, build_workspace_dashboard_snapshot,
+    )
+    from src.core.config import AppConfig, WorkspaceEntry
+
+    failed: list[str] = []
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "race"
+        server = root / "server"
+        webapp = root / "webapp"
+        (server / ".git").mkdir(parents=True)
+        webapp.mkdir(parents=True)
+        (webapp / "package.json").write_text(
+            '{"dependencies":{"vue":"3"}}', encoding="utf-8",
+        )
+        legacy = WorkspaceEntry(name="race", paths=[str(server)])
+        original_paths = list(legacy.paths)
+
+        candidate = build_legacy_workspace_candidate(legacy)
+        if candidate.error or candidate.project is None:
+            failed.append(f"legacy workspace should produce a migration candidate: {candidate.error}")
+        elif [item.id for item in candidate.project.components] != ["server"]:
+            failed.append("legacy paths must map to stable component ids without additions")
+        if str(webapp.resolve()) not in candidate.omitted_candidates:
+            failed.append("sibling project omitted by legacy data must be surfaced")
+        if legacy.paths != original_paths:
+            failed.append("candidate creation must not mutate WorkspaceEntry paths")
+
+        config = AppConfig(workspaces=[legacy])
+        if candidate.project is not None:
+            save_aggregate_project(candidate.project)
+            config.register_aggregate_project(candidate.project.root_path)
+            config.mark_legacy_workspace_migrated("race", candidate.project.root_path)
+        if config.workspaces != [legacy]:
+            failed.append("migration records must not remove legacy WorkspaceEntry")
+
+        snapshot = build_workspace_dashboard_snapshot(
+            config.aggregate_project_paths,
+            config.workspaces,
+            config.legacy_workspace_migrations,
+        )
+        if len(snapshot.legacy_workspaces) != 1:
+            failed.append("dashboard must list every legacy workspace")
+        elif snapshot.legacy_workspaces[0].status != "migrated":
+            failed.append("confirmed migration should remain auditable in the dashboard")
+
+    if failed:
+        for msg in failed:
+            print(f"[FAIL] legacy_workspace_migration: {msg}", flush=True)
+    else:
+        print("[OK]   legacy WorkspaceEntry migration preservation", flush=True)
+    return failed
+
+
+def aggregate_definition_management_check() -> list[str]:
+    """验证新建、注册和编辑聚合项目定义的纯逻辑往返。"""
+    import tempfile
+
+    from src.core.aggregate_workspace import (
+        AggregateProject, load_aggregate_project, save_aggregate_project,
+    )
+    from src.core.aggregate_workspace_manager import (
+        component_definition_from_path, suggest_stable_id,
+    )
+    from src.core.config import AppConfig
+
+    failed: list[str] = []
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "race suite"
+        component_root = root / "webapp-tenant"
+        component_root.mkdir(parents=True)
+        (component_root / "package.json").write_text(
+            '{"dependencies":{"vue":"3"}}', encoding="utf-8",
+        )
+        if suggest_stable_id(root.name) != "race-suite":
+            failed.append("new aggregate definitions need a valid suggested stable id")
+
+        component = component_definition_from_path(root, component_root)
+        if component.id != "webapp-tenant" or component.type != "frontend":
+            failed.append("selected component detection must preserve id and semantic type")
+        project = AggregateProject.from_dict(root, {
+            "schemaVersion": 1,
+            "id": suggest_stable_id(root.name),
+            "name": "race suite",
+            "kind": "aggregate",
+            "workspaceDirectory": "workspace",
+            "components": [component.to_dict()],
+            "profiles": [],
+        })
+        save_aggregate_project(project)
+
+        edited = AggregateProject.from_dict(root, {
+            **project.to_dict(),
+            "name": "race suite edited",
+        })
+        save_aggregate_project(edited)
+        loaded = load_aggregate_project(root)
+        if loaded.name != "race suite edited" or loaded.components != edited.components:
+            failed.append("edited aggregate definition must round-trip without data loss")
+
+        config = AppConfig()
+        config.register_aggregate_project(str(root))
+        if config.aggregate_project_paths != [str(root.resolve())]:
+            failed.append("opening a definition must register its canonical root path")
+        if not config.is_aggregate_project(str(root)):
+            failed.append("aggregate classification must come from the explicit registry")
+        config.unregister_aggregate_project(str(root))
+        if config.is_aggregate_project(str(root)) or not loaded.config_path.is_file():
+            failed.append("ordinary classification must preserve the existing aggregate definition")
+
+    if failed:
+        for msg in failed:
+            print(f"[FAIL] aggregate_definition_management: {msg}", flush=True)
+    else:
+        print("[OK]   aggregate definition create/open/edit", flush=True)
+    return failed
+
+
+def workspace_tab_session_check() -> list[str]:
+    """验证移除固定管理页后兼容旧活动 Tab 索引。"""
+    from src.ui.main_window import _restored_tab_index
+
+    failed: list[str] = []
+    old_entries = [r"project:E:\whaty\project\race\server"]
+    new_entries = ["workspace:management", *old_entries]
+    if _restored_tab_index(old_entries, 0) != 0:
+        failed.append("project-only session index must stay unchanged")
+    if _restored_tab_index(new_entries, 1) != 0:
+        failed.append("old fixed workspace tab must be removed from the saved index")
+
+    if failed:
+        for msg in failed:
+            print(f"[FAIL] workspace_tab_session: {msg}", flush=True)
+    else:
+        print("[OK]   removed workspace tab session compatibility", flush=True)
+    return failed
+
+
+def cli_project_match_check() -> list[str]:
+    """验证 CLI 项目匹配不会把 webapp 错配到 webapp-tenant。"""
+    import json
+    from types import SimpleNamespace
+
+    from src.core.cli_server import _find_project_tab, _match_target
+    from src.ui import project_tab as project_tab_module
+
+    failed: list[str] = []
+
+    class FakeProjectTab:
+        pass
+
+    def tab(path: str, component_id: str = ""):
+        item = FakeProjectTab()
+        item.component_id = component_id
+        item.project_meta = SimpleNamespace(
+            path=path,
+            name="time-track-webapp",
+            project_type="vue",
+        )
+        return item
+
+    webapp = tab(r"E:\whaty\project\race\webapp")
+    tenant = tab(r"E:\whaty\project\race\webapp-tenant", "tenant-ui")
+    mobile = tab(r"E:\whaty\project\race\webapp-m")
+    items = [tenant, webapp, mobile]
+
+    class FakeTabs:
+        def count(self) -> int:
+            return len(items)
+
+        def widget(self, index: int):
+            return items[index]
+
+    window = SimpleNamespace(tabs=FakeTabs())
+
+    original_project_tab = project_tab_module.ProjectTab
+    project_tab_module.ProjectTab = FakeProjectTab
+    try:
+        matched, error = _find_project_tab(window, "webapp")
+        if matched is not webapp or error is not None:
+            failed.append("exact directory name must win over earlier fuzzy matches")
+
+        matched, error = _find_project_tab(
+            window, r"e:/whaty/project/race/WEBAPP-TENANT/",
+        )
+        if matched is not tenant or error is not None:
+            failed.append("normalized full path should match case-insensitively")
+
+        matched, error = _find_project_tab(window, "tenant-ui")
+        if matched is not tenant or error is not None:
+            failed.append("stable component id should match exactly")
+
+        matched, error = _find_project_tab(window, "webapp-")
+        if matched is not None or not error or error.get("code") != "ambiguous_project":
+            failed.append("non-unique fuzzy match must return an ambiguity error")
+        elif len(error.get("candidates", [])) != 2:
+            failed.append("ambiguity error must include the complete candidate list")
+
+        matched, error = _find_project_tab(window, "missing")
+        if matched is not None or not error or error.get("code") != "project_not_found":
+            failed.append("unknown target must return project_not_found")
+
+        matched, error = _match_target([
+            {"id": "race-a", "name": "race", "path": r"E:\race-a", "project": object()},
+            {"id": "race-b", "name": "race", "path": r"E:\race-b", "project": object()},
+        ], "race", "aggregate")
+        if matched is not None or not error or len(error.get("candidates", [])) != 2:
+            failed.append("aggregate ambiguity must preserve the candidate list")
+        else:
+            try:
+                json.dumps(error)
+            except TypeError:
+                failed.append("ambiguity candidates must not expose internal model objects")
+    finally:
+        project_tab_module.ProjectTab = original_project_tab
+
+    if failed:
+        for msg in failed:
+            print(f"[FAIL] cli_project_match: {msg}", flush=True)
+    else:
+        print("[OK]   cli_project_match determinism", flush=True)
     return failed
 
 
@@ -572,6 +1524,126 @@ def content_search_cache_check() -> list[str]:
     return failed
 
 
+def aggregate_scan_isolation_check() -> list[str]:
+    """验证聚合根扫描、缓存搜索、监听和旧候选都排除 workspaceDirectory。"""
+    import tempfile
+
+    from src.core.aggregate_workspace import (
+        AggregateProject, is_aggregate_workspace_path, scan_exclusion_roots,
+        save_aggregate_project,
+    )
+    from src.core.aggregate_workspace_manager import scan_aggregate_components
+    from src.core.config import AppConfig, ProjectEntry
+    from src.core.controller_index import _ControllerWorker
+    from src.core.file_index import _IndexWorker, _should_ignore
+    from src.core.path_utils import normalized_path_key
+    from src.core.workspace_manager import ensure_workspace_candidates
+    from src.ui.content_search import SearchWorker
+
+    failed: list[str] = []
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "race"
+        source_root = root / "server"
+        workspace_server = root / "workspace" / "certificate" / "server"
+        workspace_webapp = root / "workspace" / "certificate" / "webapp"
+        source_root.mkdir(parents=True)
+        (source_root / ".git").mkdir()
+        workspace_server.mkdir(parents=True)
+        workspace_webapp.mkdir(parents=True)
+
+        project = AggregateProject.from_dict(root, {
+            "schemaVersion": 1,
+            "id": "race",
+            "name": "race",
+            "kind": "aggregate",
+            "workspaceDirectory": "workspace",
+            "components": [
+                {"id": "server", "path": "server", "type": "java"},
+            ],
+            "profiles": [],
+        })
+        save_aggregate_project(project)
+
+        source_file = source_root / "SourceController.java"
+        duplicate_file = workspace_server / "SourceController.java"
+        java_text = (
+            '@RestController\n@RequestMapping("/needle")\n'
+            'class SourceController { @GetMapping("/one") void one() {} }\n'
+        )
+        source_file.write_text(java_text, encoding="utf-8")
+        duplicate_file.write_text(java_text, encoding="utf-8")
+
+        exclusions = scan_exclusion_roots(root)
+        if len(exclusions) != 1 or normalized_path_key(exclusions[0]) != normalized_path_key(
+            root / "workspace"
+        ):
+            failed.append(f"aggregate scan exclusion mismatch: {exclusions!r}")
+        if not is_aggregate_workspace_path(duplicate_file):
+            failed.append("nested Worktree file should be recognized as aggregate workspace data")
+        if _should_ignore(source_file, root, exclusions):
+            failed.append("source component files must remain visible to the index")
+        if not _should_ignore(duplicate_file, root, exclusions):
+            failed.append("watchdog events from workspaceDirectory must be ignored")
+
+        indexed: list = []
+        index_worker = _IndexWorker(str(root))
+        index_worker.done.connect(lambda files: indexed.extend(files))
+        index_worker.run()
+        indexed_paths = {item.abs_path for item in indexed}
+        if str(source_file) not in indexed_paths or str(duplicate_file) in indexed_paths:
+            failed.append("file index must include source components and exclude Worktrees")
+
+        walked_matches: list = []
+        collected: list[str] = []
+        walk_search = SearchWorker(
+            root=str(root), query="needle", case_sensitive=False,
+            whole_word=False, use_regex=False, include_exts=[],
+        )
+        walk_search.match_found.connect(lambda batch: walked_matches.extend(batch))
+        walk_search.files_collected.connect(lambda files: collected.extend(files))
+        walk_search.run()
+        if len(walked_matches) != 1 or str(duplicate_file) in collected:
+            failed.append("walk search must not read or cache files under workspaceDirectory")
+
+        cached_matches: list = []
+        cached_search = SearchWorker(
+            root=str(root), query="needle", case_sensitive=False,
+            whole_word=False, use_regex=False, include_exts=[],
+            file_list=[str(source_file), str(duplicate_file)],
+        )
+        cached_search.match_found.connect(lambda batch: cached_matches.extend(batch))
+        cached_search.run()
+        if len(cached_matches) != 1 or cached_matches[0].abs_path != str(source_file):
+            failed.append("cached search must discard stale workspaceDirectory entries")
+
+        endpoints: list = []
+        controller_worker = _ControllerWorker(str(root))
+        controller_worker.done.connect(lambda items: endpoints.extend(items))
+        controller_worker.run()
+        if len(endpoints) != 1 or endpoints[0].abs_path != str(source_file):
+            failed.append("controller scan must not duplicate endpoints from Worktrees")
+
+        config = AppConfig(recent_projects=[
+            ProjectEntry(path=str(workspace_server)),
+            ProjectEntry(path=str(workspace_webapp)),
+        ])
+        if ensure_workspace_candidates(config) or config.workspaces:
+            failed.append("legacy workspace discovery must ignore temporary Worktree paths")
+
+        candidates = scan_aggregate_components(root)
+        if [item.id for item in candidates] != ["server"]:
+            failed.append(
+                "aggregate component scan must inspect direct candidates and exclude workspaceDirectory"
+            )
+
+    if failed:
+        for msg in failed:
+            print(f"[FAIL] aggregate_scan: {msg}", flush=True)
+    else:
+        print("[OK]   aggregate workspace scan isolation", flush=True)
+    return failed
+
+
 def git_context_check() -> list[str]:
     """验证 Git AI 上下文的标签、排序和摘要格式。"""
     from src.core.git_context import build_ai_text, sort_changed_files, status_label, summary_from_changes
@@ -647,14 +1719,25 @@ if __name__ == "__main__":
     model_failed = service_state_check()
     cli_failed = cli_parse_check()
     cli_encoding_failed = cli_output_encoding_check()
+    launcher_failed = external_launcher_check()
+    git_executable_failed = git_executable_resolution_check()
+    cli_match_failed = cli_project_match_check()
     launch_guard_failed = launch_and_operation_guard_check()
     compile_wait_failed = compile_wait_check()
     cli_reliability_failed = cli_response_and_packaging_check()
     file_failed = file_action_check()
     preview_failed = file_preview_model_check()
     search_failed = content_search_cache_check()
+    aggregate_scan_failed = aggregate_scan_isolation_check()
     git_failed = git_context_check()
     nginx_failed = nginx_detector_check()
+    aggregate_failed = aggregate_workspace_model_check()
+    development_lifecycle_failed = development_workspace_lifecycle_check()
+    aggregate_runtime_failed = aggregate_runtime_ui_check()
+    aggregate_dashboard_failed = aggregate_dashboard_check()
+    legacy_migration_failed = legacy_workspace_migration_check()
+    aggregate_definition_failed = aggregate_definition_management_check()
+    workspace_session_failed = workspace_tab_session_check()
 
     print()
     print("Hex hardcode scan (CLAUDE.md hard rule 15):")
@@ -671,10 +1754,17 @@ if __name__ == "__main__":
 
     total_fail = (
         len(failed) + len(model_failed) + len(cli_failed)
-        + len(cli_encoding_failed) + len(launch_guard_failed)
+        + len(cli_encoding_failed) + len(launcher_failed)
+        + len(git_executable_failed)
+        + len(cli_match_failed) + len(launch_guard_failed)
         + len(compile_wait_failed) + len(cli_reliability_failed)
         + len(file_failed) + len(preview_failed)
-        + len(search_failed) + len(git_failed) + len(nginx_failed) + len(hex_hits)
+        + len(search_failed) + len(aggregate_scan_failed)
+        + len(git_failed) + len(nginx_failed)
+        + len(aggregate_failed) + len(development_lifecycle_failed)
+        + len(aggregate_runtime_failed) + len(aggregate_dashboard_failed)
+        + len(legacy_migration_failed) + len(aggregate_definition_failed)
+        + len(workspace_session_failed) + len(hex_hits)
     )
     print()
     print(f"Result: imports {len(modules) - len(failed)}/{len(modules)}, "

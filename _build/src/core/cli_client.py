@@ -110,6 +110,15 @@ def _safe_write(stream, text: str) -> None:
         pass
 
 
+def _configure_stream_utf8(stream) -> None:
+    """让 console CLI 的管道输出始终使用 UTF-8。"""
+    try:
+        if stream and hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, OSError, ValueError):
+        pass
+
+
 def _attach_console():
     """GUI exe 没有标准句柄时，CLI 模式附加到父控制台作为兜底。"""
     if sys.platform != "win32":
@@ -163,6 +172,11 @@ def _parse_args(argv: list[str]) -> dict | None:
         "list-workspaces": "list-workspaces",
         "open-workspace": "open-workspace",
         "close-workspace": "close-workspace",
+        "list-aggregates": "list-aggregates",
+        "open-aggregate": "open-aggregate",
+        "create-development-workspace": "create-development-workspace",
+        "workspace-review": "workspace-review",
+        "workspace-delete-check": "workspace-delete-check",
         "start": "start",
         "stop": "stop",
         "restart": "restart",
@@ -185,6 +199,7 @@ def _parse_args(argv: list[str]) -> dict | None:
     rest = args[1:]
 
     if cmd_name in ("status", "list-projects", "list-workspaces", "close-workspace",
+                    "list-aggregates",
                     "preflight-build", "can-quit"):
         return result
 
@@ -206,8 +221,37 @@ def _parse_args(argv: list[str]) -> dict | None:
     if cmd_name == "open-workspace":
         if not rest:
             return None
-        # 工作区名允许带空格；CLI 调用方也可以用引号传成一个参数。
-        result["name"] = " ".join(rest).strip()
+        result["target"] = " ".join(rest).strip()
+        return result
+
+    if cmd_name in (
+        "open-aggregate",
+        "workspace-review", "workspace-delete-check",
+    ):
+        if not rest:
+            return None
+        result["target"] = rest[0]
+        return result if len(rest) == 1 else None
+
+    if cmd_name == "create-development-workspace":
+        if len(rest) < 2:
+            return None
+        result["aggregate"] = rest[0]
+        result["name"] = rest[1]
+        index = 2
+        while index < len(rest):
+            if rest[index] == "--projects" and index + 1 < len(rest):
+                result["projects"] = [
+                    item.strip() for item in rest[index + 1].split(",") if item.strip()
+                ]
+                index += 2
+            elif rest[index] == "--description" and index + 1 < len(rest):
+                result["description"] = rest[index + 1]
+                index += 2
+            else:
+                return None
+        if not result.get("projects"):
+            return None
         return result
 
     if cmd_name == "list-modules":
@@ -376,9 +420,28 @@ def _parse_args(argv: list[str]) -> dict | None:
     return None
 
 
+def _response_timeout_ms(cmd: dict) -> int:
+    """按命令生命周期设置 IPC 等待时间。"""
+    action = cmd["cmd"]
+    if action in (
+        "health", "compile", "ensure-running",
+        "create-development-workspace", "workspace-review", "workspace-delete-check",
+    ) or (action in ("start", "restart") and cmd.get("wait")):
+        defaults = {
+            "create-development-workspace": 600,
+        }
+        timeout = int(cmd.get("timeout", defaults.get(action, 120)))
+        return (timeout + 5) * 1000
+    if action in ("git-diff", "git-ai-context"):
+        return 120000
+    return 30000
+
+
 def run_cli(argv: list[str]) -> int:
     """CLI 模式主入口。返回退出码。"""
     _attach_console()
+    _configure_stream_utf8(sys.stdout)
+    _configure_stream_utf8(sys.stderr)
 
     cmd = _parse_args(argv)
     if cmd is None:
@@ -397,15 +460,7 @@ def run_cli(argv: list[str]) -> int:
     sock.write(payload.encode("utf-8"))
     sock.flush()
 
-    # 等待响应（--health / --compile 可能等很久，按命令携带的 timeout 放宽）
-    if cmd["cmd"] in ("health", "compile", "ensure-running") or (
-        cmd["cmd"] in ("start", "restart") and cmd.get("wait")
-    ):
-        timeout_ms = (cmd.get("timeout", 60) + 5) * 1000
-    elif cmd["cmd"] in ("git-diff", "git-ai-context"):
-        timeout_ms = 120000
-    else:
-        timeout_ms = 30000
+    timeout_ms = _response_timeout_ms(cmd)
     response_buf = b""
     deadline = time.time() + timeout_ms / 1000.0
 
@@ -454,9 +509,14 @@ def _print_usage():
         "  --list-modules <project>     List modules of a project\n"
         "  --open <path>                Open a project path in the running IDE\n"
         "  --close <project>            Stop services and close a project tab\n"
-        "  --list-workspaces            List saved workspaces\n"
-        "  --open-workspace <name>      Open a saved workspace\n"
-        "  --close-workspace            Stop services and close active workspace\n"
+        "  --list-workspaces            List aggregate development workspaces\n"
+        "  --open-workspace <target>    Open one workspace inside its aggregate tab\n"
+        "  --close-workspace            Return the current aggregate tab to source projects\n"
+        "  --list-aggregates            List aggregate project definitions\n"
+        "  --open-aggregate <target>    Open one aggregate project tab\n"
+        "  --create-development-workspace <aggregate> <name> --projects a,b [--description text]\n"
+        "  --workspace-review <target>\n"
+        "  --workspace-delete-check <target>\n"
         "  --start <project> [module]   Start a module\n"
         "  --stop <project> [module]    Stop a module\n"
         "  --restart <project> [module] Restart a module\n"

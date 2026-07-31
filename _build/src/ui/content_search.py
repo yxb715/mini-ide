@@ -21,7 +21,8 @@ from PySide6.QtWidgets import (
     QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
-from src.core.file_index import IGNORED_DIRS, IGNORED_EXTS
+from src.core.aggregate_workspace import is_scan_path_excluded, scan_exclusion_roots
+from src.core.file_index import IGNORED_EXTS, prune_scan_dirnames
 from src.ui.theme import (
     FG_BRIGHT, FG_DIM, FG_PRIMARY, FG_SECONDARY, HIGHLIGHT_MATCH_BG,
     HIGHLIGHT_MATCH_FG, apply_search_style,
@@ -94,6 +95,7 @@ class SearchWorker(QThread):
                  parent=None):
         super().__init__(parent)
         self.root = root
+        self.excluded_roots = scan_exclusion_roots(root)
         self.query = query
         self.case = case_sensitive
         self.whole_word = whole_word
@@ -158,6 +160,8 @@ class SearchWorker(QThread):
             if self._stop:
                 self.stopped.emit()
                 return
+            if is_scan_path_excluded(path, self.excluded_roots):
+                continue
             fn = Path(path).name
             if not self.include_noise and _is_noise_file(fn):
                 continue
@@ -190,8 +194,9 @@ class SearchWorker(QThread):
             if self._stop:
                 self.stopped.emit()
                 return
-            dirnames[:] = [d for d in dirnames
-                           if d not in IGNORED_DIRS and not d.startswith(".") or d == ".env"]
+            prune_scan_dirnames(
+                Path(dirpath), dirnames, self.excluded_roots, allow_env=True,
+            )
             for fn in filenames:
                 if self._stop:
                     self.stopped.emit()

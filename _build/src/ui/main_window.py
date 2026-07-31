@@ -5,29 +5,69 @@ import time
 from pathlib import Path
 
 import psutil
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QThread, QTimer, Signal
 from PySide6.QtGui import (
     QAction, QCloseEvent, QDragEnterEvent, QDropEvent, QIcon,
     QKeySequence, QShortcut,
 )
 from PySide6.QtWidgets import (
-    QApplication, QFileDialog, QInputDialog, QLabel, QMainWindow, QMessageBox,
+    QApplication, QFileDialog, QLabel, QMainWindow, QMessageBox,
     QStackedWidget, QTabWidget,
 )
 
 from src.core.config import AppConfig, ProjectEntry
+from src.core.aggregate_workspace import (
+    AggregateProject, aggregate_config_path, load_aggregate_project,
+    load_development_workspace, save_aggregate_project,
+)
+from src.core.aggregate_workspace_manager import (
+    scan_aggregate_components, suggest_stable_id,
+)
 from src.core.project_detector import detect_project
-from src.core.service_state import STATE_RUNNING_EXTERNAL, STATE_RUNNING_MANAGED
-from src.core.workspace_manager import (
-    close_workspace_paths, ensure_workspace_candidates, mark_workspace_opened,
-    save_workspace,
+from src.core.path_utils import normalized_path_key
+from src.core.service_state import (
+    STATE_RUNNING_EXTERNAL, STATE_RUNNING_MANAGED,
 )
 from src.ui.empty_state import EmptyState
+from src.ui.aggregate_project_tab import AggregateProjectTab
 from src.ui.project_tab import ProjectTab
 from src.util import app_log, notify
 from src.util.editor import open_folder
 
 log = app_log.get_logger("main_window")
+
+
+def _restored_tab_index(entries: list[str], saved_index: int) -> int:
+    """移除旧固定页后，把旧会话活动索引左移一位。"""
+    if "workspace:management" in entries and saved_index > 0:
+        return saved_index - 1
+    return max(0, saved_index)
+
+
+class _CreateAggregateProjectWorker(QThread):
+    done = Signal(object, str)
+
+    def __init__(self, root_path: str, parent=None):
+        super().__init__(parent)
+        self.root_path = root_path
+
+    def run(self) -> None:
+        try:
+            root = Path(self.root_path).resolve()
+            components = scan_aggregate_components(root)
+            project = AggregateProject.from_dict(root, {
+                "schemaVersion": 1,
+                "id": suggest_stable_id(root.name),
+                "name": root.name,
+                "kind": "aggregate",
+                "workspaceDirectory": "workspace",
+                "components": [item.to_dict() for item in components],
+                "profiles": [],
+            })
+            save_aggregate_project(project)
+            self.done.emit(project, "")
+        except Exception as exc:
+            self.done.emit(None, str(exc))
 
 
 class MainWindow(QMainWindow):
@@ -53,16 +93,17 @@ class MainWindow(QMainWindow):
         notify.install(self.stack)
 
         self.empty = EmptyState(config)
-        self.empty.projectRequested.connect(self.open_project)
+        self.empty.projectRequested.connect(self._open_or_classify_directory)
         self.stack.addWidget(self.empty)
 
         self.tabs = QTabWidget()
         self.tabs.setTabsClosable(True)
         self.tabs.setMovable(True)
         self.tabs.tabCloseRequested.connect(self._close_tab)
-        self.tabs.tabBar().tabMoved.connect(lambda _from, _to: self._save_tab_session())
+        self.tabs.tabBar().tabMoved.connect(self._on_top_tab_moved)
         self.tabs.currentChanged.connect(lambda _index: self._save_tab_session())
         self.stack.addWidget(self.tabs)
+        self._aggregate_create_worker: _CreateAggregateProjectWorker | None = None
 
         self._build_menu()
         self._build_statusbar()
@@ -109,7 +150,7 @@ class MainWindow(QMainWindow):
     def _dispatch_to_current_tab(self, method_name: str) -> None:
         """把快捷键动作转发给当前可见的项目 tab。没有打开项目时静默忽略。"""
         tab = self.tabs.currentWidget()
-        if isinstance(tab, ProjectTab):
+        if isinstance(tab, (ProjectTab, AggregateProjectTab)):
             fn = getattr(tab, method_name, None)
             if callable(fn):
                 fn()
@@ -117,22 +158,20 @@ class MainWindow(QMainWindow):
     def _build_menu(self) -> None:
         mb = self.menuBar()
 
-        file_menu = mb.addMenu("文件(&F)")
-        open_act = QAction("打开项目...", self)
+        self.file_menu = mb.addMenu("文件(&F)")
+        open_act = QAction("添加目录...", self)
         open_act.setShortcut("Ctrl+O")
         open_act.triggered.connect(self._open_dialog)
-        file_menu.addAction(open_act)
+        self.file_menu.addAction(open_act)
 
-        self.recent_menu = file_menu.addMenu("最近打开")
+        self.recent_menu = self.file_menu.addMenu("最近打开")
         self._rebuild_recent_menu()
-        self.workspace_menu = file_menu.addMenu("工作区")
-        self._rebuild_workspace_menu()
 
-        file_menu.addSeparator()
+        self.file_menu.addSeparator()
         quit_act = QAction("退出", self)
         quit_act.setShortcut("Ctrl+Q")
         quit_act.triggered.connect(self.close)
-        file_menu.addAction(quit_act)
+        self.file_menu.addAction(quit_act)
 
         help_menu = mb.addMenu("帮助(&H)")
         open_log_act = QAction("打开 mini-ide 日志", self)
@@ -158,71 +197,7 @@ class MainWindow(QMainWindow):
             self.recent_menu.addAction(empty_act)
 
     def _rebuild_workspace_menu(self) -> None:
-        self.workspace_menu.clear()
-        save_act = QAction("保存当前 Tab 为工作区...", self)
-        save_act.triggered.connect(self._save_current_tabs_as_workspace)
-        self.workspace_menu.addAction(save_act)
-        close_act = QAction("关闭当前工作区", self)
-        close_act.triggered.connect(self._close_current_workspace)
-        self.workspace_menu.addAction(close_act)
-        self.workspace_menu.addSeparator()
-
-        if ensure_workspace_candidates(self.config):
-            self.config.save()
-        if not self.config.workspaces:
-            empty = QAction("(无工作区)", self)
-            empty.setEnabled(False)
-            self.workspace_menu.addAction(empty)
-            return
-        for ws in self.config.workspaces[:15]:
-            act = QAction(f"{ws.name}  ({len(ws.paths)} 项目)", self)
-            act.triggered.connect(lambda _, name=ws.name: self.open_workspace(name))
-            self.workspace_menu.addAction(act)
-
-    def _save_current_tabs_as_workspace(self) -> None:
-        paths = self._current_project_paths()
-        if not paths:
-            QMessageBox.information(self, "工作区", "当前没有打开的项目。")
-            return
-        default_name = Path(Path(paths[0]).parent).name if paths else "workspace"
-        name, ok = QInputDialog.getText(self, "保存工作区", "工作区名称：", text=default_name)
-        name = name.strip()
-        if not ok or not name:
-            return
-        save_workspace(self.config, name, paths)
-        self.config.save()
-        self._rebuild_workspace_menu()
-
-    def _current_project_paths(self) -> list[str]:
-        paths: list[str] = []
-        for i in range(self.tabs.count()):
-            w = self.tabs.widget(i)
-            if isinstance(w, ProjectTab):
-                paths.append(w.project_meta.path)
-        return paths
-
-    def open_workspace(self, name: str) -> None:
-        ws = self.config.find_workspace(name)
-        if not ws:
-            QMessageBox.warning(self, "工作区", f"未找到工作区：{name}")
-            return
-        opened = 0
-        for path in ws.paths:
-            if Path(path).is_dir() and self.open_project(path):
-                opened += 1
-        mark_workspace_opened(self.config, ws)
-        self.config.save()
-        self._rebuild_workspace_menu()
-        log.info("打开工作区: %s | %d/%d", name, opened, len(ws.paths))
-
-    def _close_current_workspace(self) -> None:
-        paths = close_workspace_paths(self.config, self._current_project_paths())
-        for i in range(self.tabs.count() - 1, -1, -1):
-            w = self.tabs.widget(i)
-            if isinstance(w, ProjectTab) and w.project_meta.path in paths:
-                self._close_tab(i)
-        self.config.save()
-        self._rebuild_workspace_menu()
+        """旧调用兼容入口；全局工作区菜单已经移除。"""
 
     # ---- 状态栏 ----
 
@@ -250,15 +225,66 @@ class MainWindow(QMainWindow):
 
     # ---- Tab 管理 ----
 
+    def _on_top_tab_moved(self, from_index: int, to_index: int) -> None:
+        """顶层目录 Tab 可自由排序。"""
+        self._save_tab_session()
+
     def _switch_view(self) -> None:
         self.stack.setCurrentIndex(1 if self.tabs.count() > 0 else 0)
 
     def _open_dialog(self) -> None:
         path = QFileDialog.getExistingDirectory(
-            self, "选择项目目录", self._default_dialog_dir()
+            self, "选择要添加的目录", self._default_dialog_dir()
         )
         if path:
+            self._choose_directory_type(path)
+
+    def _choose_directory_type(self, path: str) -> None:
+        box = QMessageBox(self)
+        box.setWindowTitle("添加目录")
+        box.setText(f"这个目录按哪种方式管理？\n\n{path}")
+        normal_button = box.addButton("普通项目", QMessageBox.ButtonRole.AcceptRole)
+        aggregate_button = box.addButton("聚合目录", QMessageBox.ButtonRole.ActionRole)
+        box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        if box.clickedButton() is normal_button:
+            self.config.unregister_aggregate_project(path)
+            self.config.save()
             self.open_project(path)
+        elif box.clickedButton() is aggregate_button:
+            self._add_aggregate_directory(path)
+
+    def _open_or_classify_directory(self, path: str) -> None:
+        if self.config.find_project(path) or self.config.is_aggregate_project(path):
+            self.open_project(path)
+        else:
+            self._choose_directory_type(path)
+
+    def _add_aggregate_directory(self, path: str) -> None:
+        if self._aggregate_create_worker:
+            QMessageBox.information(self, "正在添加", "请等待当前聚合目录识别完成。")
+            return
+        if aggregate_config_path(path).is_file():
+            self.config.register_aggregate_project(path)
+            self.config.save()
+            self.open_aggregate_project(path)
+            return
+        worker = _CreateAggregateProjectWorker(path, QApplication.instance())
+        self._aggregate_create_worker = worker
+        worker.done.connect(self._aggregate_directory_created)
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+
+    def _aggregate_directory_created(self, project, error: str) -> None:
+        if self.sender() is not self._aggregate_create_worker:
+            return
+        self._aggregate_create_worker = None
+        if error or project is None:
+            QMessageBox.warning(self, "添加聚合目录失败", error or "未知错误")
+            return
+        self.config.register_aggregate_project(project.root_path)
+        self.config.save()
+        self.open_aggregate_project(project.root_path)
 
     def _default_dialog_dir(self) -> str:
         """对话框默认落脚点：最近项目的父目录 > 配置的 default_project_dir > 家目录"""
@@ -270,13 +296,25 @@ class MainWindow(QMainWindow):
             return self.config.default_project_dir
         return str(Path.home())
 
-    def open_project(self, path: str, quiet: bool = False) -> ProjectTab | None:
+    def open_project(
+        self, path: str, quiet: bool = False,
+    ) -> ProjectTab | AggregateProjectTab | None:
         p = Path(path)
         if not p.is_dir():
             log.warning("尝试打开无效路径: %s", path)
             if not quiet:
                 QMessageBox.warning(self, "路径无效", f"{path} 不是有效目录")
             return None
+
+        if self.config.is_aggregate_project(str(p)):
+            return self.open_aggregate_project(str(p), quiet=quiet)
+        if (p / "workspace.json").is_file():
+            try:
+                workspace = load_development_workspace(p)
+            except Exception:
+                workspace = None
+            if workspace is not None:
+                return self.open_development_workspace(str(p), quiet=quiet)
 
         existing = self.find_tab_by_path(str(p))
         if existing:
@@ -311,10 +349,131 @@ class MainWindow(QMainWindow):
         self._save_tab_session()
         return tab
 
+    def open_aggregate_project(
+        self, path: str, quiet: bool = False,
+    ) -> AggregateProjectTab | None:
+        try:
+            project = load_aggregate_project(path)
+        except Exception as exc:
+            log.exception("打开聚合项目失败: %s", path)
+            if not quiet:
+                QMessageBox.warning(self, "打开聚合项目失败", str(exc))
+            return None
+        entry = self.config.find_project(project.root_path) or ProjectEntry(
+            path=project.root_path,
+        )
+        entry.name = project.name
+        entry.project_type = "aggregate"
+        entry.last_opened_at = time.time()
+        self.config.touch_project(entry)
+        self.config.register_aggregate_project(project.root_path)
+        self.config.save()
+        self._rebuild_recent_menu()
+        existing = self.find_tab_by_path(project.root_path)
+        if isinstance(existing, AggregateProjectTab):
+            if existing.workspace is not None:
+                if not existing.activate_workspace(None, interactive=not quiet):
+                    return None
+            self.focus_tab(existing)
+            return existing
+        if isinstance(existing, ProjectTab):
+            if not self.close_project_tab(existing, quiet=quiet):
+                if not quiet:
+                    QMessageBox.warning(
+                        self, "打开聚合项目失败", "聚合根目录的旧项目 Tab 未能安全关闭。",
+                    )
+                return None
+        component_keys = {
+            normalized_path_key(item.absolute_path(project.root_path))
+            for item in project.components
+        }
+        adopted: dict[str, ProjectTab] = {}
+        for index in range(self.tabs.count() - 1, -1, -1):
+            widget = self.tabs.widget(index)
+            if not isinstance(widget, ProjectTab):
+                continue
+            key = normalized_path_key(widget.project_meta.path)
+            if key in component_keys:
+                adopted[key] = widget
+                self.tabs.removeTab(index)
+        tab = AggregateProjectTab(
+            project, self.config,
+            environment_guard=self._ensure_aggregate_environment,
+            existing_tabs=adopted,
+            parent=self.tabs,
+        )
+        index = self.tabs.addTab(tab, project.name)
+        self.tabs.setTabToolTip(index, project.root_path)
+        self.tabs.setCurrentIndex(index)
+        self._rebuild_workspace_menu()
+        self._switch_view()
+        self._save_tab_session()
+        return tab
+
+    def open_development_workspace(
+        self, path: str, quiet: bool = False,
+    ) -> AggregateProjectTab | None:
+        try:
+            workspace = load_development_workspace(path)
+            project = load_aggregate_project(workspace.aggregate_project_path)
+            workspace = load_development_workspace(path, aggregate_project=project)
+        except Exception as exc:
+            log.exception("打开开发工作区失败: %s", path)
+            if not quiet:
+                QMessageBox.warning(self, "打开开发工作区失败", str(exc))
+            return None
+        tab = self.open_aggregate_project(project.root_path, quiet=quiet)
+        if tab is None:
+            return None
+        if not tab.activate_workspace(workspace, interactive=not quiet):
+            return None
+        self.focus_tab(tab)
+        tab.show_projects()
+        self._save_tab_session()
+        return tab
+
+    def _ensure_aggregate_environment(
+        self, requester: AggregateProjectTab, allow_switch: bool, interactive: bool,
+    ) -> bool:
+        conflicts = []
+        for index in range(self.tabs.count()):
+            tab = self.tabs.widget(index)
+            if not isinstance(tab, AggregateProjectTab) or tab is requester:
+                continue
+            if normalized_path_key(tab.aggregate_root_path) != normalized_path_key(
+                requester.aggregate_root_path
+            ):
+                continue
+            if tab.running_service_items(refresh_external=True):
+                conflicts.append(tab)
+        if not conflicts:
+            return True
+        if not allow_switch:
+            return False
+        if interactive:
+            names = "、".join(tab.project_meta.name for tab in conflicts)
+            answer = QMessageBox.question(
+                self, "切换运行环境",
+                f"同一聚合项目当前由 {names} 占用运行环境。\n\n"
+                "是否先停止旧环境，再启动当前环境？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return False
+        for tab in conflicts:
+            tab.stop_all_services(include_external=True, silent=True)
+            if not tab.wait_services_stopped(20000):
+                QMessageBox.warning(self, "切换失败", f"{tab.project_meta.name} 未能完全停止。")
+                return False
+        return True
+
     def find_tab_by_path(self, path: str):
+        key = normalized_path_key(path)
         for i in range(self.tabs.count()):
             w = self.tabs.widget(i)
-            if getattr(w, "path", None) == path:
+            candidate = getattr(w, "path", None)
+            if candidate and normalized_path_key(candidate) == key:
                 return w
         return None
 
@@ -332,7 +491,7 @@ class MainWindow(QMainWindow):
         self._switch_view()
         self._save_tab_session()
 
-    def close_project_tab(self, tab: ProjectTab, quiet: bool = False) -> bool:
+    def close_project_tab(self, tab, quiet: bool = False) -> bool:
         """CLI/GUI 共用的项目关闭入口；quiet=True 时不弹消息框。"""
         idx = self.tabs.indexOf(tab)
         if idx < 0:
@@ -405,7 +564,7 @@ class MainWindow(QMainWindow):
         for url in e.mimeData().urls():
             path = url.toLocalFile()
             if path and Path(path).is_dir():
-                self.open_project(path)
+                self._open_or_classify_directory(path)
                 break
 
     def closeEvent(self, e: QCloseEvent) -> None:
@@ -444,7 +603,7 @@ class MainWindow(QMainWindow):
         items: list[dict] = []
         for i in range(self.tabs.count()):
             w = self.tabs.widget(i)
-            if isinstance(w, ProjectTab):
+            if isinstance(w, (ProjectTab, AggregateProjectTab)):
                 try:
                     items.extend(w.running_service_items(refresh_external=True))
                 except Exception:
@@ -504,7 +663,11 @@ class MainWindow(QMainWindow):
         active: list[str] = []
         for i in range(self.tabs.count()):
             w = self.tabs.widget(i)
-            if hasattr(w, "project_meta"):
+            if isinstance(w, AggregateProjectTab):
+                kind = "development" if w.workspace else "aggregate"
+                path = w.workspace.root_path if w.workspace else w.aggregate_root_path
+                active.append(f"{kind}:{path}")
+            elif isinstance(w, ProjectTab):
                 active.append(f"project:{w.project_meta.path}")
         self.config.active_tabs = active
         self.config.active_tab_index = max(0, self.tabs.currentIndex())
@@ -517,9 +680,7 @@ class MainWindow(QMainWindow):
 
     def _startup_finalize(self) -> None:
         """事件循环起来后的收尾：先恢复上次会话，再打开命令行传入的初始项目。"""
-        if self.config.startup_restore_mode == "workspace" and self.config.active_workspace_name:
-            self.open_workspace(self.config.active_workspace_name)
-        elif (self.config.startup_restore_mode == "last_session"
+        if (self.config.startup_restore_mode in {"workspace", "last_session"}
               and self.config.restore_tabs_on_startup and self.config.active_tabs):
             self._restore_tabs()
         if self.pending_initial_project:
@@ -548,15 +709,20 @@ class MainWindow(QMainWindow):
         if not entries:
             return
         log.info("恢复 Tab 会话: %d 个", len(entries))
-        target_index = self.config.active_tab_index
+        target_index = _restored_tab_index(entries, self.config.active_tab_index)
         opened = 0
         for token in entries:
             kind, _, key = token.partition(":")
-            if not key or kind != "project":
+            if not key or kind not in {"project", "aggregate", "development"}:
                 continue
             try:
                 if Path(key).is_dir():
-                    self.open_project(key)
+                    if kind == "aggregate":
+                        self.open_aggregate_project(key)
+                    elif kind == "development":
+                        self.open_development_workspace(key)
+                    else:
+                        self.open_project(key)
                     opened += 1
                 else:
                     log.warning("跳过不存在的项目: %s", key)

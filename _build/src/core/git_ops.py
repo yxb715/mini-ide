@@ -10,6 +10,8 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from src.util.git_executable import resolve_git_executable
+
 _NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0  # CREATE_NO_WINDOW
 _POPEN_KW = {"creationflags": _NO_WINDOW} if _NO_WINDOW else {}
 
@@ -25,7 +27,7 @@ class ChangedFile:
 def _run(args: list[str], cwd: str, timeout: int = 10) -> tuple[int, str, str]:
     try:
         proc = subprocess.run(
-            ["git", *args],
+            [resolve_git_executable(), *args],
             cwd=cwd, capture_output=True, text=True,
             encoding="utf-8", errors="replace",
             timeout=timeout, **_POPEN_KW,

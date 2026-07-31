@@ -1,0 +1,706 @@
+"""临时开发工作区的创建、检查、合并和保守删除。"""
+from __future__ import annotations
+
+import os
+import re
+import subprocess
+import sys
+import threading
+from dataclasses import dataclass, replace
+from datetime import datetime, timezone
+from pathlib import Path
+
+from src.core.aggregate_workspace import (
+    AggregateProject, DevelopmentWorkspace, WorkspaceComponent,
+    save_development_workspace, validate_stable_id,
+)
+from src.core.path_utils import canonical_path, is_path_within, normalized_path_key
+from src.util.git_executable import resolve_git_executable
+
+
+CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
+_OPERATION_LOCK = threading.Lock()
+_ACTIVE_OPERATIONS: set[str] = set()
+_TASK_SAFE_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+class WorkspaceOperationError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class WorkspacePlanComponent:
+    id: str
+    source_path: str
+    mode: str
+    target_path: str = ""
+    base_branch: str = ""
+    base_commit: str = ""
+    task_branch: str = ""
+    remote: str = ""
+
+
+@dataclass(frozen=True)
+class WorkspaceCreationPlan:
+    aggregate_project: AggregateProject
+    workspace_id: str
+    name: str
+    description: str
+    root_path: str
+    components: tuple[WorkspacePlanComponent, ...]
+
+
+@dataclass(frozen=True)
+class WorkspaceCreationResult:
+    ok: bool
+    workspace: DevelopmentWorkspace | None
+    created_components: tuple[str, ...]
+    rolled_back_components: tuple[str, ...]
+    pending_components: tuple[str, ...]
+    error: str = ""
+
+
+@dataclass(frozen=True)
+class WorkspaceReviewComponent:
+    id: str
+    base_branch: str
+    base_commit: str
+    task_branch: str
+    changed_files: int
+    commits: tuple[str, ...]
+    diff_stat: str
+    pushed: bool
+    merged: bool
+    error: str = ""
+    compile_result: str = "未记录"
+    health_result: str = "未记录"
+    test_result: str = "未记录"
+
+
+@dataclass(frozen=True)
+class WorkspaceMergeComponent:
+    id: str
+    base_branch: str
+    task_branch: str
+    merged: bool
+    error: str = ""
+
+
+@dataclass(frozen=True)
+class WorkspaceMergeResult:
+    ok: bool
+    workspace: DevelopmentWorkspace
+    components: tuple[WorkspaceMergeComponent, ...]
+    error: str = ""
+
+
+@dataclass(frozen=True)
+class WorkspaceDeleteComponent:
+    id: str
+    dirty: bool
+    pushed: bool
+    merged: bool
+    branch_will_be_kept: bool
+    error: str = ""
+
+
+@dataclass(frozen=True)
+class WorkspaceDeletePlan:
+    workspace: DevelopmentWorkspace
+    components: tuple[WorkspaceDeleteComponent, ...]
+    blockers: tuple[str, ...]
+    warnings: tuple[str, ...]
+    unknown_paths: tuple[str, ...]
+
+    @property
+    def can_delete(self) -> bool:
+        return not self.blockers
+
+    @property
+    def needs_unmerged_confirmation(self) -> bool:
+        return any(item.pushed and not item.merged for item in self.components)
+
+
+def _run_git(cwd: str | Path, args: list[str], timeout: int = 30) -> tuple[int, str, str]:
+    try:
+        result = subprocess.run(
+            [resolve_git_executable(), *args],
+            cwd=str(cwd), capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=timeout,
+            creationflags=CREATE_NO_WINDOW,
+        )
+        return result.returncode, result.stdout.strip(), result.stderr.strip()
+    except (OSError, subprocess.SubprocessError) as exc:
+        return -1, "", str(exc)
+
+
+def _git_value(cwd: str | Path, args: list[str], label: str) -> str:
+    code, out, err = _run_git(cwd, args)
+    if code != 0 or not out:
+        raise WorkspaceOperationError(err or out or f"无法读取 {label}")
+    return out.splitlines()[0].strip()
+
+
+def workspace_id_from_name(name: str) -> str:
+    raw = str(name or "").strip()
+    if not raw or any(char in raw for char in ("/", "\\")):
+        raise WorkspaceOperationError("任务名不能为空，也不能包含路径分隔符")
+    value = _TASK_SAFE_RE.sub("-", raw).strip("-._")
+    if not value:
+        value = datetime.now().strftime("task-%Y%m%d-%H%M%S")
+    return validate_stable_id(value[:128], "workspace id")
+
+
+def _remote_identity(repo: Path) -> str:
+    code, out, _err = _run_git(repo, ["remote", "get-url", "origin"], timeout=5)
+    return out if code == 0 else ""
+
+
+def build_workspace_creation_plan(
+    project: AggregateProject,
+    name: str,
+    description: str,
+    selected_component_ids: list[str] | tuple[str, ...],
+) -> WorkspaceCreationPlan:
+    """先检查全部仓库，再返回不可变创建计划；不写文件。"""
+    workspace_id = workspace_id_from_name(name)
+    target_root = canonical_path(project.workspace_root / workspace_id)
+    if not is_path_within(target_root, project.workspace_root, allow_equal=False):
+        raise WorkspaceOperationError("临时工作区路径越界")
+    if target_root.exists():
+        raise WorkspaceOperationError(f"目标目录已存在：{target_root}")
+
+    selected_keys = {str(item).casefold() for item in selected_component_ids}
+    if not selected_keys:
+        raise WorkspaceOperationError("至少选择一个会修改的 Git 项目")
+    unknown = selected_keys - {item.id.casefold() for item in project.components}
+    if unknown:
+        raise WorkspaceOperationError("未知项目：" + ", ".join(sorted(unknown)))
+
+    plan_components: list[WorkspacePlanComponent] = []
+    seen_branches_by_remote: set[tuple[str, str]] = set()
+    for component in project.components:
+        source = canonical_path(component.absolute_path(project.root_path))
+        if component.shared:
+            plan_components.append(WorkspacePlanComponent(
+                id=component.id, source_path=str(source), mode="shared",
+            ))
+            continue
+        if component.id.casefold() not in selected_keys:
+            continue
+        if not source.is_dir():
+            raise WorkspaceOperationError(f"项目目录不存在：{component.id}")
+        code, out, _err = _run_git(source, ["rev-parse", "--is-inside-work-tree"], 5)
+        if code != 0 or out != "true":
+            raise WorkspaceOperationError(f"项目不是 Git 仓库：{component.id}")
+        base_branch = _git_value(source, ["branch", "--show-current"], "当前分支")
+        if not base_branch:
+            raise WorkspaceOperationError(f"项目处于 detached HEAD：{component.id}")
+        base_commit = _git_value(source, ["rev-parse", "HEAD"], "基准提交")
+        task_branch = f"feature/{workspace_id}-{component.id}"
+        code, _out, err = _run_git(source, ["check-ref-format", "--branch", task_branch], 5)
+        if code != 0:
+            raise WorkspaceOperationError(
+                f"任务分支名无效：{task_branch} ({err})"
+            )
+        code, _out, _err = _run_git(
+            source, ["show-ref", "--verify", "--quiet", f"refs/heads/{task_branch}"], 5,
+        )
+        if code == 0:
+            raise WorkspaceOperationError(f"本地任务分支已存在：{task_branch}")
+        code, remote_refs, err = _run_git(
+            source, ["for-each-ref", "--format=%(refname)", "refs/remotes"], 10,
+        )
+        if code != 0:
+            raise WorkspaceOperationError(err or f"无法检查远端分支缓存：{component.id}")
+        remote_suffix = f"/{task_branch}".casefold()
+        if any(
+            ref.strip().casefold().endswith(remote_suffix)
+            for ref in remote_refs.splitlines()
+        ):
+            raise WorkspaceOperationError(f"远端任务分支已存在：{task_branch}")
+        remote = _remote_identity(source)
+        remote_key = (remote.casefold(), task_branch.casefold())
+        if remote and remote_key in seen_branches_by_remote:
+            raise WorkspaceOperationError(f"同一远端任务分支重复：{task_branch}")
+        seen_branches_by_remote.add(remote_key)
+        code, worktrees, err = _run_git(source, ["worktree", "list", "--porcelain"], 10)
+        if code != 0:
+            raise WorkspaceOperationError(err or f"无法检查 Worktree：{component.id}")
+        if f"branch refs/heads/{task_branch}" in worktrees:
+            raise WorkspaceOperationError(f"任务分支已在其他 Worktree 检出：{task_branch}")
+        plan_components.append(WorkspacePlanComponent(
+            id=component.id,
+            source_path=str(source),
+            mode="worktree",
+            target_path=str(target_root / component.id),
+            base_branch=base_branch,
+            base_commit=base_commit,
+            task_branch=task_branch,
+            remote=remote,
+        ))
+
+    selected_plans = [item for item in plan_components if item.mode == "worktree"]
+    if len(selected_plans) != len(selected_keys):
+        missing = selected_keys - {item.id.casefold() for item in selected_plans}
+        raise WorkspaceOperationError(
+            "选中的项目不能创建 Worktree：" + ", ".join(sorted(missing))
+        )
+    return WorkspaceCreationPlan(
+        aggregate_project=project,
+        workspace_id=workspace_id,
+        name=str(name).strip(),
+        description=str(description or "").strip(),
+        root_path=str(target_root),
+        components=tuple(plan_components),
+    )
+
+
+def _write_text_atomic(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(f".{path.name}.tmp")
+    try:
+        temp.write_text(text, encoding="utf-8")
+        os.replace(temp, path)
+    finally:
+        try:
+            temp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _task_agents_text(plan: WorkspaceCreationPlan) -> str:
+    project = plan.aggregate_project
+    editable = [item for item in plan.components if item.mode == "worktree"]
+    shared = [item for item in plan.components if item.mode == "shared"]
+    included = {item.id.casefold() for item in plan.components}
+    unselected = [
+        item for item in project.components if item.id.casefold() not in included
+    ]
+
+    rows = []
+    for item in editable:
+        values = (
+            item.id, item.source_path, item.base_branch, item.base_commit,
+            item.task_branch, item.target_path, item.base_branch,
+        )
+        escaped = [str(value).replace("|", "\\|") for value in values]
+        rows.append("| " + " | ".join(
+            f"`{value}`" for value in escaped
+        ) + " |")
+    editable_table = (
+        "| 项目 | 源仓库 | 基准分支 | 基准提交 | 任务分支 | 可修改 Worktree | 最终合并目标 |\n"
+        "| --- | --- | --- | --- | --- | --- | --- |\n"
+        + "\n".join(rows)
+    )
+
+    forbidden = [
+        f"- `{item.id}`：`{item.source_path}`（共享引用，只可读取和启动）"
+        for item in shared
+    ]
+    forbidden.extend(
+        f"- `{item.id}`：`{item.absolute_path(project.root_path)}`（本需求未选择）"
+        for item in unselected
+    )
+    return (
+        f"# {plan.name}\n\n"
+        "## 任务\n\n"
+        f"- 任务名称：{plan.name}\n"
+        f"- 任务目标：{plan.description or '见 context.md'}\n"
+        f"- 来源聚合目录：`{project.root_path}`\n"
+        f"- 当前任务根目录：`{plan.root_path}`\n\n"
+        "## 项目来源与合并目标\n\n"
+        f"{editable_table}\n\n"
+        "开发完成后，各项目代码分别合并回表中的最终合并目标；"
+        "仅允许用户通过 mini-ide 的“合并代码”明确触发快进合并，"
+        "禁止 AI 自行合并仓库或强删分支。\n\n"
+        "## 修改边界\n\n"
+        "只允许修改上表中的可修改 Worktree。以下目录禁止在本需求中修改：\n\n"
+        + ("\n".join(forbidden) if forbidden else "- 无")
+        + "\n\n"
+        "必须继续遵守来源聚合目录及其上级的 `AGENTS.md`，尤其是：\n"
+        f"- `{Path(project.root_path) / 'AGENTS.md'}`\n\n"
+        "## mini-ide 约束\n\n"
+        "- 服务启动、停止、健康检查、日志、诊断和编译必须走 mini-ide CLI 或 GUI。\n"
+        "- 工作区创建、Review 和删除必须走 mini-ide；不要手工移动或递归删除 Worktree。\n"
+        "- Codex 和 cc 的工作目录必须保持为当前任务根目录。\n"
+    )
+
+
+def _context_text(plan: WorkspaceCreationPlan) -> str:
+    return (
+        f"# {plan.name}\n\n"
+        "## 需求\n\n"
+        f"{plan.description or '待补充'}\n\n"
+        "## 已确认决策\n\n- \n\n"
+        "## 未解决问题\n\n- \n\n"
+        "## Review 结论\n\n- \n"
+    )
+
+
+def create_development_workspace(plan: WorkspaceCreationPlan) -> WorkspaceCreationResult:
+    operation_key = normalized_path_key(plan.root_path)
+    with _OPERATION_LOCK:
+        if operation_key in _ACTIVE_OPERATIONS:
+            return WorkspaceCreationResult(
+                False, None, (), (), (), "同名工作区正在创建或删除",
+            )
+        _ACTIVE_OPERATIONS.add(operation_key)
+    created: list[WorkspacePlanComponent] = []
+    rolled_back: list[str] = []
+    try:
+        root = Path(plan.root_path)
+        root.mkdir(parents=True, exist_ok=False)
+        worktree_items = [item for item in plan.components if item.mode == "worktree"]
+        for item in worktree_items:
+            code, out, err = _run_git(
+                item.source_path,
+                ["worktree", "add", "-b", item.task_branch, item.target_path, item.base_commit],
+                timeout=120,
+            )
+            if code != 0:
+                raise WorkspaceOperationError(err or out or f"创建 {item.id} 失败")
+            created.append(item)
+
+        workspace_components = [
+            WorkspaceComponent(
+                id=item.id,
+                source_repository_path=item.source_path,
+                mode=item.mode,
+                worktree_path=item.target_path,
+                base_branch=item.base_branch,
+                base_commit=item.base_commit,
+                task_branch=item.task_branch,
+            )
+            for item in plan.components
+        ]
+        workspace = DevelopmentWorkspace(
+            root_path=plan.root_path,
+            id=plan.workspace_id,
+            name=plan.name,
+            created_at=datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
+            aggregate_project_path=plan.aggregate_project.root_path,
+            status="active",
+            components=tuple(workspace_components),
+            description=plan.description,
+            runtime_state_ref=f"{plan.aggregate_project.id}/{plan.workspace_id}",
+        )
+        _write_text_atomic(root / "AGENTS.md", _task_agents_text(plan))
+        _write_text_atomic(root / "context.md", _context_text(plan))
+        save_development_workspace(workspace, aggregate_project=plan.aggregate_project)
+        return WorkspaceCreationResult(
+            True, workspace, tuple(item.id for item in created), (), (), "",
+        )
+    except Exception as exc:
+        for item in reversed(created):
+            code, dirty, _err = _run_git(item.target_path, ["status", "--porcelain"], 10)
+            if code != 0 or dirty:
+                continue
+            remove_code, _out, _err = _run_git(
+                item.source_path, ["worktree", "remove", item.target_path], 60,
+            )
+            if remove_code == 0:
+                _run_git(item.source_path, ["worktree", "prune"], 30)
+                _run_git(item.source_path, ["branch", "-d", item.task_branch], 30)
+                rolled_back.append(item.id)
+        try:
+            Path(plan.root_path).rmdir()
+        except OSError:
+            pass
+        pending = [
+            item.id for item in plan.components
+            if item.mode == "worktree"
+            and item.id not in {created_item.id for created_item in created}
+        ]
+        return WorkspaceCreationResult(
+            False,
+            None,
+            tuple(item.id for item in created),
+            tuple(rolled_back),
+            tuple(pending),
+            str(exc),
+        )
+    finally:
+        with _OPERATION_LOCK:
+            _ACTIVE_OPERATIONS.discard(operation_key)
+
+
+def review_development_workspace(
+    workspace: DevelopmentWorkspace,
+) -> tuple[WorkspaceReviewComponent, ...]:
+    results: list[WorkspaceReviewComponent] = []
+    for item in workspace.components:
+        if item.mode != "worktree":
+            continue
+        code, status, err = _run_git(item.worktree_path, ["status", "--porcelain"], 15)
+        if code != 0:
+            results.append(WorkspaceReviewComponent(
+                item.id, item.base_branch, item.base_commit, item.task_branch,
+                0, (), "", False, False, err or "无法读取 Git 状态",
+            ))
+            continue
+        commits_code, commits_out, commits_err = _run_git(
+            item.worktree_path,
+            ["log", "--oneline", f"{item.base_commit}..HEAD"], 20,
+        )
+        diff_code, diff_out, diff_err = _run_git(
+            item.worktree_path,
+            ["diff", "--stat", item.base_commit, "HEAD"], 20,
+        )
+        pushed_code, pushed_out, _ = _run_git(
+            item.source_repository_path,
+            ["branch", "-r", "--contains", item.task_branch], 15,
+        )
+        merged_code, _out, _ = _run_git(
+            item.source_repository_path,
+            ["merge-base", "--is-ancestor", item.task_branch, item.base_branch], 15,
+        )
+        error = ""
+        if commits_code != 0:
+            error = commits_err
+        elif diff_code != 0:
+            error = diff_err
+        results.append(WorkspaceReviewComponent(
+            id=item.id,
+            base_branch=item.base_branch,
+            base_commit=item.base_commit,
+            task_branch=item.task_branch,
+            changed_files=len(status.splitlines()) if status else 0,
+            commits=tuple(line for line in commits_out.splitlines() if line),
+            diff_stat=diff_out,
+            pushed=pushed_code == 0 and bool(pushed_out),
+            merged=merged_code == 0,
+            error=error,
+        ))
+    review = tuple(results)
+    has_task_commits = any(item.commits for item in review)
+    fully_merged = bool(review) and all(
+        not item.error and item.changed_files == 0 and item.merged for item in review
+    )
+    next_status = "merged" if has_task_commits and fully_merged else "reviewing"
+    if workspace.status != next_status:
+        save_development_workspace(replace(workspace, status=next_status))
+    return review
+
+
+def _merge_preflight_error(item: WorkspaceComponent) -> str:
+    code, status, err = _run_git(item.worktree_path, ["status", "--porcelain"], 15)
+    if code != 0:
+        return err or "无法读取工作区状态"
+    if status:
+        return "工作区有未提交或未跟踪文件"
+    code, branch, err = _run_git(
+        item.worktree_path, ["branch", "--show-current"], 10,
+    )
+    if code != 0:
+        return err or "无法读取任务分支"
+    if branch != item.task_branch:
+        return f"工作区当前分支不是 {item.task_branch}"
+
+    code, source_branch, err = _run_git(
+        item.source_repository_path, ["branch", "--show-current"], 10,
+    )
+    if code != 0:
+        return err or "无法读取源目录分支"
+    if source_branch != item.base_branch:
+        return f"源目录当前分支不是 {item.base_branch}"
+    code, source_status, err = _run_git(
+        item.source_repository_path, ["status", "--porcelain"], 15,
+    )
+    if code != 0:
+        return err or "无法读取源目录状态"
+    if source_status:
+        return "源目录有未提交或未跟踪文件"
+
+    code, _out, err = _run_git(
+        item.source_repository_path,
+        ["merge-base", "--is-ancestor", item.base_branch, item.task_branch],
+        15,
+    )
+    if code == 0:
+        return ""
+    already_merged, _out, merged_err = _run_git(
+        item.source_repository_path,
+        ["merge-base", "--is-ancestor", item.task_branch, item.base_branch],
+        15,
+    )
+    if already_merged == 0:
+        return ""
+    return err or merged_err or "基准分支与任务分支已分叉，不能快进合并"
+
+
+def merge_development_workspace(
+    workspace: DevelopmentWorkspace,
+) -> WorkspaceMergeResult:
+    operation_key = normalized_path_key(workspace.root_path)
+    with _OPERATION_LOCK:
+        if operation_key in _ACTIVE_OPERATIONS:
+            return WorkspaceMergeResult(False, workspace, (), "工作区正在执行其它操作")
+        _ACTIVE_OPERATIONS.add(operation_key)
+    try:
+        editable = [item for item in workspace.components if item.mode == "worktree"]
+        if not editable:
+            return WorkspaceMergeResult(False, workspace, (), "工作区没有可合并的项目")
+
+        checked = tuple(
+            WorkspaceMergeComponent(
+                item.id, item.base_branch, item.task_branch, False,
+                _merge_preflight_error(item),
+            )
+            for item in editable
+        )
+        blockers = [f"{item.id}：{item.error}" for item in checked if item.error]
+        if blockers:
+            return WorkspaceMergeResult(False, workspace, checked, "；".join(blockers))
+
+        merged: list[WorkspaceMergeComponent] = []
+        for index, item in enumerate(editable):
+            code, out, err = _run_git(
+                item.source_repository_path,
+                ["merge", "--ff-only", item.task_branch],
+                120,
+            )
+            if code != 0:
+                message = err or out or "快进合并失败"
+                merged.append(WorkspaceMergeComponent(
+                    item.id, item.base_branch, item.task_branch, False, message,
+                ))
+                merged.extend(
+                    WorkspaceMergeComponent(
+                        pending.id, pending.base_branch, pending.task_branch,
+                        False, "前序项目合并失败，未执行",
+                    )
+                    for pending in editable[index + 1:]
+                )
+                return WorkspaceMergeResult(
+                    False, workspace, tuple(merged), f"{item.id}：{message}",
+                )
+            merged.append(WorkspaceMergeComponent(
+                item.id, item.base_branch, item.task_branch, True,
+            ))
+
+        merged_workspace = replace(workspace, status="merged")
+        save_development_workspace(merged_workspace)
+        return WorkspaceMergeResult(True, merged_workspace, tuple(merged))
+    finally:
+        with _OPERATION_LOCK:
+            _ACTIVE_OPERATIONS.discard(operation_key)
+
+
+def inspect_workspace_delete(
+    workspace: DevelopmentWorkspace,
+    running_paths: tuple[str, ...] | list[str] = (),
+) -> WorkspaceDeletePlan:
+    root = canonical_path(workspace.root_path)
+    running_keys = {normalized_path_key(path) for path in running_paths}
+    expected = {"workspace.json", "AGENTS.md", "context.md"}
+    expected.update(
+        Path(item.worktree_path).name
+        for item in workspace.components if item.mode == "worktree"
+    )
+    try:
+        unknown = tuple(sorted(
+            str(path) for path in root.iterdir() if path.name not in expected
+        ))
+    except OSError as exc:
+        unknown = (f"无法读取任务目录：{exc}",)
+    blockers: list[str] = []
+    warnings: list[str] = []
+    if unknown:
+        blockers.append("任务目录包含不受 mini-ide 管理的文件")
+
+    components: list[WorkspaceDeleteComponent] = []
+    for item in workspace.components:
+        runtime_path = item.worktree_path or item.source_repository_path
+        if normalized_path_key(runtime_path) in running_keys:
+            blockers.append(f"{item.id} 仍有服务或任务在运行")
+        if item.mode != "worktree":
+            continue
+        code, status, err = _run_git(item.worktree_path, ["status", "--porcelain"], 15)
+        dirty = code != 0 or bool(status)
+        pushed_code, pushed_out, _ = _run_git(
+            item.source_repository_path,
+            ["branch", "-r", "--contains", item.task_branch], 15,
+        )
+        merged_code, _out, _ = _run_git(
+            item.source_repository_path,
+            ["merge-base", "--is-ancestor", item.task_branch, item.base_branch], 15,
+        )
+        pushed = pushed_code == 0 and bool(pushed_out)
+        merged = merged_code == 0
+        error = err if code != 0 else ""
+        if dirty:
+            blockers.append(f"{item.id} 有未提交或未跟踪文件")
+        if not merged and not pushed:
+            blockers.append(f"{item.id} 未合并且没有远端备份")
+        elif not merged and pushed:
+            warnings.append(f"{item.id} 未合并，将保留任务分支")
+        components.append(WorkspaceDeleteComponent(
+            id=item.id,
+            dirty=dirty,
+            pushed=pushed,
+            merged=merged,
+            branch_will_be_kept=not merged,
+            error=error,
+        ))
+    return WorkspaceDeletePlan(
+        workspace=workspace,
+        components=tuple(components),
+        blockers=tuple(dict.fromkeys(blockers)),
+        warnings=tuple(dict.fromkeys(warnings)),
+        unknown_paths=unknown,
+    )
+
+
+def delete_development_workspace(
+    plan: WorkspaceDeletePlan,
+    *,
+    confirm_unmerged_backed_up: bool = False,
+) -> tuple[bool, tuple[str, ...], str]:
+    if not plan.can_delete:
+        return False, (), "；".join(plan.blockers)
+    if plan.needs_unmerged_confirmation and not confirm_unmerged_backed_up:
+        return False, (), "存在未合并但已有远端备份的分支，需要明确确认保留分支"
+    operation_key = normalized_path_key(plan.workspace.root_path)
+    with _OPERATION_LOCK:
+        if operation_key in _ACTIVE_OPERATIONS:
+            return False, (), "同名工作区正在创建或删除"
+        _ACTIVE_OPERATIONS.add(operation_key)
+    kept_branches: list[str] = []
+    try:
+        by_id = {item.id: item for item in plan.components}
+        for item in plan.workspace.components:
+            if item.mode != "worktree":
+                continue
+            code, out, err = _run_git(
+                item.source_repository_path,
+                ["worktree", "remove", item.worktree_path],
+                60,
+            )
+            if code != 0:
+                return False, tuple(kept_branches), err or out or f"移除 {item.id} 失败"
+            _run_git(item.source_repository_path, ["worktree", "prune"], 30)
+            status = by_id.get(item.id)
+            if status and status.merged:
+                delete_code, _out, _err = _run_git(
+                    item.source_repository_path, ["branch", "-d", item.task_branch], 30,
+                )
+                if delete_code != 0:
+                    kept_branches.append(item.task_branch)
+            else:
+                kept_branches.append(item.task_branch)
+
+        root = Path(plan.workspace.root_path)
+        for name in ("workspace.json", "AGENTS.md", "context.md"):
+            try:
+                (root / name).unlink(missing_ok=True)
+            except OSError as exc:
+                return False, tuple(kept_branches), f"删除元数据失败：{exc}"
+        try:
+            root.rmdir()
+        except OSError as exc:
+            return False, tuple(kept_branches), f"任务目录非空，已保留：{exc}"
+        return True, tuple(kept_branches), ""
+    finally:
+        with _OPERATION_LOCK:
+            _ACTIVE_OPERATIONS.discard(operation_key)

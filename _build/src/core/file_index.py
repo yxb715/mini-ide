@@ -14,6 +14,10 @@ from typing import Callable
 
 from PySide6.QtCore import QObject, QThread, Signal
 
+from src.core.aggregate_workspace import (
+    is_scan_path_excluded, scan_exclusion_roots,
+)
+
 
 IGNORED_DIRS = {
     ".git", ".idea", ".vscode", ".gradle", ".mvn", ".nuxt", ".next", ".output",
@@ -53,6 +57,7 @@ class FileIndexer(QObject):
     def __init__(self, project_root: str, parent=None):
         super().__init__(parent)
         self.root = Path(project_root).resolve()
+        self._excluded_roots = scan_exclusion_roots(self.root)
         self._lock = threading.RLock()
         self._files: list[IndexedFile] = []
         self._abs_set: set[str] = set()
@@ -64,7 +69,7 @@ class FileIndexer(QObject):
     def start_async_scan(self) -> None:
         if self._worker and self._worker.isRunning():
             return
-        self._worker = _IndexWorker(str(self.root))
+        self._worker = _IndexWorker(str(self.root), self._excluded_roots)
         self._worker.done.connect(self._apply_snapshot)
         self._worker.start()
 
@@ -152,7 +157,7 @@ class FileIndexer(QObject):
             return
         if not p.is_relative_to(self.root):
             return
-        if _should_ignore(p, self.root):
+        if _should_ignore(p, self.root, self._excluded_roots):
             return
         key = str(p)
         with self._lock:
@@ -180,17 +185,27 @@ class FileIndexer(QObject):
 class _IndexWorker(QThread):
     done = Signal(list)
 
-    def __init__(self, root: str):
+    def __init__(
+        self,
+        root: str,
+        excluded_roots: tuple[str | Path, ...] | None = None,
+    ):
         super().__init__()
         self.root = root
+        self.excluded_roots = (
+            tuple(Path(path) for path in excluded_roots)
+            if excluded_roots is not None
+            else scan_exclusion_roots(root)
+        )
 
     def run(self) -> None:
         files: list[IndexedFile] = []
         root_path = Path(self.root)
         try:
             for dirpath, dirnames, filenames in os.walk(self.root):
-                dirnames[:] = [d for d in dirnames
-                               if d not in IGNORED_DIRS and not d.startswith(".") or d in (".env",)]
+                prune_scan_dirnames(
+                    Path(dirpath), dirnames, self.excluded_roots, allow_env=True,
+                )
                 for fn in filenames:
                     ext = Path(fn).suffix.lower()
                     if ext in IGNORED_EXTS:
@@ -214,7 +229,31 @@ class _IndexWorker(QThread):
         self.done.emit(files)
 
 
-def _should_ignore(p: Path, root: Path) -> bool:
+def prune_scan_dirnames(
+    dirpath: Path,
+    dirnames: list[str],
+    excluded_roots: tuple[str | Path, ...] | list[str | Path],
+    *,
+    allow_env: bool = False,
+) -> None:
+    """原地裁剪 os.walk 目录，统一应用噪音目录和聚合工作区排除。"""
+    dirnames[:] = [
+        name for name in dirnames
+        if (
+            (name not in IGNORED_DIRS and not name.startswith("."))
+            or (allow_env and name == ".env")
+        )
+        and not is_scan_path_excluded(dirpath / name, excluded_roots)
+    ]
+
+
+def _should_ignore(
+    p: Path,
+    root: Path,
+    excluded_roots: tuple[str | Path, ...] | list[str | Path] = (),
+) -> bool:
+    if is_scan_path_excluded(p, excluded_roots):
+        return True
     try:
         rel = p.relative_to(root)
     except ValueError:

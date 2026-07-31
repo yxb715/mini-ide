@@ -16,7 +16,8 @@ from pathlib import Path
 
 from PySide6.QtCore import QObject, QThread, Signal
 
-from src.core.file_index import IGNORED_DIRS
+from src.core.aggregate_workspace import scan_exclusion_roots
+from src.core.file_index import prune_scan_dirnames
 
 
 # 方法级映射注解 → 默认 HTTP 方法标签
@@ -220,12 +221,12 @@ class _ControllerWorker(QThread):
     def __init__(self, root: str):
         super().__init__()
         self.root = root
+        self.excluded_roots = scan_exclusion_roots(root)
 
     def run(self) -> None:
         endpoints: list[Endpoint] = []
         for dirpath, dirnames, filenames in os.walk(self.root):
-            dirnames[:] = [d for d in dirnames
-                           if d not in IGNORED_DIRS and not d.startswith(".")]
+            prune_scan_dirnames(Path(dirpath), dirnames, self.excluded_roots)
             for fn in filenames:
                 if not fn.endswith(".java"):
                     continue

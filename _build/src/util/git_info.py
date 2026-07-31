@@ -11,6 +11,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from src.util.git_executable import resolve_git_executable
+
 _CACHE: dict[str, tuple[float, "GitInfo | None"]] = {}
 _TTL = 2.0    # 秒，状态栏每 3s 刷一次；短缓存保证 AI 提交后改动数及时归零
 
@@ -30,7 +32,7 @@ class GitInfo:
 
 def _git(args: list[str], cwd: str) -> str:
     return subprocess.run(
-        ["git", *args],
+        [resolve_git_executable(), *args],
         cwd=cwd, capture_output=True, text=True, timeout=3,
         **_POPEN_KW,
     ).stdout

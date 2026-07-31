@@ -799,7 +799,7 @@ class FileTree(QWidget):
 
         # 外部工具 / 系统定位
         menu.addAction("在 cc 中打开", lambda d=target_dir: self._open_cc(d))
-        menu.addAction("在 codex 中打开", lambda d=target_dir: self._open_codex(d))
+        menu.addAction("在 Codex 中打开", lambda d=target_dir: self._open_codex(d))
         menu.addAction(REVEAL_LABEL, lambda: reveal_in_explorer(path))
         menu.addSeparator()
 
@@ -1063,8 +1063,8 @@ class FileTree(QWidget):
         command = open_in_codex_args(target_dir)
         if not command:
             QMessageBox.warning(
-                self, "启动 codex 失败",
-                "没有找到可用的终端来启动 codex。",
+                self, "启动 Codex 失败",
+                "没有找到可用的终端来启动 Codex。",
             )
             return
         try:
@@ -1075,7 +1075,7 @@ class FileTree(QWidget):
                 close_fds=True,
             )
         except OSError as e:
-            QMessageBox.warning(self, "启动 codex 失败", f"{e}")
+            QMessageBox.warning(self, "启动 Codex 失败", f"{e}")
 
     def _open_cc(self, target_dir: Path) -> None:
         """在终端中打开 Claude Code (cc)。"""

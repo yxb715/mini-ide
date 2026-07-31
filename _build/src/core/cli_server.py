@@ -17,6 +17,14 @@ if TYPE_CHECKING:
     from src.ui.main_window import MainWindow
 
 from src.core import git_context
+from src.core.aggregate_workspace import (
+    load_aggregate_project, load_development_workspace,
+)
+from src.core.development_workspace_service import (
+    build_workspace_creation_plan, create_development_workspace,
+    inspect_workspace_delete, review_development_workspace,
+)
+from src.core.path_utils import normalized_path_key
 from src.util import app_log
 
 log = app_log.get_logger("cli_server")
@@ -62,6 +70,51 @@ def _all_project_tabs(window: "MainWindow") -> list:
     return tabs
 
 
+def _all_environment_tabs(window: "MainWindow") -> list:
+    from src.ui.aggregate_project_tab import AggregateProjectTab
+    return [
+        window.tabs.widget(index)
+        for index in range(window.tabs.count())
+        if isinstance(window.tabs.widget(index), AggregateProjectTab)
+    ]
+
+
+def _project_target_tabs(window: "MainWindow", *, include_components: bool = True) -> list:
+    """返回 CLI 可操作项目；聚合目录内项目不参与顶层状态重复汇总。"""
+    tabs = list(_all_project_tabs(window))
+    if include_components:
+        for environment in _all_environment_tabs(window):
+            tabs.extend(environment.component_tabs.values())
+    return list(dict.fromkeys(tabs))
+
+
+def _environment_snapshot(tab) -> dict:
+    states = tab.service_states(refresh_external=True)
+    return {
+        "id": tab.stable_id,
+        "name": tab.project_meta.name,
+        "path": tab.path,
+        "type": tab.project_meta.project_type,
+        "aggregate_project_path": tab.aggregate_root_path,
+        "workspace": bool(tab.workspace),
+        "workspace_path": tab.workspace.root_path if tab.workspace else "",
+        "projects": [
+            {
+                "id": component_id,
+                "path": component_tab.project_meta.path,
+                "type": component_tab.project_meta.project_type,
+                "modules": [
+                    state.to_cli_module()
+                    for state in component_tab.service_states(refresh_external=False)
+                    if state.kind != "script"
+                ],
+            }
+            for component_id, component_tab in tab.component_tabs.items()
+        ],
+        "running": [state.to_running_item() for state in states if state.is_active],
+    }
+
+
 def _collect_running(window: "MainWindow") -> list[dict]:
     items: list[dict] = []
     for tab in _all_project_tabs(window):
@@ -69,17 +122,103 @@ def _collect_running(window: "MainWindow") -> list[dict]:
             items.extend(tab.running_service_items(refresh_external=True))
         except Exception:
             log.exception("收集运行服务失败: %s", tab.project_meta.name)
+    for tab in _all_environment_tabs(window):
+        try:
+            items.extend(tab.running_service_items(refresh_external=True))
+        except Exception:
+            log.exception("收集聚合环境服务失败: %s", tab.project_meta.name)
     return items
 
 
-def _workspace_payload(ws, active_name: str = "") -> dict:
+def _public_target_candidate(record: dict) -> dict:
+    """歧义响应只暴露可 JSON 序列化的目标标识。"""
     return {
-        "name": ws.name,
-        "paths": list(ws.paths),
-        "project_count": len(ws.paths),
-        "last_opened_at": ws.last_opened_at,
-        "active": bool(active_name and ws.name == active_name),
+        "id": str(record.get("id", "")),
+        "name": str(record.get("name", "")),
+        "path": str(record.get("path", "")),
     }
+
+
+def _match_target(records: list[dict], target: str, label: str) -> tuple[dict | None, dict | None]:
+    key = str(target or "").strip()
+    if not key:
+        return None, {"ok": False, "error": f"missing {label} target"}
+    path_matches = [
+        item for item in records
+        if normalized_path_key(item["path"]) == normalized_path_key(key)
+    ]
+    exact = path_matches or [
+        item for item in records
+        if key.casefold() in {
+            str(item.get("id", "")).casefold(),
+            str(item.get("name", "")).casefold(),
+            Path(item["path"]).name.casefold(),
+        }
+    ]
+    if len(exact) == 1:
+        return exact[0], None
+    if len(exact) > 1:
+        return None, {
+            "ok": False, "code": f"ambiguous_{label}",
+            "error": f"ambiguous {label}: {key}",
+            "candidates": [_public_target_candidate(item) for item in exact],
+        }
+    folded = key.casefold()
+    fuzzy = [
+        item for item in records
+        if any(folded in str(value).casefold() for value in (
+            item.get("id", ""), item.get("name", ""), item.get("path", ""),
+        ))
+    ]
+    if len(fuzzy) == 1:
+        return fuzzy[0], None
+    if len(fuzzy) > 1:
+        return None, {
+            "ok": False, "code": f"ambiguous_{label}",
+            "error": f"ambiguous {label}: {key}",
+            "candidates": [_public_target_candidate(item) for item in fuzzy],
+        }
+    return None, {
+        "ok": False, "code": f"{label}_not_found",
+        "error": f"{label} not found: {key}",
+    }
+
+
+def _aggregate_records(window: "MainWindow") -> list[dict]:
+    records = []
+    for path in window.config.aggregate_project_paths:
+        try:
+            project = load_aggregate_project(path)
+            records.append({
+                "id": project.id, "name": project.name, "path": project.root_path,
+                "project_count": len(project.components), "error": "",
+            })
+        except Exception as exc:
+            records.append({
+                "id": "", "name": Path(path).name, "path": str(path),
+                "project_count": 0, "error": str(exc),
+            })
+    return records
+
+
+def _development_workspace_records(window: "MainWindow") -> list[dict]:
+    """只读取聚合 Tab 的后台缓存，不在 GUI 主线程扫描目录。"""
+    records = []
+    for tab in _all_environment_tabs(window):
+        for summary in getattr(tab, "_workspace_summaries", ()):
+            workspace = summary.workspace
+            records.append({
+                "id": workspace.id if workspace else "",
+                "name": summary.name,
+                "path": summary.root_path,
+                "aggregate": summary.aggregate_name,
+                "projects": list(summary.component_ids),
+                "branches": list(summary.task_branches),
+                "status": summary.status,
+                "git_change_count": summary.git_change_count,
+                "error": summary.error,
+            })
+    return records
 
 
 def _log_widget_for(tab, module: str | None):
@@ -147,6 +286,199 @@ class _GitDiffWorker(QObject):
         self.deleteLater()
 
 
+class _WorkspaceCommandWorker(QObject):
+    done = Signal(dict)
+
+    def __init__(self, command: dict, aggregate_paths: tuple[str, ...], running_paths: tuple[str, ...]):
+        super().__init__()
+        self.command = command
+        self.aggregate_paths = aggregate_paths
+        self.running_paths = running_paths
+
+    def _aggregates(self) -> list[dict]:
+        records = []
+        for path in self.aggregate_paths:
+            try:
+                project = load_aggregate_project(path)
+                records.append({
+                    "id": project.id, "name": project.name,
+                    "path": project.root_path, "project": project,
+                })
+            except Exception:
+                continue
+        return records
+
+    def _workspaces(self) -> list[dict]:
+        records = []
+        for aggregate in self._aggregates():
+            project = aggregate["project"]
+            root = project.workspace_root
+            if not root.is_dir():
+                continue
+            try:
+                children = tuple(root.iterdir())
+            except OSError:
+                continue
+            for path in children:
+                if not path.is_dir() or not (path / "workspace.json").is_file():
+                    continue
+                try:
+                    workspace = load_development_workspace(path, aggregate_project=project)
+                except Exception:
+                    continue
+                records.append({
+                    "id": workspace.id, "name": workspace.name,
+                    "path": workspace.root_path, "workspace": workspace,
+                    "project": project,
+                })
+        return records
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            action = self.command["cmd"]
+            if action == "list-workspaces":
+                records = []
+                active_path = normalized_path_key(
+                    self.command.get("active_workspace_path", "")
+                ) if self.command.get("active_workspace_path") else ""
+                for record in self._workspaces():
+                    workspace = record["workspace"]
+                    records.append({
+                        "id": workspace.id,
+                        "name": workspace.name,
+                        "path": workspace.root_path,
+                        "aggregate": record["project"].name,
+                        "projects": [item.id for item in workspace.components],
+                        "branches": [
+                            item.task_branch for item in workspace.components
+                            if item.task_branch
+                        ],
+                        "status": workspace.status,
+                        "active": bool(
+                            active_path
+                            and normalized_path_key(workspace.root_path) == active_path
+                        ),
+                    })
+                records.sort(key=lambda item: (
+                    item["aggregate"].casefold(), item["name"].casefold(),
+                ))
+                self.done.emit({
+                    "ok": True,
+                    "active_workspace_name": next((
+                        item["name"] for item in records if item["active"]
+                    ), ""),
+                    "workspaces": records,
+                })
+                return
+            if action == "create-development-workspace":
+                record, error = _match_target(
+                    self._aggregates(), self.command.get("aggregate", ""), "aggregate",
+                )
+                if error:
+                    self.done.emit(error)
+                    return
+                plan = build_workspace_creation_plan(
+                    record["project"], self.command.get("name", ""),
+                    self.command.get("description", ""),
+                    self.command.get("projects", []),
+                )
+                result = create_development_workspace(plan)
+                self.done.emit({
+                    "ok": result.ok,
+                    "error": result.error,
+                    "workspace": ({
+                        "id": result.workspace.id,
+                        "name": result.workspace.name,
+                        "path": result.workspace.root_path,
+                        "projects": [item.to_dict() for item in result.workspace.components],
+                    } if result.workspace else None),
+                    "created": list(result.created_components),
+                    "rolled_back": list(result.rolled_back_components),
+                    "pending": list(result.pending_components),
+                })
+                return
+            record, error = _match_target(
+                self._workspaces(), self.command.get("target", ""),
+                "development_workspace",
+            )
+            if error:
+                self.done.emit(error)
+                return
+            workspace = record["workspace"]
+            if action == "open-workspace":
+                self.done.emit({
+                    "ok": True,
+                    "workspace": {
+                        "id": workspace.id,
+                        "name": workspace.name,
+                        "path": workspace.root_path,
+                    },
+                    "_open_path": workspace.root_path,
+                })
+                return
+            if action == "workspace-review":
+                projects = review_development_workspace(workspace)
+                workspace = load_development_workspace(
+                    workspace.root_path, aggregate_project=record["project"],
+                )
+                self.done.emit({
+                    "ok": True,
+                    "workspace": {
+                        "id": workspace.id, "name": workspace.name,
+                        "path": workspace.root_path, "status": workspace.status,
+                    },
+                    "projects": [
+                        {
+                            "id": item.id,
+                            "base_branch": item.base_branch,
+                            "base_commit": item.base_commit,
+                            "task_branch": item.task_branch,
+                            "changed_files": item.changed_files,
+                            "commits": list(item.commits),
+                            "diff_stat": item.diff_stat,
+                            "pushed": item.pushed,
+                            "merged": item.merged,
+                            "compile_result": item.compile_result,
+                            "health_result": item.health_result,
+                            "test_result": item.test_result,
+                            "error": item.error,
+                        }
+                        for item in projects
+                    ],
+                })
+                return
+            if action == "workspace-delete-check":
+                plan = inspect_workspace_delete(workspace, self.running_paths)
+                self.done.emit({
+                    "ok": True,
+                    "workspace": {"id": workspace.id, "name": workspace.name, "path": workspace.root_path},
+                    "can_delete": plan.can_delete,
+                    "requires_confirmation": plan.needs_unmerged_confirmation,
+                    "blockers": list(plan.blockers),
+                    "warnings": list(plan.warnings),
+                    "unknown_paths": list(plan.unknown_paths),
+                    "projects": [
+                        {
+                            "id": item.id, "dirty": item.dirty,
+                            "pushed": item.pushed, "merged": item.merged,
+                            "branch_will_be_kept": item.branch_will_be_kept,
+                            "error": item.error,
+                        }
+                        for item in plan.components
+                    ],
+                })
+                return
+            self.done.emit({"ok": False, "error": f"unsupported workspace command: {action}"})
+        except Exception as exc:
+            log.exception("CLI 开发工作区命令失败")
+            self.done.emit({"ok": False, "error": str(exc)})
+
+    @Slot(dict)
+    def dispose(self, _payload: dict) -> None:
+        self.deleteLater()
+
+
 class _GitDiffResponder(QObject):
     def __init__(self, sock: QLocalSocket, thread: QThread, worker: QObject, parent=None):
         super().__init__(parent)
@@ -170,6 +502,27 @@ class _GitDiffResponder(QObject):
         self.deleteLater()
 
 
+class _WorkspaceCommandResponder(_GitDiffResponder):
+    def __init__(self, window: "MainWindow", *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.window = window
+
+    @Slot(dict)
+    def finish(self, payload: dict) -> None:
+        result = dict(payload)
+        open_path = result.pop("_open_path", "")
+        if result.get("ok") and open_path:
+            tab = self.window.open_development_workspace(open_path, quiet=True)
+            if tab is None:
+                result = {
+                    "ok": False,
+                    "error": f"open workspace failed: {open_path}",
+                }
+            else:
+                result["environment"] = _environment_snapshot(tab)
+        super().finish(result)
+
+
 _active_workers: list[tuple[QThread, QObject, QObject]] = []
 
 
@@ -179,6 +532,33 @@ def _run_git_diff_async(tab, mode: str, max_chars: int, sock: QLocalSocket) -> N
     responder = _GitDiffResponder(sock, thread, worker)
     worker.moveToThread(thread)
 
+    worker.done.connect(responder.finish)
+    worker.done.connect(worker.dispose)
+    thread.started.connect(worker.run)
+    thread.finished.connect(responder.cleanup)
+    _active_workers.append((thread, worker, responder))
+    thread.start()
+
+
+def _run_workspace_command_async(cmd: dict, window: "MainWindow", sock: QLocalSocket) -> None:
+    thread = QThread()
+    running_paths = tuple(
+        path
+        for tab in _all_environment_tabs(window)
+        if tab.running_service_items(refresh_external=True)
+        for path in tab.runtime_paths()
+    )
+    command = dict(cmd)
+    current = window.tabs.currentWidget()
+    active_workspace = getattr(current, "workspace", None)
+    command["active_workspace_path"] = (
+        active_workspace.root_path if active_workspace else ""
+    )
+    worker = _WorkspaceCommandWorker(
+        command, tuple(window.config.aggregate_project_paths), running_paths,
+    )
+    responder = _WorkspaceCommandResponder(window, sock, thread, worker)
+    worker.moveToThread(thread)
     worker.done.connect(responder.finish)
     worker.done.connect(worker.dispose)
     thread.started.connect(worker.run)
@@ -235,11 +615,19 @@ def _dispatch(cmd: dict, window: "MainWindow") -> dict:
     if action == "open":
         return _cmd_open(window, cmd.get("path", ""))
 
-    if action == "list-workspaces":
-        return _cmd_list_workspaces(window)
+    if action in ("list-workspaces", "open-workspace"):
+        return {"ok": False, "error": f"{action} command uses async handler"}
 
-    if action == "open-workspace":
-        return _cmd_open_workspace(window, cmd.get("name", ""))
+    if action == "list-aggregates":
+        return {"ok": True, "aggregates": _aggregate_records(window)}
+
+    if action == "open-aggregate":
+        return _cmd_open_aggregate(window, cmd.get("target", ""))
+
+    if action in (
+        "create-development-workspace", "workspace-review", "workspace-delete-check",
+    ):
+        return {"ok": False, "error": f"{action} command uses async handler"}
 
     if action == "close-workspace":
         return _cmd_close_workspace(window)
@@ -255,9 +643,11 @@ def _dispatch(cmd: dict, window: "MainWindow") -> dict:
     if not project_key:
         return {"ok": False, "error": "missing 'project' argument"}
 
-    tab = _find_project_tab(window, project_key)
-    if tab is None:
-        return {"ok": False, "error": f"project not found: {project_key}"}
+    tab, match_error = _find_project_tab(
+        window, project_key, include_components=action != "close",
+    )
+    if match_error:
+        return match_error
 
     if action == "list-modules":
         return _cmd_list_modules(tab)
@@ -296,6 +686,12 @@ def handle_async_cli_request(
 ) -> bool:
     """处理需要异步等待的命令。返回 True 表示已接管。"""
     action = cmd.get("cmd")
+    if action in (
+        "list-workspaces", "open-workspace", "create-development-workspace",
+        "workspace-review", "workspace-delete-check",
+    ):
+        _run_workspace_command_async(cmd, window, sock)
+        return True
     if action in ("start", "restart") and not cmd.get("wait"):
         return False
     if action not in (
@@ -309,9 +705,9 @@ def handle_async_cli_request(
         _send_response(sock, {"ok": False, "error": "missing 'project' argument"})
         return True
 
-    tab = _find_project_tab(window, project_key)
-    if tab is None:
-        _send_response(sock, {"ok": False, "error": f"project not found: {project_key}"})
+    tab, match_error = _find_project_tab(window, project_key)
+    if match_error:
+        _send_response(sock, match_error)
         return True
 
     if action == "health":
@@ -338,19 +734,108 @@ def handle_async_cli_request(
 
 # ---- 项目查找 ----
 
-def _find_project_tab(window: "MainWindow", key: str):
-    """按目录名模糊匹配（包含即可，不区分大小写）。"""
-    from src.ui.project_tab import ProjectTab
-    key_lower = key.lower()
-    for i in range(window.tabs.count()):
-        w = window.tabs.widget(i)
-        if not isinstance(w, ProjectTab):
-            continue
-        dir_name = w.project_meta.name.lower()
-        full_path = w.project_meta.path.lower().replace("/", "\\")
-        if key_lower in dir_name or key_lower in full_path:
-            return w
-    return None
+def _find_project_tab(
+    window: "MainWindow", key: str, *, include_components: bool = True,
+):
+    """确定性匹配项目，返回 (tab, error_payload)。"""
+    tabs = _project_target_tabs(window, include_components=include_components)
+    key = key.strip()
+    key_folded = key.casefold()
+
+    def normalized_path(value: str) -> str:
+        return normalized_path_key(value)
+
+    def stable_id(tab) -> str:
+        meta = tab.project_meta
+        return str(
+            getattr(tab, "component_id", "")
+            or getattr(tab, "stable_id", "")
+            or getattr(meta, "component_id", "")
+            or getattr(meta, "stable_id", "")
+            or ""
+        )
+
+    def candidate(tab) -> dict:
+        path = str(tab.project_meta.path)
+        return {
+            "id": stable_id(tab) or Path(path).name,
+            "name": tab.project_meta.name,
+            "path": path,
+            "type": tab.project_meta.project_type,
+        }
+
+    def resolved(matches: list, match_kind: str):
+        if len(matches) == 1:
+            return matches[0], None
+        if len(matches) > 1:
+            candidates = sorted(
+                (candidate(tab) for tab in matches),
+                key=lambda item: normalized_path(item["path"]),
+            )
+            return None, {
+                "ok": False,
+                "code": "ambiguous_project",
+                "error": f"ambiguous project: {key}",
+                "match": match_kind,
+                "candidates": candidates,
+            }
+        return None
+
+    exact_path = [
+        tab for tab in tabs
+        if normalized_path(tab.project_meta.path) == normalized_path(key)
+    ]
+    result = resolved(exact_path, "path")
+    if result:
+        return result
+
+    exact_id_or_dir = []
+    for tab in tabs:
+        path = str(tab.project_meta.path)
+        identifiers = {Path(path).name.casefold()}
+        tab_stable_id = stable_id(tab)
+        if tab_stable_id:
+            identifiers.add(tab_stable_id.casefold())
+        if key_folded in identifiers:
+            exact_id_or_dir.append(tab)
+    result = resolved(exact_id_or_dir, "id")
+    if result:
+        return result
+
+    fuzzy = []
+    for tab in tabs:
+        path = str(tab.project_meta.path)
+        values = {
+            normalized_path(path),
+            Path(path).name.casefold(),
+            str(tab.project_meta.name).casefold(),
+        }
+        tab_stable_id = stable_id(tab)
+        if tab_stable_id:
+            values.add(tab_stable_id.casefold())
+        if any(key_folded in value for value in values):
+            fuzzy.append(tab)
+    result = resolved(fuzzy, "fuzzy")
+    if result:
+        return result
+
+    return None, {
+        "ok": False,
+        "code": "project_not_found",
+        "error": f"project not found: {key}",
+    }
+
+
+def _cmd_open_aggregate(window: "MainWindow", target: str) -> dict:
+    record, error = _match_target(_aggregate_records(window), target, "aggregate")
+    if error:
+        return error
+    if record.get("error"):
+        return {"ok": False, "error": record["error"]}
+    tab = window.open_aggregate_project(record["path"], quiet=True)
+    if tab is None:
+        return {"ok": False, "error": f"open aggregate failed: {target}"}
+    return {"ok": True, "environment": _environment_snapshot(tab)}
 
 
 # ---- 命令实现 ----
@@ -373,14 +858,8 @@ def _stop_tab_all(tab) -> tuple[int, bool]:
 
 
 def _cmd_status(window: "MainWindow") -> dict:
-    from src.core.workspace_manager import ensure_workspace_candidates
-    changed = ensure_workspace_candidates(window.config)
-    if changed:
-        window.config.save()
-        try:
-            window._rebuild_workspace_menu()
-        except Exception:
-            log.exception("刷新工作区菜单失败")
+    from src.ui.aggregate_project_tab import AggregateProjectTab
+
     current = window.tabs.currentWidget()
     current_project = None
     if current is not None and hasattr(current, "project_meta"):
@@ -389,23 +868,29 @@ def _cmd_status(window: "MainWindow") -> dict:
             "path": current.project_meta.path,
         }
     projects = [_project_snapshot(tab) for tab in _all_project_tabs(window)]
+    environments = [_environment_snapshot(tab) for tab in _all_environment_tabs(window)]
+    active_workspace = (
+        current.workspace if isinstance(current, AggregateProjectTab) else None
+    )
+    workspaces = _development_workspace_records(window)
     running = []
     for p in projects:
         running.extend(p.get("running", []))
+    for environment in environments:
+        running.extend(environment.get("running", []))
     return {
         "ok": True,
         "ide": "mini-ide",
         "version": _app_version(),
-        "project_count": len(projects),
+        "project_count": len(projects) + len(environments),
         "current_project": current_project,
-        "active_workspace_name": window.config.active_workspace_name,
+        "active_workspace_name": active_workspace.name if active_workspace else "",
         "startup_restore_mode": window.config.startup_restore_mode,
         "projects": projects,
+        "environments": environments,
+        "aggregates": _aggregate_records(window),
         "running": running,
-        "workspaces": [
-            _workspace_payload(ws, window.config.active_workspace_name)
-            for ws in window.config.workspaces
-        ],
+        "workspaces": workspaces,
     }
 
 
@@ -418,6 +903,8 @@ def _cmd_open(window: "MainWindow", path: str) -> dict:
     tab = window.open_project(str(p), quiet=True)
     if tab is None:
         return {"ok": False, "error": f"open project failed: {path}"}
+    if tab in _all_environment_tabs(window):
+        return {"ok": True, "environment": _environment_snapshot(tab)}
     return {"ok": True, "project": _project_snapshot(tab)}
 
 
@@ -441,104 +928,28 @@ def _cmd_close_project(window: "MainWindow", tab) -> dict:
     }
 
 
-def _cmd_list_workspaces(window: "MainWindow") -> dict:
-    from src.core.workspace_manager import ensure_workspace_candidates
-    changed = ensure_workspace_candidates(window.config)
-    if changed:
-        window.config.save()
-        try:
-            window._rebuild_workspace_menu()
-        except Exception:
-            log.exception("刷新工作区菜单失败")
+def _cmd_close_workspace(window: "MainWindow") -> dict:
+    from src.ui.aggregate_project_tab import AggregateProjectTab
+
+    tab = window.tabs.currentWidget()
+    if not isinstance(tab, AggregateProjectTab) or tab.workspace is None:
+        return {"ok": False, "error": "no active aggregate workspace"}
+    workspace = tab.workspace
+    running = tab.running_service_items(refresh_external=True)
+    stopped_count = tab.stop_all_services(include_external=True, silent=True)
+    if stopped_count and not tab.wait_services_stopped(20000):
+        return {
+            "ok": False, "error": "stop timeout", "services": running,
+        }
+    if not tab.activate_workspace(None, interactive=False):
+        return {"ok": False, "error": "workspace could not return to source projects"}
+    window._save_tab_session()
     return {
         "ok": True,
-        "active_workspace_name": window.config.active_workspace_name,
-        "startup_restore_mode": window.config.startup_restore_mode,
-        "workspaces": [
-            _workspace_payload(ws, window.config.active_workspace_name)
-            for ws in window.config.workspaces
-        ],
+        "workspace": {"id": workspace.id, "name": workspace.name, "path": workspace.root_path},
+        "stopped": stopped_count,
+        "services": running,
     }
-
-
-def _find_workspace(window: "MainWindow", name: str):
-    if not name:
-        return None
-    exact = window.config.find_workspace(name)
-    if exact:
-        return exact
-    key = name.lower()
-    matches = [ws for ws in window.config.workspaces if key in ws.name.lower()]
-    return matches[0] if len(matches) == 1 else None
-
-
-def _cmd_open_workspace(window: "MainWindow", name: str) -> dict:
-    from src.core.workspace_manager import mark_workspace_opened
-    ws = _find_workspace(window, name)
-    if not ws:
-        return {"ok": False, "error": f"workspace not found: {name}"}
-    opened = []
-    failed = []
-    for path in ws.paths:
-        if not Path(path).is_dir():
-            failed.append({"path": path, "error": "path not found"})
-            continue
-        tab = window.open_project(path, quiet=True)
-        if tab is None:
-            failed.append({"path": path, "error": "open failed"})
-            continue
-        opened.append({"name": tab.project_meta.name, "path": tab.project_meta.path})
-    mark_workspace_opened(window.config, ws)
-    window.config.save()
-    try:
-        window._rebuild_workspace_menu()
-    except Exception:
-        log.exception("刷新工作区菜单失败")
-    return {
-        "ok": bool(opened) or not ws.paths,
-        "workspace": _workspace_payload(ws, window.config.active_workspace_name),
-        "opened": opened,
-        "failed": failed,
-    }
-
-
-def _cmd_close_workspace(window: "MainWindow") -> dict:
-    from src.core.workspace_manager import close_workspace_paths
-    current_paths = window._current_project_paths()
-    active = window.config.active_workspace_name
-    ws = window.config.find_workspace(active) if active else None
-    paths = set(ws.paths) if ws else set(current_paths)
-    closed = []
-    failed = []
-    for i in range(window.tabs.count() - 1, -1, -1):
-        tab = window.tabs.widget(i)
-        if not hasattr(tab, "project_meta"):
-            continue
-        if tab.project_meta.path not in paths:
-            continue
-        running = tab.running_service_items(refresh_external=True)
-        if window.close_project_tab(tab, quiet=True):
-            closed.append({
-                "name": tab.project_meta.name,
-                "path": tab.project_meta.path,
-                "stopped": len(running),
-                "services": running,
-            })
-        else:
-            failed.append({
-                "name": tab.project_meta.name,
-                "path": tab.project_meta.path,
-                "running": running,
-            })
-    if failed:
-        return {"ok": False, "error": "close workspace failed", "closed": closed, "failed": failed}
-    close_workspace_paths(window.config, current_paths)
-    window.config.save()
-    try:
-        window._rebuild_workspace_menu()
-    except Exception:
-        log.exception("刷新工作区菜单失败")
-    return {"ok": True, "closed": closed, "active_workspace_name": window.config.active_workspace_name}
 
 
 def _cmd_preflight_build(window: "MainWindow") -> dict:
@@ -559,6 +970,7 @@ def _cmd_quit(window: "MainWindow") -> dict:
     退出动作延迟到响应发回客户端之后执行（QTimer.singleShot），否则主进程
     先退导致 CLI 端收不到确认、报「empty response」。
     """
+    from src.ui.aggregate_project_tab import AggregateProjectTab
     from src.ui.project_tab import ProjectTab
     from PySide6.QtCore import QTimer
     from PySide6.QtWidgets import QApplication
@@ -568,7 +980,7 @@ def _cmd_quit(window: "MainWindow") -> dict:
     timed_out = []
     for i in range(window.tabs.count()):
         w = window.tabs.widget(i)
-        if not isinstance(w, ProjectTab):
+        if not isinstance(w, (ProjectTab, AggregateProjectTab)):
             continue
         try:
             running_items = w.running_service_items(refresh_external=True)
@@ -615,12 +1027,8 @@ def _cmd_quit(window: "MainWindow") -> dict:
 
 
 def _cmd_list_projects(window: "MainWindow") -> list:
-    from src.ui.project_tab import ProjectTab
     projects = []
-    for i in range(window.tabs.count()):
-        w = window.tabs.widget(i)
-        if not isinstance(w, ProjectTab):
-            continue
+    for w in _project_target_tabs(window):
         modules = [m[0] for m in w.project_meta.spring_boot_modules]
         projects.append({
             "name": w.project_meta.name,

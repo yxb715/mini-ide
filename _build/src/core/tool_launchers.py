@@ -29,11 +29,17 @@ def open_in_codex_args(target_dir: Path) -> list[str]:
     wt = shutil.which("wt.exe") or shutil.which("wt")
     ps = find_powershell()
     if wt and ps:
-        return [wt, "-w", "0", "new-tab", "-d", target, ps, "-NoExit", "-NoLogo", "-Command", "codex"]
+        return [
+            wt, "-w", "0", "new-tab", "-d", target,
+            ps, "-NoExit", "-NoLogo", "-Command", "codex",
+        ]
 
     cmd = shutil.which("cmd.exe") or "cmd.exe"
     if ps:
-        return [cmd, "/c", "start", "", "/D", target, ps, "-NoExit", "-NoLogo", "-Command", "codex"]
+        return [
+            cmd, "/c", "start", "", "/D", target,
+            ps, "-NoExit", "-NoLogo", "-Command", "codex",
+        ]
     return [cmd, "/c", "start", "", "/D", target, cmd, "/k", "codex"]
 
 

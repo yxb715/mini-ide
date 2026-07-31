@@ -8,6 +8,7 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
+from src.core.aggregate_workspace import is_aggregate_workspace_path
 from src.core.config import AppConfig, WorkspaceEntry
 
 
@@ -30,6 +31,8 @@ def ensure_workspace_candidates(config: AppConfig) -> bool:
     """从最近项目中自动补充工作区候选，返回配置是否有变化。"""
     groups: dict[str, list[str]] = {}
     for p in config.recent_projects:
+        if is_aggregate_workspace_path(p.path):
+            continue
         path = Path(p.path)
         if not path.parent:
             continue

@@ -1,69 +1,90 @@
 # mini-ide
 
-mini-ide 是本机开发指挥台：用一个 GUI 管理多个项目的启动、停止、日志、Git 状态、工作区和 AI 操作入口。
+mini-ide 是本机开发指挥台，用 GUI 管理项目、聚合目录、服务、Git 状态、临时开发工作区和 Codex/cc 入口。所有回复使用简短、易懂的中文。
 
-## 基本信息
+## 项目结构
 
-- 技术栈：Python 3.11+ / PySide6 / Pygments / psutil / watchdog / sqlparse。
-- 源码目录：`_build/`。
-- 发布产物：根目录 `mini-ide.exe`（GUI）+ `mini-ide-cli.exe`（控制台 CLI）+ `mini-ide-runtime/`。
-- 打包脚本：`_build\scripts\build.bat`。
-- 冒烟测试：`cd _build && poetry run python scripts/_smoke.py`。
+- 技术栈：Python 3.11+、PySide6、Pygments、psutil、watchdog、sqlparse。
+- 源码根目录：`_build/`。
+- 逻辑层：`_build/src/core/`，负责配置、项目识别、进程、服务状态、Git、文件和工作区。
+- 界面层：`_build/src/ui/`，负责 Qt 交互和展示。
+- 工具层：`_build/src/util/`。
+- 发布文件：根目录 `mini-ide.exe`、`mini-ide-cli.exe`、`mini-ide-runtime/`。
+- 打包：`_build\scripts\build.bat`。
+- 冒烟测试：在 `_build` 目录运行 `poetry run python scripts/_smoke.py`。
 
-## 代码边界
+## 当前产品模型
 
-- `src/core/`：纯逻辑层，放配置、项目识别、进程封装、服务状态、工作区、文件操作、Git 上下文等可测试逻辑。
-- `src/ui/`：Qt UI 层，只做交互、展示和 UI 协调；耗时操作必须放 `QThread`。
-- `src/util/`：跨层工具。
-- CLI 通过 `cli_client.py` / `cli_server.py` 走 IPC 控制已运行的 GUI 实例，不要绕过 mini-ide 直接启动业务项目。
+### 普通项目
 
-## CLI 能力
+普通项目占一个顶层 Tab。项目页提供服务启停、日志、文件、Git、诊断和编译；多模块项目不传模块时，操作作用于全部模块。
 
-外部 AI 工具必须通过根目录 `mini-ide-cli.exe` 调用 CLI。它是 console 子系统，会可靠等待长时间编译/健康检查并返回真实 stdout、stderr 和退出码。`mini-ide.exe` 仅作为 GUI 入口保留兼容参数，自动化不得使用它。连上 GUI 后 stdout 返回 JSON；参数错误、mini-ide 未运行、等待超时等客户端侧错误可能写到 stderr。
+### 聚合目录
+
+一个聚合目录只占一个顶层 Tab，内部只有“项目”和“需求工作区”两个页面。
+
+- 项目表中的每个项目独立启动、停止，不提供批量启动、批量停止或运行预设。
+- 项目页的 Codex/cc 入口打开当前代码环境：源目录模式打开聚合目录，工作区模式打开当前任务根目录。
+- 需求工作区表只展示当前聚合目录自己的工作区；双击行进入工作区，页头“退出工作区”返回源目录。
+- 工作区页的操作是新建、在 Codex/cc 中打开、合并代码、删除和刷新。
+
+### 临时开发工作区
+
+新建工作区时，只为勾选的 Git 项目创建本地任务分支和 Worktree；分支从创建时记录的基准分支和提交创建。未勾选项目不复制，共享项目只引用源目录。
+
+“合并代码”是用户确认后的本地安全操作：要求源目录和 Worktree 干净、分支位置正确且可以快进合并，只执行 `git merge --ff-only`，不自动解决冲突、不推送远程、不改写历史。
+
+“删除”先检查运行服务、未提交/未跟踪文件、远端备份和未知路径。合并后的任务分支才会尝试安全删除；未合并但已推送的分支会保留，未合并且未推送或存在风险时禁止删除。
+
+CLI 仍提供 `--workspace-review` 和 `--workspace-delete-check` 作为检查接口；界面不再提供 Review 按钮。
+
+## CLI
+
+外部自动化和 AI 工具只能调用根目录 `mini-ide-cli.exe`，不能用 `mini-ide.exe` 执行自动化命令。CLI 通过 IPC 控制已运行的 GUI，成功结果通常为 JSON；错误可能写入 stderr。
 
 常用命令：
 
-```bash
-mini-ide-cli.exe --status
-mini-ide-cli.exe --list-projects
-mini-ide-cli.exe --list-modules <project>
-mini-ide-cli.exe --open <path>
-mini-ide-cli.exe --close <project>
-mini-ide-cli.exe --list-workspaces
-mini-ide-cli.exe --open-workspace <name>
-mini-ide-cli.exe --close-workspace
-mini-ide-cli.exe --start <project> [module] [--wait] [--timeout N]
-mini-ide-cli.exe --stop <project> [module]
-mini-ide-cli.exe --restart <project> [module] [--wait] [--timeout N]
-mini-ide-cli.exe --ensure-running <project> [module] [--timeout N]
-mini-ide-cli.exe --health <project> [module] [--timeout N]
-mini-ide-cli.exe --compile <project>
-mini-ide-cli.exe --log <project> [module] [--tail N] [--errors] [--all-modules]
-mini-ide-cli.exe --diagnose <project> [module] [--tail N]
-mini-ide-cli.exe --git-status <project>
-mini-ide-cli.exe --git-diff <project> [--summary|--full] [--max-chars N]
-mini-ide-cli.exe --git-ai-context <project> [--summary|--full] [--max-chars N]
-mini-ide-cli.exe --preflight-build
-mini-ide-cli.exe --can-quit
-mini-ide-cli.exe --quit
+```text
+--status
+--list-projects
+--list-modules <project>
+--open <path>                  --close <project>
+--start <project> [module]     --stop <project> [module]
+--restart <project> [module]   --ensure-running <project> [module]
+--health <project> [module]    --compile <project>
+--log <project> [module]       --diagnose <project> [module]
+--git-status <project>         --git-diff <project>
+--git-ai-context <project>     --preflight-build
+--list-aggregates              --open-aggregate <target>
+--list-workspaces              --open-workspace <target>
+--close-workspace
+--create-development-workspace <aggregate> <name> --projects a,b
+--workspace-review <target>    --workspace-delete-check <target>
+--can-quit                     --quit
 ```
 
 规则：
 
-- `<project>` 按目录名或完整路径模糊匹配，不区分大小写。
-- `<module>` 精确匹配模块名；多模块项目不传 module 时表示操作全部模块。
-- 退出码：`0=成功`，`1=失败`，`2=参数错误`，`3=mini-ide 未运行`，`4=超时`。
-- 打包前必须先确认 `--preflight-build` 或 `--can-quit` 返回 `ok=true`。
-- 构建任务与本项目服务强制互斥：任一模块仍在运行/启动/停止时，`--compile` 会返回 `code=services_running`；编译进行中，启动/重启会返回 `code=build_in_progress`。改代码后的安全顺序是记录运行模块 → 全部停止 → 编译并确认成功 → 只恢复原来运行的模块。
+- 项目、聚合目录和工作区目标优先按规范化完整路径、稳定 ID 或唯一短名匹配；有歧义时拒绝执行并返回候选。
+- 模块名必须精确匹配；项目不传模块时表示全部模块。
+- `--list-workspaces` 只返回聚合目录工作区，不展示旧 `WorkspaceEntry`。
+- `--open-workspace` 在原聚合 Tab 内切换，不创建新的顶层 Tab；`--close-workspace` 返回源目录。
+- 退出码：`0` 成功，`1` 操作失败，`2` 参数错误，`3` GUI 未运行，`4` 超时。
+- `--preflight-build` 和 `--can-quit` 都用于确认构建/退出条件；打包前必须返回 `ok=true`。
+- `--compile` 只与目标项目自己的服务互斥，不得为了编译停止其它项目；编译前记录目标项目原本运行的模块，完成后只恢复这些模块。
 
-## 必守规则
+## 开发约束
 
-- **修改代码后要重新打包发布**：跑 `_build\scripts\build.bat` 更新根目录 `mini-ide.exe`、`mini-ide-cli.exe` 和 `mini-ide-runtime/`。
-- **更新 mini-ide 能力后要同步检查全局 skill**：如果 CLI、服务启停、日志、诊断、编译、打包前检查等行为有变化，必须检查 `C:\Users\Administrator\.claude\skills\mini-ide\SKILL.md` 是否需要同步更新。
-- **未经用户明确同意，禁止关闭 mini-ide**。
-- **用户同意关闭后，必须先通过 mini-ide 停止当前 IDE 中正在运行的所有服务**，包括后端、前端、Python、脚本等；确认停净后，才允许关闭 IDE 和打包。
-- **服务启停、日志诊断、编译、工作区管理都必须走 mini-ide CLI 或 GUI 能力**，不要直接运行 `gradle/mvn/npm/python` 启动业务项目。
-- **禁止 hardcode 颜色、圆角、间距**：UI 样式从 `src/ui/theme.py` token 获取。
-- **子进程必须加 `CREATE_NO_WINDOW`**，避免弹出黑窗口。
-- **不引入新依赖**，除非用户明确确认。
-- **完成前必须跑冒烟测试和必要的编译检查**；失败要先修复，不能带着失败结果交付。
+- UI 中的扫描、Git、文件创建/删除、工作区创建/合并/删除和其它耗时操作必须在 `QThread`，不能阻塞 Qt 主线程。
+- UI 颜色、圆角、间距必须使用 `_build/src/ui/theme.py` 的 token，禁止散落硬编码。
+- 所有子进程使用 `CREATE_NO_WINDOW`，避免弹出控制台窗口。
+- 不引入新依赖，除非用户明确同意。
+- 服务启停、日志、诊断、编译和工作区生命周期必须经过 mini-ide CLI 或 GUI；不要直接运行业务项目的 Gradle、Maven、npm 或 Python 启动命令。
+
+## 发布与安全
+
+- 修改源码后运行 `_build\scripts\build.bat`，更新根目录 EXE 和运行时目录。
+- 修改 CLI、服务生命周期、日志、诊断、编译或构建预检行为后，检查 `C:\Users\Administrator\.claude\skills\mini-ide\SKILL.md` 是否需要同步。
+- 未经用户明确同意，不关闭 mini-ide。
+- 用户同意关闭后，先通过 mini-ide 停止当前 IDE 中所有服务并确认停净，再关闭 IDE 和打包。
+- 交付前运行冒烟测试、必要的 `compileall` 和 `git diff --check`；失败必须先修复。

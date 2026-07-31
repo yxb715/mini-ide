@@ -58,10 +58,15 @@ class WorkspaceEntry:
 class AppConfig:
     recent_projects: list[ProjectEntry] = field(default_factory=list)
     workspaces: list[WorkspaceEntry] = field(default_factory=list)
+    # 已打开的聚合项目定义根目录；定义正文仍保存在各项目 .mini-ide/project.json。
+    aggregate_project_paths: list[str] = field(default_factory=list)
+    # 旧 WorkspaceEntry 名称 -> 已确认迁移到的聚合项目根目录。
+    legacy_workspace_migrations: dict[str, str] = field(default_factory=dict)
+    # 旧字段只为读取兼容保留，不再驱动全局工作区 UI。
     active_workspace_name: str = ""
-    # last_session：恢复上次 tab；workspace：恢复 active_workspace_name；none：不恢复
+    # last_session：恢复上次 Tab；旧 workspace 值也按 last_session；none：不恢复。
     startup_restore_mode: str = "last_session"
-    # 上次关闭时打开的 Tab，格式："project:<绝对路径>"
+    # 上次关闭时打开的 Tab：普通项目或聚合目录；旧 workspace:management 会被忽略。
     active_tabs: list[str] = field(default_factory=list)
     active_tab_index: int = 0
     restore_tabs_on_startup: bool = True
@@ -148,3 +153,42 @@ class AppConfig:
 
     def find_workspace(self, name: str) -> WorkspaceEntry | None:
         return next((w for w in self.workspaces if w.name == name), None)
+
+    def register_aggregate_project(self, path: str) -> None:
+        """按规范化路径注册聚合项目，同时保留最近使用顺序。"""
+        from src.core.path_utils import canonical_path, normalized_path_key
+
+        canonical = str(canonical_path(path))
+        key = normalized_path_key(canonical)
+        self.aggregate_project_paths = [
+            item for item in self.aggregate_project_paths
+            if normalized_path_key(item) != key
+        ]
+        self.aggregate_project_paths.insert(0, canonical)
+        self.aggregate_project_paths = self.aggregate_project_paths[:50]
+
+    def unregister_aggregate_project(self, path: str) -> None:
+        """取消人工聚合分类；目录内已有定义保留，避免静默丢数据。"""
+        from src.core.path_utils import normalized_path_key
+
+        key = normalized_path_key(path)
+        self.aggregate_project_paths = [
+            item for item in self.aggregate_project_paths
+            if normalized_path_key(item) != key
+        ]
+
+    def is_aggregate_project(self, path: str) -> bool:
+        """只有用户明确登记过的目录才按聚合目录打开。"""
+        from src.core.path_utils import normalized_path_key
+
+        key = normalized_path_key(path)
+        return any(
+            normalized_path_key(item) == key
+            for item in self.aggregate_project_paths
+        )
+
+    def mark_legacy_workspace_migrated(self, name: str, path: str) -> None:
+        """只记录迁移结果，不删除或改写旧 WorkspaceEntry。"""
+        from src.core.path_utils import canonical_path
+
+        self.legacy_workspace_migrations[name] = str(canonical_path(path))
