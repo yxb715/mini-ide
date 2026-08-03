@@ -10,9 +10,10 @@ from types import SimpleNamespace
 from PySide6.QtCore import QThread, QTimer, Qt, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QDialog, QHBoxLayout, QHeaderView, QLabel,
-    QMessageBox, QPushButton, QSplitter, QStackedWidget, QStyle, QTabWidget,
-    QTableWidget, QTableWidgetItem, QToolButton, QVBoxLayout, QWidget,
+    QAbstractItemView, QApplication, QCheckBox, QDialog, QHBoxLayout,
+    QHeaderView, QLabel, QMessageBox, QPushButton, QSplitter, QStackedWidget,
+    QStyle, QTabWidget, QTableWidget, QTableWidgetItem, QToolButton,
+    QVBoxLayout, QWidget,
 )
 
 from src.core.aggregate_workspace import (
@@ -23,6 +24,7 @@ from src.core.config import AppConfig, ProjectEntry
 from src.core.development_workspace_service import (
     create_development_workspace, delete_development_workspace,
     inspect_workspace_delete, merge_development_workspace,
+    sync_development_workspace,
 )
 from src.core.git_ops import current_branch
 from src.core.path_utils import normalized_path_key
@@ -119,6 +121,33 @@ class _MergeWorkspaceWorker(QThread):
             self.done.emit(None, str(exc))
 
 
+class _SyncWorkspaceWorker(QThread):
+    done = Signal(object, str)
+
+    def __init__(
+        self,
+        workspace: DevelopmentWorkspace,
+        *,
+        fetch_remote: bool,
+        keep_conflicts: bool,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.workspace = workspace
+        self.fetch_remote = fetch_remote
+        self.keep_conflicts = keep_conflicts
+
+    def run(self) -> None:
+        try:
+            self.done.emit(sync_development_workspace(
+                self.workspace,
+                fetch_remote=self.fetch_remote,
+                keep_conflicts=self.keep_conflicts,
+            ), "")
+        except Exception as exc:
+            self.done.emit(None, str(exc))
+
+
 class _DeletePreflightWorker(QThread):
     done = Signal(object, str)
 
@@ -194,6 +223,8 @@ class AggregateProjectTab(QWidget):
         self._workspace_worker: _WorkspaceSnapshotWorker | None = None
         self._create_worker: _CreateWorkspaceWorker | None = None
         self._merge_worker: _MergeWorkspaceWorker | None = None
+        self._sync_worker: _SyncWorkspaceWorker | None = None
+        self._pending_sync_fetch = False
         self._delete_preflight_worker: _DeletePreflightWorker | None = None
         self._delete_worker: _DeleteWorkspaceWorker | None = None
 
@@ -249,10 +280,12 @@ class AggregateProjectTab(QWidget):
         progress_row = QHBoxLayout()
         progress_row.setSpacing(GAP_SM)
         progress_row.addWidget(self.project_progress, 1)
-        self.project_codex_button = QPushButton("在 Codex 中打开")
+        self.project_codex_button = QPushButton("codex")
+        self.project_codex_button.setToolTip("在 codex 中打开当前代码环境")
         self.project_codex_button.clicked.connect(self._open_current_in_codex)
         progress_row.addWidget(self.project_codex_button)
-        self.project_cc_button = QPushButton("在 cc 中打开")
+        self.project_cc_button = QPushButton("cc")
+        self.project_cc_button.setToolTip("在 cc 中打开当前代码环境")
         self.project_cc_button.clicked.connect(self._open_current_in_cc)
         progress_row.addWidget(self.project_cc_button)
         layout.addLayout(progress_row)
@@ -307,12 +340,20 @@ class AggregateProjectTab(QWidget):
         self.new_workspace_button = QPushButton("新建需求工作区")
         self.new_workspace_button.clicked.connect(self._create_workspace)
         actions.addWidget(self.new_workspace_button)
-        self.codex_button = QPushButton("在 Codex 中打开")
+        self.codex_button = QPushButton("codex")
+        self.codex_button.setToolTip("在 codex 中打开选中的需求工作区")
         self.codex_button.clicked.connect(self._open_selected_in_codex)
         actions.addWidget(self.codex_button)
-        self.cc_button = QPushButton("在 cc 中打开")
+        self.cc_button = QPushButton("cc")
+        self.cc_button.setToolTip("在 cc 中打开选中的需求工作区")
         self.cc_button.clicked.connect(self._open_selected_in_cc)
         actions.addWidget(self.cc_button)
+        self.sync_button = QPushButton("同步源分支")
+        self.sync_button.setToolTip(
+            "把源目录基准分支的新提交合并进当前任务分支，只改工作区，不动源目录"
+        )
+        self.sync_button.clicked.connect(self._sync_selected_workspace)
+        actions.addWidget(self.sync_button)
         self.merge_button = QPushButton("合并代码")
         self.merge_button.clicked.connect(self._merge_selected_workspace)
         actions.addWidget(self.merge_button)
@@ -332,9 +373,9 @@ class AggregateProjectTab(QWidget):
         self.workspace_status = QLabel("正在读取需求工作区...")
         self.workspace_status.setProperty("role", "subtitle")
         layout.addWidget(self.workspace_status)
-        self.workspace_table = QTableWidget(0, 6)
+        self.workspace_table = QTableWidget(0, 7)
         self.workspace_table.setHorizontalHeaderLabels(
-            ["需求", "修改项目", "任务分支", "改动", "状态", "创建时间"]
+            ["需求", "修改项目", "任务分支", "改动", "落后", "状态", "创建时间"]
         )
         self.workspace_table.setSelectionBehavior(
             QAbstractItemView.SelectionBehavior.SelectRows
@@ -559,7 +600,8 @@ class AggregateProjectTab(QWidget):
     def _workspace_busy(self) -> bool:
         return bool(
             self._workspace_worker or self._create_worker or self._merge_worker
-            or self._delete_preflight_worker or self._delete_worker
+            or self._sync_worker or self._delete_preflight_worker
+            or self._delete_worker
         )
 
     def _update_workspace_buttons(self) -> None:
@@ -567,7 +609,8 @@ class AggregateProjectTab(QWidget):
         valid = bool(summary and summary.workspace is not None)
         busy = self._workspace_busy()
         for button in (
-            self.codex_button, self.cc_button, self.merge_button, self.delete_button,
+            self.codex_button, self.cc_button, self.sync_button,
+            self.merge_button, self.delete_button,
         ):
             button.setEnabled(valid and not busy)
         self.new_workspace_button.setEnabled(not busy)
@@ -608,6 +651,7 @@ class AggregateProjectTab(QWidget):
                 ", ".join(summary.component_ids) or "-",
                 ", ".join(summary.task_branches) or "-",
                 str(summary.git_change_count),
+                str(summary.behind_count),
                 status_labels.get(summary.status, summary.status),
                 summary.created_at,
             ]
@@ -619,7 +663,13 @@ class AggregateProjectTab(QWidget):
                     item.setData(Qt.ItemDataRole.UserRole, summary)
                 if column == 3 and summary.git_change_count:
                     item.setForeground(QColor(COLOR_WARN))
-                elif column == 4 and summary.error:
+                elif column == 4 and summary.behind_count:
+                    item.setForeground(QColor(COLOR_WARN))
+                    item.setToolTip(
+                        f"任务分支落后源目录基准分支 {summary.behind_count} 个提交，"
+                        "建议先同步源分支"
+                    )
+                elif column == 5 and summary.error:
                     item.setForeground(QColor(COLOR_ERROR))
                 self.workspace_table.setItem(row, column, item)
             if self._pending_workspace_path and normalized_path_key(summary.root_path) == normalized_path_key(
@@ -725,6 +775,158 @@ class AggregateProjectTab(QWidget):
         summary = self._selected_workspace_summary()
         if summary and summary.workspace is not None:
             self._open_in_cc(Path(summary.workspace.root_path))
+
+    def _sync_selected_workspace(self) -> None:
+        summary = self._selected_workspace_summary()
+        if not summary or summary.workspace is None or self._workspace_busy():
+            return
+        editable = [
+            item for item in summary.workspace.components if item.mode == "worktree"
+        ]
+        lines = ["将把源目录基准分支的新提交合并进任务分支："]
+        lines.extend(
+            f"- {item.id}: {item.base_branch} -> {item.task_branch}"
+            for item in editable
+        )
+        lines.append(
+            "\n只改工作区，不动源目录；工作区必须无未提交改动。确认继续？"
+        )
+        box = QMessageBox(self)
+        box.setWindowTitle("确认同步源分支")
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setText("\n".join(lines))
+        box.setStandardButtons(
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        box.setDefaultButton(QMessageBox.StandardButton.No)
+        fetch_box = QCheckBox("先从远端拉取源分支更新")
+        fetch_box.setToolTip("对配置了上游的项目先 git fetch，再用较新的一端同步")
+        box.setCheckBox(fetch_box)
+        box.exec()
+        if box.standardButton(box.clickedButton()) != QMessageBox.StandardButton.Yes:
+            return
+        self._start_workspace_sync(
+            summary.workspace, fetch_remote=fetch_box.isChecked(), keep_conflicts=False,
+        )
+
+    def _start_workspace_sync(
+        self,
+        workspace: DevelopmentWorkspace,
+        *,
+        fetch_remote: bool,
+        keep_conflicts: bool,
+    ) -> None:
+        action_log.info(
+            "[GUI] 同步源分支 aggregate=%s workspace=%s fetch_remote=%s keep_conflicts=%s",
+            self.aggregate_project.name, workspace.name, fetch_remote, keep_conflicts,
+        )
+        self.workspace_status.setText("正在把源分支同步到任务分支...")
+        self._pending_sync_fetch = fetch_remote
+        worker = _SyncWorkspaceWorker(
+            workspace,
+            fetch_remote=fetch_remote,
+            keep_conflicts=keep_conflicts,
+            parent=QApplication.instance(),
+        )
+        self._sync_worker = worker
+        self._update_workspace_buttons()
+        worker.done.connect(self._workspace_sync_ready)
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+
+    @staticmethod
+    def _conflict_lines(items) -> list[str]:
+        lines = []
+        for item in items:
+            files = "、".join(item.conflict_files[:5])
+            if len(item.conflict_files) > 5:
+                files += f" 等 {len(item.conflict_files)} 个文件"
+            lines.append(f"- {item.id}: {files or '有冲突'}")
+        return lines
+
+    def _workspace_sync_ready(self, result, error: str) -> None:
+        if self.sender() is not self._sync_worker:
+            return
+        self._sync_worker = None
+        self._update_workspace_buttons()
+        if error or result is None:
+            message = error or "未知错误"
+            action_log.warning("[GUI] 同步源分支失败 error=%s", message)
+            QMessageBox.warning(self, "同步失败", message)
+            self.refresh_workspaces()
+            return
+
+        synced = "、".join(result.synced_ids)
+        others = [
+            f"- {item.id}: {item.error}"
+            for item in result.components
+            if item.error and not item.conflicted
+        ]
+        if result.needs_conflict_confirmation:
+            conflicted = [
+                item for item in result.components
+                if item.conflicted and item.rolled_back
+            ]
+            lines = ["以下项目同步时有冲突，已回滚到同步前状态："]
+            lines.extend(self._conflict_lines(conflicted))
+            if synced:
+                lines.append(f"\n已成功同步：{synced}")
+            if others:
+                lines.append("\n其它未同步项目：")
+                lines.extend(others)
+            lines.append(
+                "\n是否重新同步并把冲突保留在工作区，由你或 AI 手工解决？"
+                "\n保留后工作区会停在合并中状态，解决冲突并提交后才能合并代码。"
+            )
+            answer = QMessageBox.question(
+                self, "同步存在冲突", "\n".join(lines),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer == QMessageBox.StandardButton.Yes:
+                self._start_workspace_sync(
+                    result.workspace,
+                    fetch_remote=self._pending_sync_fetch,
+                    keep_conflicts=True,
+                )
+                return
+            action_log.warning(
+                "[GUI] 同步源分支存在冲突并已回滚 projects=%s",
+                "、".join(item.id for item in conflicted),
+            )
+            self.workspace_status.setText("同步存在冲突，已回滚。")
+            self.refresh_workspaces()
+            return
+
+        if not result.ok:
+            action_log.warning("[GUI] 同步源分支失败 error=%s", result.error)
+            QMessageBox.warning(self, "同步未完成", result.error)
+            self.refresh_workspaces()
+            return
+
+        kept = [
+            item for item in result.components
+            if item.conflicted and not item.rolled_back
+        ]
+        current = [item.id for item in result.components if item.already_current]
+        blocks = []
+        if synced:
+            blocks.append(f"已同步：{synced}")
+        if kept:
+            blocks.append(
+                "冲突已保留在工作区，需手工解决后提交：\n"
+                + "\n".join(self._conflict_lines(kept))
+            )
+        if current:
+            blocks.append("已是最新：" + "、".join(current))
+        action_log.info(
+            "[GUI] 同步源分支成功 synced=%s kept_conflicts=%s",
+            synced or "无", "、".join(item.id for item in kept) or "无",
+        )
+        QMessageBox.information(
+            self, "同步完成", "\n\n".join(blocks) or "没有需要同步的项目。",
+        )
+        self.refresh_workspaces()
 
     def _merge_selected_workspace(self) -> None:
         summary = self._selected_workspace_summary()

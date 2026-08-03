@@ -163,6 +163,12 @@ def cli_parse_check() -> list[str]:
           "description": "证书功能"}),
         (["mini-ide.exe", "--workspace-delete-check", "certificate"],
          {"cmd": "workspace-delete-check", "target": "certificate"}),
+        (["mini-ide.exe", "--workspace-sync", "certificate"],
+         {"cmd": "workspace-sync", "target": "certificate"}),
+        (["mini-ide.exe", "--workspace-sync", "certificate", "--fetch",
+          "--keep-conflicts"],
+         {"cmd": "workspace-sync", "target": "certificate",
+          "fetch_remote": True, "keep_conflicts": True}),
         (["mini-ide.exe", "--start", "server", "gateway", "--wait", "--timeout", "90"],
          {"cmd": "start", "project": "server", "module": "gateway", "wait": True, "timeout": 90}),
         (["mini-ide.exe", "--ensure-running", "server", "gateway", "--timeout", "120"],
@@ -184,7 +190,11 @@ def cli_parse_check() -> list[str]:
             failed.append(f"{argv[1]} parsed as {actual!r}, expected {expected!r}")
     if _parse_args(["mini-ide.exe", "--unknown"]) is not None:
         failed.append("unknown command should fail parsing")
-    for action in ("create-development-workspace",):
+    if _parse_args(["mini-ide.exe", "--workspace-sync", "certificate", "--push"]) is not None:
+        failed.append("workspace-sync must reject unknown flags")
+    if _parse_args(["mini-ide.exe", "--workspace-sync"]) is not None:
+        failed.append("workspace-sync must require a target")
+    for action in ("create-development-workspace", "workspace-sync"):
         if _response_timeout_ms({"cmd": action}) < 605000:
             failed.append(f"{action} should allow a complete workspace operation")
     if _parse_args(["mini-ide.exe", "--start-profile", "race"]) is not None:
@@ -659,6 +669,72 @@ def development_workspace_lifecycle_check() -> list[str]:
             )
             if reviewed_workspace.status != "reviewing":
                 failed.append("Review should move an active workspace to reviewing")
+
+            # 源基准分支前进后，任务分支必须能安全同步回来。
+            (repo_one / "BASE.md").write_text("base update\n", encoding="utf-8")
+            git("-C", str(repo_one), "add", "BASE.md")
+            git("-C", str(repo_one), "commit", "-m", "base update")
+            behind = service.workspace_behind_counts(workspace)
+            if behind.get("server") != 1:
+                failed.append(f"behind count should follow the base branch: {behind!r}")
+            sync = service.sync_development_workspace(workspace)
+            if not sync.ok or "server" not in sync.synced_ids:
+                failed.append(f"clean sync should merge base into task branch: {sync.error}")
+            if not (worktree / "BASE.md").is_file():
+                failed.append("sync should bring base branch files into the Worktree")
+            if not (repo_one / "LOCAL_ONLY.txt").is_file():
+                failed.append("sync must not touch the dirty source checkout")
+            synced_workspace = load_development_workspace(
+                workspace.root_path, aggregate_project=project,
+            )
+            base_main = git("-C", str(repo_one), "rev-parse", "main")
+            synced_server = next(
+                item for item in synced_workspace.components if item.id == "server"
+            )
+            if synced_server.base_commit != base_main:
+                failed.append("sync should record the new base commit")
+            if service.workspace_behind_counts(synced_workspace).get("server") != 0:
+                failed.append("synced task branch should not stay behind")
+
+            # 冲突默认回滚；用户确认后才保留冲突。
+            (repo_one / "README.md").write_text("server v2\n", encoding="utf-8")
+            git("-C", str(repo_one), "add", "README.md")
+            git("-C", str(repo_one), "commit", "-m", "base conflict")
+            declined = service.sync_development_workspace(synced_workspace)
+            if declined.ok or not declined.needs_conflict_confirmation:
+                failed.append("conflicting sync must ask before keeping conflicts")
+            if not all(item.rolled_back for item in declined.components if item.conflicted):
+                failed.append("declined conflict sync should roll back the Worktree")
+            if service._run_git(str(worktree), ["status", "--porcelain"], 15)[1]:
+                failed.append("rolled-back sync must leave the Worktree clean")
+            kept = service.sync_development_workspace(
+                synced_workspace, keep_conflicts=True,
+            )
+            if not kept.ok or "server" not in kept.conflicted_ids:
+                failed.append(f"keep-conflicts sync should hold conflicts: {kept.error}")
+            if service._run_git(
+                str(worktree), ["rev-parse", "--verify", "MERGE_HEAD"], 10,
+            )[0] != 0:
+                failed.append("kept conflicts should leave the merge in progress")
+            (worktree / "README.md").write_text("resolved\n", encoding="utf-8")
+            git("-C", str(worktree), "add", "README.md")
+            git("-C", str(worktree), "commit", "--no-edit")
+            healed = service.sync_development_workspace(synced_workspace)
+            if not healed.ok or not all(
+                item.already_current for item in healed.components
+            ):
+                failed.append("sync after manual resolution should report already current")
+            healed_server = next(
+                item for item in load_development_workspace(
+                    workspace.root_path, aggregate_project=project,
+                ).components if item.id == "server"
+            )
+            if healed_server.base_commit != git("-C", str(repo_one), "rev-parse", "main"):
+                failed.append("sync should heal a stale base commit after resolution")
+            workspace = load_development_workspace(
+                workspace.root_path, aggregate_project=project,
+            )
+
             merge_dirty = worktree / "MERGE_DIRTY.txt"
             merge_dirty.write_text("block merge\n", encoding="utf-8")
             dirty_merge = service.merge_development_workspace(workspace)
@@ -776,16 +852,32 @@ def aggregate_runtime_ui_check() -> list[str]:
         if tab.detail_stack.count() != 3:
             failed.append("project details should remain internal to the aggregate tab")
         if (
-            tab.project_codex_button.text() != "在 Codex 中打开"
-            or tab.project_cc_button.text() != "在 cc 中打开"
+            tab.project_codex_button.text() != "codex"
+            or tab.project_cc_button.text() != "cc"
+            or tab.codex_button.text() != "codex"
+            or tab.cc_button.text() != "cc"
         ):
-            failed.append("project view must expose Codex and cc for the current environment")
+            failed.append("codex and cc entries must keep their labels short and lowercase")
+        if not all(
+            button.toolTip()
+            for button in (
+                tab.project_codex_button, tab.project_cc_button,
+                tab.codex_button, tab.cc_button,
+            )
+        ):
+            failed.append("short Codex and cc labels must keep an explanatory tooltip")
         if tab._current_environment_root() != Path(project.root_path):
             failed.append("project tools must open the aggregate root in source mode")
         if hasattr(tab, "enter_workspace_button") or hasattr(tab, "review_button"):
             failed.append("workspace toolbar must rely on double-click and omit Review")
         if tab.merge_button.text() != "合并代码" or tab.delete_button.text() != "删除":
             failed.append("workspace toolbar must expose concise merge and delete actions")
+        if tab.sync_button.text() != "同步源分支":
+            failed.append("workspace toolbar must expose syncing the base branch")
+        if tab.workspace_table.columnCount() != 7 or tab.workspace_table.horizontalHeaderItem(
+            4
+        ).text() != "落后":
+            failed.append("workspace table must show how far each task branch is behind")
         double_clicks: list[bool] = []
         tab._activate_selected_workspace = lambda: double_clicks.append(True)
         tab.workspace_table.itemDoubleClicked.emit(QTableWidgetItem("workspace"))

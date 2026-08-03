@@ -176,6 +176,7 @@ def _parse_args(argv: list[str]) -> dict | None:
         "open-aggregate": "open-aggregate",
         "create-development-workspace": "create-development-workspace",
         "workspace-review": "workspace-review",
+        "workspace-sync": "workspace-sync",
         "workspace-delete-check": "workspace-delete-check",
         "start": "start",
         "stop": "stop",
@@ -232,6 +233,22 @@ def _parse_args(argv: list[str]) -> dict | None:
             return None
         result["target"] = rest[0]
         return result if len(rest) == 1 else None
+
+    if cmd_name == "workspace-sync":
+        if not rest:
+            return None
+        result["target"] = rest[0]
+        index = 1
+        while index < len(rest):
+            if rest[index] == "--fetch":
+                result["fetch_remote"] = True
+                index += 1
+            elif rest[index] == "--keep-conflicts":
+                result["keep_conflicts"] = True
+                index += 1
+            else:
+                return None
+        return result
 
     if cmd_name == "create-development-workspace":
         if len(rest) < 2:
@@ -426,9 +443,11 @@ def _response_timeout_ms(cmd: dict) -> int:
     if action in (
         "health", "compile", "ensure-running",
         "create-development-workspace", "workspace-review", "workspace-delete-check",
+        "workspace-sync",
     ) or (action in ("start", "restart") and cmd.get("wait")):
         defaults = {
             "create-development-workspace": 600,
+            "workspace-sync": 600,
         }
         timeout = int(cmd.get("timeout", defaults.get(action, 120)))
         return (timeout + 5) * 1000
@@ -558,6 +577,8 @@ def _print_usage():
         "  --open-aggregate <target>    Open one aggregate project tab\n"
         "  --create-development-workspace <aggregate> <name> --projects a,b [--description text]\n"
         "  --workspace-review <target>\n"
+        "  --workspace-sync <target> [--fetch] [--keep-conflicts]\n"
+        "                               Merge the source base branch into task branches\n"
         "  --workspace-delete-check <target>\n"
         "  --start <project> [module]   Start a module\n"
         "  --stop <project> [module]    Stop a module\n"

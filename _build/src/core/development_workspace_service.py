@@ -87,6 +87,43 @@ class WorkspaceMergeComponent:
 
 
 @dataclass(frozen=True)
+class WorkspaceSyncComponent:
+    id: str
+    base_branch: str
+    task_branch: str
+    merge_ref: str = ""
+    behind_count: int = 0
+    synced: bool = False
+    already_current: bool = False
+    conflicted: bool = False
+    conflict_files: tuple[str, ...] = ()
+    rolled_back: bool = False
+    new_base_commit: str = ""
+    error: str = ""
+
+
+@dataclass(frozen=True)
+class WorkspaceSyncResult:
+    ok: bool
+    workspace: DevelopmentWorkspace
+    components: tuple[WorkspaceSyncComponent, ...]
+    error: str = ""
+
+    @property
+    def synced_ids(self) -> tuple[str, ...]:
+        return tuple(item.id for item in self.components if item.synced)
+
+    @property
+    def conflicted_ids(self) -> tuple[str, ...]:
+        return tuple(item.id for item in self.components if item.conflicted)
+
+    @property
+    def needs_conflict_confirmation(self) -> bool:
+        """有冲突已安全回滚，等待用户确认是否保留冲突手工解决。"""
+        return any(item.conflicted and item.rolled_back for item in self.components)
+
+
+@dataclass(frozen=True)
 class WorkspaceMergeResult:
     ok: bool
     workspace: DevelopmentWorkspace
@@ -585,6 +622,213 @@ def merge_development_workspace(
     finally:
         with _OPERATION_LOCK:
             _ACTIVE_OPERATIONS.discard(operation_key)
+
+
+def _resolve_sync_merge_ref(
+    item: WorkspaceComponent,
+    *,
+    fetch_remote: bool,
+    fetched: set[tuple[str, str]],
+) -> tuple[str, str]:
+    """返回 (要合并进任务分支的 ref, 错误)。只读源仓库 ref，不动源目录工作区。"""
+    repo = item.source_repository_path
+    code, _out, err = _run_git(
+        repo, ["show-ref", "--verify", "--quiet", f"refs/heads/{item.base_branch}"], 10,
+    )
+    if code != 0:
+        return "", err or f"源目录缺少基准分支：{item.base_branch}"
+    if not fetch_remote:
+        return item.base_branch, ""
+
+    code, upstream, _err = _run_git(
+        repo,
+        [
+            "rev-parse", "--abbrev-ref", "--symbolic-full-name",
+            f"{item.base_branch}@{{upstream}}",
+        ],
+        10,
+    )
+    if code != 0 or not upstream:
+        return item.base_branch, ""
+    remote = upstream.split("/", 1)[0]
+    fetch_key = (normalized_path_key(repo), remote.casefold())
+    if fetch_key not in fetched:
+        code, out, err = _run_git(repo, ["fetch", "--prune", remote], 300)
+        if code != 0:
+            return "", err or out or f"拉取远端失败：{remote}"
+        fetched.add(fetch_key)
+
+    local_ahead, _out, _err = _run_git(
+        repo, ["merge-base", "--is-ancestor", upstream, item.base_branch], 15,
+    )
+    if local_ahead == 0:
+        return item.base_branch, ""
+    remote_ahead, _out, _err = _run_git(
+        repo, ["merge-base", "--is-ancestor", item.base_branch, upstream], 15,
+    )
+    if remote_ahead == 0:
+        return upstream, ""
+    return "", f"源目录 {item.base_branch} 与 {upstream} 已分叉，请先在源目录处理"
+
+
+def _sync_preflight_error(item: WorkspaceComponent) -> str:
+    """同步只要求工作区干净、分支正确；不要求源目录干净或停在基准分支。"""
+    code, status, err = _run_git(item.worktree_path, ["status", "--porcelain"], 15)
+    if code != 0:
+        return err or "无法读取工作区状态"
+    if status:
+        return "工作区有未提交或未跟踪文件"
+    code, branch, err = _run_git(item.worktree_path, ["branch", "--show-current"], 10)
+    if code != 0:
+        return err or "无法读取任务分支"
+    if branch != item.task_branch:
+        return f"工作区当前分支不是 {item.task_branch}"
+    return ""
+
+
+def workspace_behind_counts(workspace: DevelopmentWorkspace) -> dict[str, int]:
+    """各任务分支落后本地基准分支多少提交；只读本地 ref，不联网。"""
+    counts: dict[str, int] = {}
+    for item in workspace.components:
+        if item.mode != "worktree" or not item.task_branch or not item.base_branch:
+            continue
+        code, out, _err = _run_git(
+            item.source_repository_path,
+            ["rev-list", "--count", f"{item.task_branch}..{item.base_branch}"],
+            15,
+        )
+        if code != 0:
+            continue
+        try:
+            counts[item.id] = int(out.strip() or "0")
+        except ValueError:
+            continue
+    return counts
+
+
+def sync_development_workspace(
+    workspace: DevelopmentWorkspace,
+    *,
+    fetch_remote: bool = False,
+    keep_conflicts: bool = False,
+) -> WorkspaceSyncResult:
+    """把源目录基准分支的新提交合并进任务分支，只动 Worktree，不动源目录。"""
+    operation_key = normalized_path_key(workspace.root_path)
+    with _OPERATION_LOCK:
+        if operation_key in _ACTIVE_OPERATIONS:
+            return WorkspaceSyncResult(False, workspace, (), "工作区正在执行其它操作")
+        _ACTIVE_OPERATIONS.add(operation_key)
+    try:
+        editable = [item for item in workspace.components if item.mode == "worktree"]
+        if not editable:
+            return WorkspaceSyncResult(False, workspace, (), "工作区没有可同步的项目")
+
+        fetched: set[tuple[str, str]] = set()
+        results: list[WorkspaceSyncComponent] = []
+        new_commits: dict[str, str] = {}
+        for item in editable:
+            results.append(_sync_one_component(
+                item, fetch_remote, keep_conflicts, fetched, new_commits,
+            ))
+
+        updated = workspace
+        if new_commits:
+            updated = replace(updated, components=tuple(
+                replace(component, base_commit=new_commits[component.id])
+                if component.id in new_commits else component
+                for component in workspace.components
+            ))
+        if any(item.synced for item in results) and updated.status == "merged":
+            updated = replace(updated, status="active")
+        if updated is not workspace:
+            save_development_workspace(updated)
+
+        components = tuple(results)
+        failures = [
+            f"{item.id}：{item.error}"
+            for item in components
+            if item.error and not (keep_conflicts and item.conflicted)
+        ]
+        return WorkspaceSyncResult(
+            not failures, updated, components, "；".join(failures),
+        )
+    finally:
+        with _OPERATION_LOCK:
+            _ACTIVE_OPERATIONS.discard(operation_key)
+
+
+def _sync_one_component(
+    item: WorkspaceComponent,
+    fetch_remote: bool,
+    keep_conflicts: bool,
+    fetched: set[tuple[str, str]],
+    new_commits: dict[str, str],
+) -> WorkspaceSyncComponent:
+    base = WorkspaceSyncComponent(item.id, item.base_branch, item.task_branch)
+    error = _sync_preflight_error(item)
+    if error:
+        return replace(base, error=error)
+
+    merge_ref, error = _resolve_sync_merge_ref(
+        item, fetch_remote=fetch_remote, fetched=fetched,
+    )
+    if error:
+        return replace(base, error=error)
+    base = replace(base, merge_ref=merge_ref)
+
+    code, target, err = _run_git(
+        item.source_repository_path, ["rev-parse", merge_ref], 15,
+    )
+    if code != 0 or not target:
+        return replace(base, error=err or f"无法解析 {merge_ref}")
+    target_commit = target.splitlines()[0].strip()
+
+    code, _out, _err = _run_git(
+        item.worktree_path, ["merge-base", "--is-ancestor", target_commit, "HEAD"], 15,
+    )
+    if code == 0:
+        # 基准内容已全部包含在任务分支里，顺手修正过期的基准提交记录。
+        if target_commit != item.base_commit:
+            new_commits[item.id] = target_commit
+        return replace(base, already_current=True, new_base_commit=target_commit)
+
+    code, behind, _err = _run_git(
+        item.worktree_path, ["rev-list", "--count", f"HEAD..{target_commit}"], 20,
+    )
+    base = replace(
+        base, behind_count=int(behind) if code == 0 and behind.isdigit() else 0,
+    )
+
+    code, out, err = _run_git(
+        item.worktree_path, ["merge", "--no-edit", target_commit], 180,
+    )
+    if code == 0:
+        new_commits[item.id] = target_commit
+        return replace(base, synced=True, new_base_commit=target_commit)
+
+    unmerged_code, unmerged, _err = _run_git(
+        item.worktree_path, ["diff", "--name-only", "--diff-filter=U"], 20,
+    )
+    conflict_files = tuple(
+        line.strip() for line in unmerged.splitlines() if line.strip()
+    ) if unmerged_code == 0 else ()
+    if not conflict_files:
+        return replace(base, error=err or out or "合并失败")
+    if keep_conflicts:
+        return replace(
+            base, conflicted=True, conflict_files=conflict_files,
+            error="存在冲突，已保留在工作区等待手工解决",
+        )
+    abort_code, _out, abort_err = _run_git(item.worktree_path, ["merge", "--abort"], 60)
+    if abort_code != 0:
+        return replace(
+            base, conflicted=True, conflict_files=conflict_files,
+            error=f"存在冲突且回滚失败，需要手工处理：{abort_err}",
+        )
+    return replace(
+        base, conflicted=True, rolled_back=True, conflict_files=conflict_files,
+        error="存在冲突，已回滚到同步前状态",
+    )
 
 
 def inspect_workspace_delete(

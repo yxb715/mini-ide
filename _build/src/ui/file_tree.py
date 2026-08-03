@@ -798,8 +798,8 @@ class FileTree(QWidget):
         menu.addSeparator()
 
         # 外部工具 / 系统定位
-        menu.addAction("在 cc 中打开", lambda d=target_dir: self._open_cc(d))
-        menu.addAction("在 Codex 中打开", lambda d=target_dir: self._open_codex(d))
+        menu.addAction("cc", lambda d=target_dir: self._open_cc(d))
+        menu.addAction("codex", lambda d=target_dir: self._open_codex(d))
         menu.addAction(REVEAL_LABEL, lambda: reveal_in_explorer(path))
         menu.addSeparator()
 

@@ -23,6 +23,7 @@ from src.core.aggregate_workspace import (
 from src.core.development_workspace_service import (
     build_workspace_creation_plan, create_development_workspace,
     inspect_workspace_delete, review_development_workspace,
+    sync_development_workspace,
 )
 from src.core.path_utils import normalized_path_key
 from src.util import app_log
@@ -448,6 +449,42 @@ class _WorkspaceCommandWorker(QObject):
                     ],
                 })
                 return
+            if action == "workspace-sync":
+                result = sync_development_workspace(
+                    workspace,
+                    fetch_remote=bool(self.command.get("fetch_remote")),
+                    keep_conflicts=bool(self.command.get("keep_conflicts")),
+                )
+                self.done.emit({
+                    "ok": result.ok,
+                    "error": result.error,
+                    "workspace": {
+                        "id": result.workspace.id, "name": result.workspace.name,
+                        "path": result.workspace.root_path,
+                        "status": result.workspace.status,
+                    },
+                    "synced": list(result.synced_ids),
+                    "conflicted": list(result.conflicted_ids),
+                    "needs_conflict_confirmation": result.needs_conflict_confirmation,
+                    "projects": [
+                        {
+                            "id": item.id,
+                            "base_branch": item.base_branch,
+                            "task_branch": item.task_branch,
+                            "merge_ref": item.merge_ref,
+                            "behind_count": item.behind_count,
+                            "synced": item.synced,
+                            "already_current": item.already_current,
+                            "conflicted": item.conflicted,
+                            "rolled_back": item.rolled_back,
+                            "conflict_files": list(item.conflict_files),
+                            "new_base_commit": item.new_base_commit,
+                            "error": item.error,
+                        }
+                        for item in result.components
+                    ],
+                })
+                return
             if action == "workspace-delete-check":
                 plan = inspect_workspace_delete(workspace, self.running_paths)
                 self.done.emit({
@@ -632,7 +669,8 @@ def _dispatch(cmd: dict, window: "MainWindow") -> dict:
         return _cmd_open_aggregate(window, cmd.get("target", ""))
 
     if action in (
-        "create-development-workspace", "workspace-review", "workspace-delete-check",
+        "create-development-workspace", "workspace-review", "workspace-sync",
+        "workspace-delete-check",
     ):
         return {"ok": False, "error": f"{action} command uses async handler"}
 
@@ -695,7 +733,7 @@ def handle_async_cli_request(
     action = cmd.get("cmd")
     if action in (
         "list-workspaces", "open-workspace", "create-development-workspace",
-        "workspace-review", "workspace-delete-check",
+        "workspace-review", "workspace-sync", "workspace-delete-check",
     ):
         _run_workspace_command_async(cmd, window, sock)
         return True

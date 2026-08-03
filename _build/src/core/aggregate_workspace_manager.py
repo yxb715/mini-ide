@@ -9,6 +9,7 @@ from src.core.aggregate_workspace import (
     AggregateProject, DevelopmentWorkspace, WORKSPACE_CONFIG_NAME,
     load_aggregate_project, load_development_workspace,
 )
+from src.core.development_workspace_service import workspace_behind_counts
 from src.core.git_ops import list_changed_files
 from src.core.config import WorkspaceEntry
 from src.core.path_utils import (
@@ -40,6 +41,7 @@ class DevelopmentWorkspaceSummary:
     runtime_paths: tuple[str, ...]
     status: str
     created_at: str
+    behind_count: int = 0
     workspace: DevelopmentWorkspace | None = None
     error: str = ""
 
@@ -346,10 +348,12 @@ def _workspace_summaries(
             for component in workspace.components
             if component.mode == "worktree"
         )
+        behind_counts = workspace_behind_counts(workspace)
         summaries.append(DevelopmentWorkspaceSummary(
             root_path=workspace.root_path,
             name=workspace.name,
             aggregate_name=project.name,
+            behind_count=sum(behind_counts.values()),
             component_ids=tuple(component.id for component in workspace.components),
             task_branches=tuple(
                 component.task_branch
