@@ -28,8 +28,9 @@ mini-ide-runtime/
 *.swp
 *.swo
 
-# Claude Code 本地状态（settings.local.json 是机器特定的）
-.claude/settings.local.json
+# AI 工具本地状态（会话记录、中转日志、机器特定配置，不入库）
+.claude/
+.codex/
 
 # OS 垃圾
 .DS_Store
