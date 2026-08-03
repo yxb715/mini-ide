@@ -437,24 +437,66 @@ def _response_timeout_ms(cmd: dict) -> int:
     return 30000
 
 
+def _start_gui_and_wait(timeout_sec: int = 15) -> bool:
+    """启动 mini-ide.exe，轮询等待 IPC socket 可连接，成功返回 True。"""
+    import subprocess
+    from pathlib import Path
+
+    gui_exe = Path(sys.argv[0]).resolve().parent / "mini-ide.exe"
+    if not gui_exe.exists():
+        return False
+    try:
+        subprocess.Popen(
+            [str(gui_exe)],
+            creationflags=0x00000008,  # DETACHED_PROCESS，独立运行不继承父进程控制台
+        )
+    except OSError:
+        return False
+
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        probe = QLocalSocket()
+        probe.connectToServer(SERVER_NAME)
+        if probe.waitForConnected(500):
+            probe.disconnectFromServer()
+            return True
+        time.sleep(0.3)
+    return False
+
+
 def run_cli(argv: list[str]) -> int:
     """CLI 模式主入口。返回退出码。"""
     _attach_console()
     _configure_stream_utf8(sys.stdout)
     _configure_stream_utf8(sys.stderr)
 
-    cmd = _parse_args(argv)
+    # 摘出 --auto-start flag，不传给命令解析和 Qt
+    auto_start = "--auto-start" in argv
+    filtered_argv = [a for a in argv if a != "--auto-start"]
+
+    cmd = _parse_args(filtered_argv)
     if cmd is None:
         _safe_write(sys.stderr, json.dumps({"ok": False, "error": "invalid arguments"}) + "\n")
         _print_usage()
         return EXIT_BAD_ARGS
 
-    app = QCoreApplication(argv)
+    # quit / preflight-build / status 不触发自动启动
+    if cmd["cmd"] in {"quit", "preflight-build", "status"}:
+        auto_start = False
+
+    app = QCoreApplication(filtered_argv)
     sock = QLocalSocket()
     sock.connectToServer(SERVER_NAME)
     if not sock.waitForConnected(2000):
-        _safe_write(sys.stderr, json.dumps({"ok": False, "error": "mini-ide is not running"}) + "\n")
-        return EXIT_NOT_RUNNING
+        if auto_start and _start_gui_and_wait():
+            sock = QLocalSocket()
+            sock.connectToServer(SERVER_NAME)
+            if not sock.waitForConnected(5000):
+                _safe_write(sys.stderr, json.dumps({"ok": False, "error": "mini-ide started but IPC not ready"}) + "\n")
+                return EXIT_NOT_RUNNING
+        else:
+            _safe_write(sys.stderr, json.dumps({"ok": False, "error": "mini-ide is not running"}) + "\n")
+            return EXIT_NOT_RUNNING
 
     payload = json.dumps(cmd, ensure_ascii=False) + "\n"
     sock.write(payload.encode("utf-8"))
@@ -530,4 +572,7 @@ def _print_usage():
         "  --git-ai-context <project> [--summary|--full] [--max-chars N]\n"
         "  --preflight-build            Check running services before build/quit\n"
         "  --quit                       Stop all running services and exit mini-ide\n"
+        "\nOptions:\n"
+        "  --auto-start                 If mini-ide is not running, launch it automatically\n"
+        "                               (ignored for --status / --preflight-build / --quit)\n"
     )

@@ -50,13 +50,8 @@ modules = [
     "src.core.file_index",
     "src.core.controller_index",
     "src.ui.quick_open",
-    "src.ui.content_search",
     "src.core.git_ops",
-    "src.core.port_scanner",
-    "src.core.env_scanner",
     "src.ui.git_viewer",
-    "src.ui.port_dialog",
-    "src.ui.env_panel",
     "src.ui.main_window",
     "src.ui.toast",
     "src.util.editor",
@@ -1486,44 +1481,6 @@ def cli_response_and_packaging_check() -> list[str]:
     return failed
 
 
-def content_search_cache_check() -> list[str]:
-    """验证命中上限提前结束时，不会缓存半截文件清单。"""
-    import tempfile
-
-    import src.ui.content_search as content_search
-
-    failed: list[str] = []
-    original_max = content_search.MAX_MATCHES
-    emitted: list[list[str]] = []
-    try:
-        content_search.MAX_MATCHES = 1
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "hit.txt").write_text("needle\n", encoding="utf-8")
-            (root / "later.yml").write_text("target: needle\n", encoding="utf-8")
-            worker = content_search.SearchWorker(
-                root=str(root),
-                query="needle",
-                case_sensitive=False,
-                whole_word=False,
-                use_regex=False,
-                include_exts=[],
-            )
-            worker.files_collected.connect(lambda files: emitted.append(files))
-            worker.run()
-        if emitted:
-            failed.append("content search should not cache partial file list after match cap")
-    finally:
-        content_search.MAX_MATCHES = original_max
-
-    if failed:
-        for msg in failed:
-            print(f"[FAIL] content_search: {msg}", flush=True)
-    else:
-        print("[OK]   content_search cache rules", flush=True)
-    return failed
-
-
 def aggregate_scan_isolation_check() -> list[str]:
     """验证聚合根扫描、缓存搜索、监听和旧候选都排除 workspaceDirectory。"""
     import tempfile
@@ -1538,7 +1495,6 @@ def aggregate_scan_isolation_check() -> list[str]:
     from src.core.file_index import _IndexWorker, _should_ignore
     from src.core.path_utils import normalized_path_key
     from src.core.workspace_manager import ensure_workspace_candidates
-    from src.ui.content_search import SearchWorker
 
     failed: list[str] = []
     with tempfile.TemporaryDirectory() as tmp:
@@ -1592,29 +1548,6 @@ def aggregate_scan_isolation_check() -> list[str]:
         indexed_paths = {item.abs_path for item in indexed}
         if str(source_file) not in indexed_paths or str(duplicate_file) in indexed_paths:
             failed.append("file index must include source components and exclude Worktrees")
-
-        walked_matches: list = []
-        collected: list[str] = []
-        walk_search = SearchWorker(
-            root=str(root), query="needle", case_sensitive=False,
-            whole_word=False, use_regex=False, include_exts=[],
-        )
-        walk_search.match_found.connect(lambda batch: walked_matches.extend(batch))
-        walk_search.files_collected.connect(lambda files: collected.extend(files))
-        walk_search.run()
-        if len(walked_matches) != 1 or str(duplicate_file) in collected:
-            failed.append("walk search must not read or cache files under workspaceDirectory")
-
-        cached_matches: list = []
-        cached_search = SearchWorker(
-            root=str(root), query="needle", case_sensitive=False,
-            whole_word=False, use_regex=False, include_exts=[],
-            file_list=[str(source_file), str(duplicate_file)],
-        )
-        cached_search.match_found.connect(lambda batch: cached_matches.extend(batch))
-        cached_search.run()
-        if len(cached_matches) != 1 or cached_matches[0].abs_path != str(source_file):
-            failed.append("cached search must discard stale workspaceDirectory entries")
 
         endpoints: list = []
         controller_worker = _ControllerWorker(str(root))
@@ -1727,7 +1660,6 @@ if __name__ == "__main__":
     cli_reliability_failed = cli_response_and_packaging_check()
     file_failed = file_action_check()
     preview_failed = file_preview_model_check()
-    search_failed = content_search_cache_check()
     aggregate_scan_failed = aggregate_scan_isolation_check()
     git_failed = git_context_check()
     nginx_failed = nginx_detector_check()
@@ -1759,7 +1691,7 @@ if __name__ == "__main__":
         + len(cli_match_failed) + len(launch_guard_failed)
         + len(compile_wait_failed) + len(cli_reliability_failed)
         + len(file_failed) + len(preview_failed)
-        + len(search_failed) + len(aggregate_scan_failed)
+        + len(aggregate_scan_failed)
         + len(git_failed) + len(nginx_failed)
         + len(aggregate_failed) + len(development_lifecycle_failed)
         + len(aggregate_runtime_failed) + len(aggregate_dashboard_failed)

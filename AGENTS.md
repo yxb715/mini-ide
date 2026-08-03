@@ -88,3 +88,54 @@ CLI 仍提供 `--workspace-review` 和 `--workspace-delete-check` 作为检查�
 - 未经用户明确同意，不关闭 mini-ide。
 - 用户同意关闭后，先通过 mini-ide 停止当前 IDE 中所有服务并确认停净，再关闭 IDE 和打包。
 - 交付前运行冒烟测试、必要的 `compileall` 和 `git diff --check`；失败必须先修复。
+
+## 操作日志
+
+所有 CLI 接口调用和 GUI 关键操作统一写入 mini-ide 自身运行日志：
+
+- **日志路径**：`%APPDATA%\mini-ide\logs\mini-ide-YYYYMMDD.log`，按天切分，保留最近 14 天。
+- **日志 logger**：`mini-ide.action`（子 logger，自动 propagate 到 `mini-ide` 根 logger）。
+
+### CLI 接口日志格式
+
+```
+[CLI] <cmd> params=<参数字典>      ← 收到命令时记录
+[CLI] <cmd> ok                     ← 命令成功
+[CLI] <cmd> fail: <错误信息>       ← 命令失败（WARNING 级别）
+[CLI] <cmd> EXCEPTION              ← 命令抛异常（ERROR + 堆栈）
+```
+
+示例：
+```
+[ACTION][CLI] start params={'project': 'my-proj', 'module': 'api'}
+[ACTION][CLI] start ok
+```
+
+### GUI 操作日志格式
+
+```
+[GUI] 启动服务 project=<项目名> profile=<profile名>
+[GUI] 停止服务 project=<项目名>
+[GUI] 重启服务 project=<项目名>
+[GUI] 启动模块 project=<项目名> module=<模块名>
+[GUI] 停止模块 project=<项目名> module=<模块名>
+[GUI] 进入工作区 aggregate=<聚合目录名> workspace=<工作区名>
+[GUI] 创建工作区成功 workspace=<路径>
+[GUI] 创建工作区失败 error=<错误信息>    ← WARNING 级别
+[GUI] 合并工作区成功 projects=<项目列表>
+[GUI] 合并工作区失败 error=<错误信息>    ← WARNING 级别
+[GUI] 删除工作区成功 kept_branches=<保留分支>
+[GUI] 删除工作区失败 error=<错误信息>    ← WARNING 级别
+```
+
+### 查询方式
+
+用 grep 过滤操作日志（Windows PowerShell）：
+
+```powershell
+# 查看全部操作记录
+Select-String "\[CLI\]|\[GUI\]" $env:APPDATA\mini-ide\logs\mini-ide-$(Get-Date -f yyyyMMdd).log
+
+# 只看失败/异常
+Select-String "(fail|FAIL|WARNING|ERROR).*\[CLI\]|\[GUI\].*失败" ...
+```

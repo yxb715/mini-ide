@@ -32,7 +32,6 @@ from src.core.service_state import (
     STATE_STOPPED as SERVICE_STOPPED, STATE_STOPPING as SERVICE_STOPPING,
     ServiceState, running_items,
 )
-from src.ui.content_search import ContentSearchDialog
 from src.ui.file_tree import FileTree
 from src.ui.git_viewer import GitViewer
 from src.ui.log_widget import LogWidget
@@ -67,6 +66,7 @@ RESTART_GAP_MS = 1800
 COMPILE_THEN_RUN_GAP_MS = 300
 
 log = logging.getLogger("mini-ide")
+action_log = logging.getLogger("mini-ide.action")  # 操作行为日志，统一写到同一日志文件
 
 
 # 状态栏分支/改动按钮的 base QSS（透明、hover 高亮 BG_L4）
@@ -278,7 +278,6 @@ class ProjectTab(QWidget):
         self.log = LogWidget()
         self.log.set_max_blocks(self.config.max_log_blocks)
         self.log.fileJumpRequested.connect(self._jump_to_file)
-        self.log.portDiagnosisRequested.connect(self.open_port_dialog)
 
         # 中心 Tab 容器：tab 0 固定是日志（不可关），其它 tab 是文件面板
         self.center_tabs = QTabWidget()
@@ -448,6 +447,7 @@ class ProjectTab(QWidget):
     def _start_profile(self, prof: RunProfile, enforce_guard: bool = True) -> bool:
         if prof is None:
             return False
+        action_log.info("[GUI] 启动服务 project=%s profile=%s", self.project_meta.name, prof.name)
         if enforce_guard:
             conflict = self.service_controller.profile_start_error(prof)
             if conflict:
@@ -481,6 +481,7 @@ class ProjectTab(QWidget):
         return True
 
     def _stop(self) -> None:
+        action_log.info("[GUI] 停止服务 project=%s", self.project_meta.name)
         self._pending_after_compile = None
         self.runner.stop()
 
@@ -530,6 +531,7 @@ class ProjectTab(QWidget):
         btn.style().polish(btn)
 
     def _restart(self) -> None:
+        action_log.info("[GUI] 重启服务 project=%s", self.project_meta.name)
         primary = next((p for p in self.project_meta.profiles if p.primary), None)
         if not primary:
             return
@@ -575,7 +577,6 @@ class ProjectTab(QWidget):
         lw = LogWidget()
         lw.set_max_blocks(self.config.max_log_blocks)
         lw.fileJumpRequested.connect(self._jump_to_file)
-        lw.portDiagnosisRequested.connect(self.open_port_dialog)
         self.module_logs[module] = lw
         idx = self.center_tabs.addTab(lw, f"📋 {module}")
         self.center_tabs.setCurrentIndex(idx)
@@ -589,6 +590,7 @@ class ProjectTab(QWidget):
         把它停掉、等端口释放，再用 mini-ide 自己启动——这样起来的就是 mini-ide
         亲手管理的进程，界面正常显示「运行中」，不会再留外部标记。
         """
+        action_log.info("[GUI] 启动模块 project=%s module=%s", self.project_meta.name, module)
         conflict = self.service_controller.service_start_error()
         if conflict:
             message = conflict.get("error", "operation blocked")
@@ -673,6 +675,7 @@ class ProjectTab(QWidget):
 
 
     def _stop_module(self, module: str, silent: bool = False) -> None:
+        action_log.info("[GUI] 停止模块 project=%s module=%s", self.project_meta.name, module)
         runner = self.module_runners.get(module)
         if runner and self.service_controller.runner_busy(runner):
             runner.stop()
@@ -1243,7 +1246,6 @@ class ProjectTab(QWidget):
             lw = LogWidget()
             lw.set_max_blocks(self.config.max_log_blocks)
             lw.fileJumpRequested.connect(self._jump_to_file)
-            lw.portDiagnosisRequested.connect(self.open_port_dialog)
             self._script_logs[key] = lw
             idx = self.center_tabs.addTab(lw, f"▶ {p.name}")
         else:
@@ -2145,7 +2147,7 @@ class ProjectTab(QWidget):
     def _register_shortcuts(self) -> None:
         # 快捷键已上移到 MainWindow 统一注册（窗口级，焦点在哪都生效，
         # 多 tab 不冲突），由 MainWindow 路由到当前可见 tab 的下列 public 方法：
-        #   Ctrl+Shift+N → open_file_picker      Ctrl+Shift+F → open_content_search
+        #   Ctrl+Shift+N → open_file_picker
         #   Ctrl+E       → open_recent_files      Ctrl+Shift+P → open_command_palette
         #   Ctrl+\\       → open_endpoint_picker   Ctrl+Shift+R → restart_project
         #   Ctrl+W       → close_current_file_tab
@@ -2168,11 +2170,6 @@ class ProjectTab(QWidget):
             on_pick=lambda p: self._show_preview(p, 0, 0),
             parent=self,
         )
-        dlg.show()
-
-    def open_content_search(self) -> None:
-        dlg = ContentSearchDialog(self.project_meta.path, parent=self)
-        dlg.open_requested.connect(lambda p, l, c: self._show_preview(p, l, c))
         dlg.show()
 
     def open_recent_files(self) -> None:
@@ -2229,14 +2226,11 @@ class ProjectTab(QWidget):
             commands.append(("↻  重启项目", "Ctrl+Shift+R", self._restart))
 
         commands.append(("🔍  搜索文件名", "Ctrl+Shift+N", self.open_file_picker))
-        commands.append(("🔎  搜索文件内容", "Ctrl+Shift+F", self.open_content_search))
         commands.append(("🎯  接口地址跳转", "Ctrl+\\  定位 Controller 方法", self.open_endpoint_picker))
         commands.append(("⏱  最近打开的文件", "Ctrl+E", self.open_recent_files))
         commands.append(("📁  打开项目目录", "用资源管理器", lambda: open_folder(self.project_meta.path)))
         commands.append(("🧹  清空所有日志", "项目日志、服务日志、脚本日志", self.clear_all_logs))
         commands.append(("🌿  Git 改动", "实时查看当前分支改动文件", self.open_git_viewer))
-        commands.append(("🔌  端口占用查询", "查看指定端口被哪个进程占用 / kill", lambda: self.open_port_dialog(0)))
-        commands.append(("📋  环境/配置文件", ".env / application*.yml 等集中查看", self.open_env_panel))
         commands.append(("ℹ️  项目信息", "路径 / 类型 / 包管理 / 主类（只读）", self.open_project_info))
 
         dlg = show_command_palette(commands, parent=self)
@@ -2302,19 +2296,6 @@ class ProjectTab(QWidget):
         dlg = GitViewer(self.project_meta.path, parent=self)
         self._git_viewer = dlg
         dlg.destroyed.connect(lambda: setattr(self, "_git_viewer", None))
-        dlg.openFileRequested.connect(lambda p: self._show_preview(p, 0, 0))
-        dlg.show()
-
-    def open_port_dialog(self, default_port: int = 0) -> None:
-        """端口占用查询对话框。default_port>0 时自动预填并查询。"""
-        from src.ui.port_dialog import PortDialog
-        dlg = PortDialog(default_port=default_port, parent=self)
-        dlg.show()
-
-    def open_env_panel(self) -> None:
-        """环境/配置文件集中面板（只读查看入口）"""
-        from src.ui.env_panel import EnvPanel
-        dlg = EnvPanel(self.project_meta.path, parent=self)
         dlg.openFileRequested.connect(lambda p: self._show_preview(p, 0, 0))
         dlg.show()
 

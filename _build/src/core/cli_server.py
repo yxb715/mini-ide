@@ -581,13 +581,20 @@ def handle_cli_request(data: str, sock: QLocalSocket, window: "MainWindow") -> b
     if "cmd" not in cmd:
         return False
 
-    log.info("收到 CLI 命令: %s", cmd)
+    log.info("[CLI] %s params=%s", cmd.get("cmd", "?"), {k: v for k, v in cmd.items() if k != "cmd"})
 
     try:
         result = _dispatch(cmd, window)
     except Exception as e:
-        log.exception("CLI 命令执行异常")
+        log.exception("[CLI] %s EXCEPTION", cmd.get("cmd", "?"))
         result = {"ok": False, "error": str(e)}
+
+    ok_flag = result.get("ok", True) if isinstance(result, dict) else True
+    if ok_flag:
+        log.info("[CLI] %s ok", cmd.get("cmd", "?"))
+    else:
+        log.warning("[CLI] %s fail: %s", cmd.get("cmd", "?"),
+                    result.get("error", "") if isinstance(result, dict) else "")
 
     _send_response(sock, result)
     return True

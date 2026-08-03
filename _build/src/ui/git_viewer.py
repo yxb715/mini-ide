@@ -23,7 +23,6 @@ from src.ui.theme import (
 from src.util.editor import REVEAL_LABEL, reveal_in_explorer
 
 WORKER_CLOSE_WAIT_MS = 16000
-AI_DIFF_LIMIT_CHARS = 30000
 
 
 class _OverviewWorker(QThread):
@@ -52,29 +51,6 @@ class _FileDiffWorker(QThread):
         f = self.changed_file
         text = git_context.file_diff_text(self.root, f)
         self.done.emit(f.path, text)
-
-
-class _AiDiffContextWorker(QThread):
-    done = Signal(str)
-
-    def __init__(self, root: str, files: list[git_ops.ChangedFile],
-                 summary: str, parent=None):
-        super().__init__(parent)
-        self.root = root
-        self.files = files
-        self.summary = summary
-
-    def run(self) -> None:
-        diff, truncated = git_context.limited_diff_text(
-            self.root, self.files, max_chars=AI_DIFF_LIMIT_CHARS, untracked_max_lines=120,
-        )
-        parts = [self.summary]
-        if diff:
-            parts.extend(["", "Diff：", diff])
-        if truncated:
-            parts.append(f"\n...（diff 已截断，限制 {AI_DIFF_LIMIT_CHARS} 字符）")
-            parts.append("请按需打开 Git 改动窗口查看完整 diff。")
-        self.done.emit("\n".join(parts))
 
 
 class DiffHighlighter(QSyntaxHighlighter):
@@ -126,7 +102,6 @@ class GitViewer(QDialog):
         self.resize(1120, 720)
         self._overview_worker: _OverviewWorker | None = None
         self._diff_worker: _FileDiffWorker | None = None
-        self._ai_diff_worker: _AiDiffContextWorker | None = None
         self._numstat: dict[str, tuple[int, int]] = {}
         self._last_signature = ""
         self._selected_path = ""
@@ -143,19 +118,6 @@ class GitViewer(QDialog):
         self.lbl_branch = QLabel("")
         self.lbl_branch.setTextFormat(Qt.TextFormat.RichText)
         header.addWidget(self.lbl_branch, 1)
-        self.btn_copy_branch = QPushButton("复制当前分支")
-        self.btn_copy_branch.clicked.connect(self._copy_current_branch)
-        header.addWidget(self.btn_copy_branch)
-        btn_copy_summary = QPushButton("复制 AI 摘要")
-        btn_copy_summary.clicked.connect(lambda: self._copy_ai_context("summary"))
-        header.addWidget(btn_copy_summary)
-        btn_copy_files = QPushButton("复制文件列表")
-        btn_copy_files.clicked.connect(lambda: self._copy_ai_context("files"))
-        header.addWidget(btn_copy_files)
-        btn_copy_diff = QPushButton("复制完整 diff")
-        self.btn_copy_diff = btn_copy_diff
-        self.btn_copy_diff.clicked.connect(lambda: self._copy_ai_context("diff"))
-        header.addWidget(self.btn_copy_diff)
         btn_refresh = QPushButton("刷新")
         btn_refresh.clicked.connect(lambda: self._reload(force=True))
         header.addWidget(btn_refresh)
@@ -240,7 +202,6 @@ class GitViewer(QDialog):
             f"🌿 {branch or '(无分支)'} "
             f"<span style='color:{FG_SECONDARY};'>@ {self.root}</span>"
         )
-        self.btn_copy_branch.setEnabled(bool(branch))
         counts: dict[str, int] = {}
         for f in self._sort_files(files):
             label = self._status_label(f)
@@ -335,53 +296,6 @@ class GitViewer(QDialog):
             )
             return
         self.openFileRequested.emit(str(abs_path))
-
-    def _copy_current_branch(self) -> None:
-        if self._current_branch:
-            QApplication.clipboard().setText(self._current_branch)
-
-    def _build_ai_summary(self, include_files: bool = True) -> str:
-        summary = git_context.summary_from_changes(
-            repo=self.root,
-            branch=self._current_branch,
-            files=self._current_files,
-            stats=self._numstat,
-            include_files=include_files,
-        )
-        return git_context.build_ai_text(summary) if summary.get("ok") else summary.get("error", "")
-
-    def _copy_ai_context(self, mode: str) -> None:
-        if mode == "files":
-            text = self._build_ai_summary(include_files=True)
-        elif mode == "diff":
-            self._copy_full_diff_async()
-            return
-        else:
-            text = self._build_ai_summary(include_files=False)
-        QApplication.clipboard().setText(text)
-
-    def _copy_full_diff_async(self) -> None:
-        if self._ai_diff_worker and self._ai_diff_worker.isRunning():
-            return
-        files = self._sort_files(self._current_files)
-        summary = self._build_ai_summary(include_files=True)
-        worker = _AiDiffContextWorker(
-            self.root, files, summary, parent=QApplication.instance(),
-        )
-        self._ai_diff_worker = worker
-        self.btn_copy_diff.setEnabled(False)
-        self.btn_copy_diff.setText("生成中...")
-        worker.done.connect(self._on_ai_diff_context_ready)
-        self._track_worker(worker)
-        worker.start()
-
-    def _on_ai_diff_context_ready(self, text: str) -> None:
-        if self._closing:
-            return
-        QApplication.clipboard().setText(text)
-        self.btn_copy_diff.setEnabled(True)
-        self.btn_copy_diff.setText("复制完整 diff")
-        self._ai_diff_worker = None
 
     def _reload(self, force: bool = False) -> None:
         if self._closing:

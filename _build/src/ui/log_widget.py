@@ -33,7 +33,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QHBoxLayout, QLabel, QLineEdit, QMenu,
-    QPushButton, QPlainTextEdit, QToolTip, QVBoxLayout, QWidget, QToolButton,
+    QPlainTextEdit, QToolTip, QVBoxLayout, QWidget, QToolButton,
 )
 
 from src.core import log_classifier as lc
@@ -55,14 +55,12 @@ class LineMeta:
     jumps: list[lc.FileJump] = field(default_factory=list)
     stack_group: str = ""
     diagnosis: str = ""
-    diagnosis_port: int = 0
 
 
 class LogWidget(QWidget):
     """日志区：顶部一条工具条 + 中间日志 + 底部搜索条"""
 
     fileJumpRequested = Signal(str, int, int)       # path, line, col
-    portDiagnosisRequested = Signal(int)            # 诊断到端口占用，要求打开 PortDialog
     contentAdded = Signal()                         # 有新内容写入（多模块时用来把隐藏的日志 tab 显示回来）
 
     def __init__(self, parent=None):
@@ -80,6 +78,7 @@ class LogWidget(QWidget):
         self._first_error = ""
         self._ready_seen = False
         self._external_running = False
+        self._new_run = False
 
         # 批量刷新：高吞吐日志（如 Gradle 初扫）会飙到 1000+行/秒，
         # 单行 insert 会卡主线程。把接收到的行先塞到队列，每 50ms 集中写入一次。
@@ -141,12 +140,6 @@ class LogWidget(QWidget):
         self.diagnosis_text.setWordWrap(True)
         self.diagnosis_text.setStyleSheet(f"color: {COLOR_WARN}; background: transparent;")
         db_layout.addWidget(self.diagnosis_text, 1)
-        self.btn_port_diagnose = QPushButton("🔌 查看占用进程")
-        self.btn_port_diagnose.setVisible(False)
-        self.btn_port_diagnose.setToolTip("查询该端口被哪个进程占用，可一键 kill")
-        self.btn_port_diagnose.clicked.connect(self._on_port_diagnose_clicked)
-        db_layout.addWidget(self.btn_port_diagnose)
-        self._diagnosis_port: int = 0
         root.addWidget(self.diagnosis_bar)
 
         # 搜索栏
@@ -216,14 +209,13 @@ class LogWidget(QWidget):
         self._error_count = 0
         self._warn_count = 0
         self._last_diagnosis = ""
-        self._diagnosis_port = 0
         self._run_label = label
         self._run_started_at = time.time()
         self._run_ended_at = 0.0
         self._first_error = ""
         self._ready_seen = False
         self._external_running = False
-        self.btn_port_diagnose.setVisible(False)
+        self._new_run = True          # 新运行开始，下次 flush 强制滚到底部
         self.diagnosis_bar.setVisible(False)
         self._close_log_file()
         ts = time.strftime("%Y%m%d-%H%M%S")
@@ -259,9 +251,7 @@ class LogWidget(QWidget):
             detail += f"（端口 {port}）"
         detail += "；当前 IDE 没有这次启动日志上下文。"
         self._last_diagnosis = detail
-        self._diagnosis_port = 0
-        self.btn_port_diagnose.setVisible(False)
-        self._show_diagnosis(detail, 0)
+        self._show_diagnosis(detail)
         self._update_counts(None)
 
     def diagnosis_summary(self, max_chars: int = 4000) -> str:
@@ -337,7 +327,6 @@ class LogWidget(QWidget):
                     jumps=cls.jumps,
                     stack_group=cls.stack_group_id,
                     diagnosis=cls.diagnosis,
-                    diagnosis_port=cls.diagnosis_port,
                 )
                 display_line = line
                 if cls.kind == "sql" and ";" in line:
@@ -354,15 +343,16 @@ class LogWidget(QWidget):
                     self._ready_seen = True
                 if cls.diagnosis and cls.diagnosis != self._last_diagnosis:
                     self._last_diagnosis = cls.diagnosis
-                    self._show_diagnosis(cls.diagnosis, cls.diagnosis_port)
+                    self._show_diagnosis(cls.diagnosis)
                 if self._hide_stack and cls.kind == "stack" and bool(meta.stack_group):
                     self.edit.document().lastBlock().setVisible(False)
         finally:
             self.edit.setUpdatesEnabled(True)
 
-        # 批次末尾统一刷新一次计数；仅在用户原本贴底时才跟随滚动到最新
+        # 批次末尾统一刷新一次计数；新运行开始或用户贴底时跟随滚动到最新
         self._update_counts(None)
-        if was_at_bottom:
+        if self._new_run or was_at_bottom:
+            self._new_run = False
             sb.setValue(sb.maximum())
 
         # Qt 文档超限时会自动淘汰头部旧块，同步截断 _lines 保持一致
@@ -386,10 +376,9 @@ class LogWidget(QWidget):
         self._error_count = 0
         self._warn_count = 0
         self._last_diagnosis = ""
-        self._diagnosis_port = 0
         self._first_error = ""
         self._external_running = False
-        self.btn_port_diagnose.setVisible(False)
+        self._new_run = False
         self.diagnosis_bar.setVisible(False)
         self._update_counts(None)
 
@@ -483,18 +472,10 @@ class LogWidget(QWidget):
             parts.append(f"<span style='color:{FG_SECONDARY};'>0 errors</span>")
         self.lbl_counts.setText("  ".join(parts))
 
-    def _show_diagnosis(self, text: str, port: int) -> None:
-        """在诊断栏显示一行提示。port > 0 时挂上「查看占用进程」按钮。"""
+    def _show_diagnosis(self, text: str) -> None:
+        """在诊断栏显示一行提示。"""
         self.diagnosis_text.setText("💡  " + text)
-        self._diagnosis_port = port
-        self.btn_port_diagnose.setVisible(port > 0)
-        if port > 0:
-            self.btn_port_diagnose.setText(f"🔌 查看端口 {port} 占用进程")
         self.diagnosis_bar.setVisible(True)
-
-    def _on_port_diagnose_clicked(self) -> None:
-        if self._diagnosis_port > 0:
-            self.portDiagnosisRequested.emit(self._diagnosis_port)
 
     # ---- 事件：点击跳转、右键、搜索 ----
 

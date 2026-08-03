@@ -136,7 +136,6 @@ class MainWindow(QMainWindow):
         # (序列, 调用当前 tab 的哪个方法名)
         bindings = [
             ("Ctrl+Shift+N", "open_file_picker"),
-            ("Ctrl+Shift+F", "open_content_search"),
             ("Ctrl+E", "open_recent_files"),
             ("Ctrl+Shift+P", "open_command_palette"),
             ("Ctrl+\\", "open_endpoint_picker"),

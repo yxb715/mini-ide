@@ -1,6 +1,7 @@
 """聚合目录工作台：一个顶层 Tab 管理自己的项目和需求工作区。"""
 from __future__ import annotations
 
+import logging
 import subprocess
 import time
 from pathlib import Path
@@ -39,6 +40,8 @@ from src.ui.theme import (
     COLOR_ERROR, COLOR_SUCCESS, COLOR_WARN, FG_DIM, GAP_LG, GAP_MD, GAP_NONE,
     GAP_SM, H_TABLE_ROW,
 )
+
+action_log = logging.getLogger("mini-ide.action")
 
 
 class _PrepareProjectsWorker(QThread):
@@ -637,6 +640,8 @@ class AggregateProjectTab(QWidget):
     def _activate_selected_workspace(self) -> None:
         summary = self._selected_workspace_summary()
         if summary and summary.workspace is not None:
+            action_log.info("[GUI] 进入工作区 aggregate=%s workspace=%s",
+                            self.aggregate_project.name, summary.name)
             self.activate_workspace(summary.workspace)
 
     def _create_workspace(self) -> None:
@@ -661,6 +666,7 @@ class AggregateProjectTab(QWidget):
             return
         self._create_worker = None
         if not result.ok or result.workspace is None:
+            action_log.warning("[GUI] 创建工作区失败 error=%s", result.error)
             details = [result.error]
             if result.created_components:
                 details.append("已创建：" + ", ".join(result.created_components))
@@ -670,6 +676,7 @@ class AggregateProjectTab(QWidget):
                 details.append("未处理：" + ", ".join(result.pending_components))
             QMessageBox.warning(self, "创建需求工作区失败", "\n".join(details))
         else:
+            action_log.info("[GUI] 创建工作区成功 workspace=%s", result.workspace.root_path)
             self._pending_workspace_path = result.workspace.root_path
             self.workspace_status.setText("需求工作区已创建。")
         self._update_workspace_buttons()
@@ -756,9 +763,11 @@ class AggregateProjectTab(QWidget):
         self._update_workspace_buttons()
         if error or result is None or not result.ok:
             message = error or (result.error if result is not None else "未知错误")
+            action_log.warning("[GUI] 合并工作区失败 error=%s", message)
             QMessageBox.warning(self, "合并失败", message)
         else:
             projects = "、".join(item.id for item in result.components if item.merged)
+            action_log.info("[GUI] 合并工作区成功 projects=%s", projects)
             QMessageBox.information(self, "合并完成", f"已合并：{projects}")
         self.refresh_workspaces()
 
@@ -839,8 +848,10 @@ class AggregateProjectTab(QWidget):
         self._delete_worker = None
         self._update_workspace_buttons()
         if not ok:
+            action_log.warning("[GUI] 删除工作区失败 error=%s", error)
             QMessageBox.warning(self, "删除未完成", error)
         else:
+            action_log.info("[GUI] 删除工作区成功 kept_branches=%s", kept_branches)
             message = "需求工作区已删除。"
             if kept_branches:
                 message += "\n\n保留分支：" + ", ".join(kept_branches)
@@ -1039,11 +1050,6 @@ class AggregateProjectTab(QWidget):
         tab = self._current_project_tab()
         if tab:
             tab.open_file_picker()
-
-    def open_content_search(self) -> None:
-        tab = self._current_project_tab()
-        if tab:
-            tab.open_content_search()
 
     def open_recent_files(self) -> None:
         tab = self._current_project_tab()
