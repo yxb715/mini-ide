@@ -678,7 +678,7 @@ def _dispatch(cmd: dict, window: "MainWindow") -> dict:
         return _cmd_close_workspace(window)
 
     if action == "preflight-build":
-        return _cmd_preflight_build(window)
+        return _cmd_preflight_build(window, cmd.get("project", ""))
 
     if action == "quit":
         return _cmd_quit(window)
@@ -997,12 +997,31 @@ def _cmd_close_workspace(window: "MainWindow") -> dict:
     }
 
 
-def _cmd_preflight_build(window: "MainWindow") -> dict:
-    running = _collect_running(window)
+def _cmd_preflight_build(window: "MainWindow", project_key: str = "") -> dict:
+    """检查构建目标；不指定项目时保留退出前的全局检查语义。"""
+
+    if project_key:
+        tab, match_error = _find_project_tab(window, project_key)
+        if match_error:
+            return match_error
+        try:
+            running = tab.running_service_items(refresh_external=True)
+        except Exception:
+            log.exception("收集目标项目运行服务失败: %s", tab.project_meta.name)
+            return {
+                "ok": False,
+                "error": "failed to inspect target project services",
+                "can_build": False,
+                "running": [],
+            }
+        error = "target project services must be stopped before build"
+    else:
+        running = _collect_running(window)
+        error = "running services must be stopped before build/quit"
     if running:
         return {
             "ok": False,
-            "error": "running services must be stopped before build/quit",
+            "error": error,
             "can_build": False,
             "running": running,
         }

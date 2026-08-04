@@ -200,8 +200,14 @@ def _parse_args(argv: list[str]) -> dict | None:
     rest = args[1:]
 
     if cmd_name in ("status", "list-projects", "list-workspaces", "close-workspace",
-                    "list-aggregates",
-                    "preflight-build", "can-quit"):
+                    "list-aggregates", "can-quit"):
+        return result
+
+    if cmd_name == "preflight-build":
+        if len(rest) > 1:
+            return None
+        if rest:
+            result["project"] = rest[0]
         return result
 
     if cmd_name == "quit":
@@ -591,7 +597,8 @@ def _print_usage():
         "  --git-status <project>       Get git branch and changed files\n"
         "  --git-diff <project> [--summary|--full] [--max-chars N]\n"
         "  --git-ai-context <project> [--summary|--full] [--max-chars N]\n"
-        "  --preflight-build            Check running services before build/quit\n"
+        "  --preflight-build [project]  Check target project, or all projects if omitted\n"
+        "  --can-quit                   Check all running services before quitting\n"
         "  --quit                       Stop all running services and exit mini-ide\n"
         "\nOptions:\n"
         "  --auto-start                 If mini-ide is not running, launch it automatically\n"

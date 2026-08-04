@@ -1,5 +1,6 @@
 """mini-ide 入口"""
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).parent
@@ -35,7 +36,7 @@ if _is_cli_mode():
 
 
 from PySide6.QtWidgets import QApplication
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QLockFile, QStandardPaths, QThread, Qt, QTimer
 from PySide6.QtGui import QIcon
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 
@@ -46,6 +47,25 @@ from src.core.config import AppConfig
 
 
 SERVER_NAME = "mini-ide-single-instance"
+_INSTANCE_LOCK: QLockFile | None = None
+
+
+def _instance_lock_path() -> str:
+    """返回当前用户范围内、跨 GUI/CLI 启动进程共享的锁文件路径。"""
+    temp_dir = QStandardPaths.writableLocation(QStandardPaths.TempLocation)
+    if not temp_dir:
+        temp_dir = str(Path.cwd())
+    return str(Path(temp_dir) / "whaty-mini-ide-single-instance.lock")
+
+
+def _acquire_instance_lock() -> QLockFile | None:
+    """串行化 GUI 冷启动，避免 IPC 尚未监听时重复创建窗口。"""
+    global _INSTANCE_LOCK
+    lock = QLockFile(_instance_lock_path())
+    if not lock.tryLock(0):
+        return None
+    _INSTANCE_LOCK = lock
+    return lock
 
 
 def _forward_to_existing(path: str | None) -> bool:
@@ -62,10 +82,18 @@ def _forward_to_existing(path: str | None) -> bool:
     return True
 
 
+def _wait_for_existing(path: str | None, timeout_ms: int = 15000) -> bool:
+    """等待现有实例完成冷启动，并在 IPC 就绪后转发一次请求。"""
+    deadline = time.monotonic() + timeout_ms / 1000
+    while time.monotonic() < deadline:
+        if _forward_to_existing(path):
+            return True
+        QThread.msleep(100)
+    return False
+
+
 def _start_local_server(window: MainWindow) -> QLocalServer | None:
     """在本实例启动 IPC server 监听后续右键请求。"""
-    # 清理可能残留的同名 server（Windows named pipe 自动回收，调用无副作用）
-    QLocalServer.removeServer(SERVER_NAME)
     server = QLocalServer(window)
     if not server.listen(SERVER_NAME):
         app_log.get_logger("main").warning(
@@ -148,7 +176,16 @@ def main():
 
         initial_project = sys.argv[1] if len(sys.argv) > 1 else None
 
-        # 单实例：已有实例在跑就转发路径后退出
+        # 单实例：先拿启动锁，避免第一个实例尚未监听 IPC 时第二个实例继续启动。
+        # 已有实例拿着锁时，等待它完成冷启动后转发路径并退出。
+        if _acquire_instance_lock() is None:
+            if _wait_for_existing(initial_project):
+                logger.info("检测到正在启动的 mini-ide，已等待并转发路径=%r 后退出", initial_project)
+                return
+            logger.error("已有 mini-ide 正在启动，但 IPC 在等待窗口内仍未就绪")
+            return
+
+        # 兼容锁文件不存在但旧实例已经在运行的情况。
         if _forward_to_existing(initial_project):
             logger.info("检测到已运行的 mini-ide，已转发路径=%r 后退出", initial_project)
             return
@@ -165,10 +202,17 @@ def main():
         config = AppConfig.load()
         window = MainWindow(config)
         window.pending_initial_project = initial_project
-        window.show()
 
-        # 启动 IPC server,接收后续右键请求
+        # 先确认 IPC 已成功监听，再显示窗口；失败时不启动一个无法接收请求的副本。
         window._local_server = _start_local_server(window)
+        if window._local_server is None:
+            if _wait_for_existing(initial_project, timeout_ms=3000):
+                logger.info("检测到另一个 mini-ide 已监听 IPC，已转发路径=%r 后退出", initial_project)
+            else:
+                logger.error("mini-ide IPC 监听失败，取消本次窗口启动")
+            window.close()
+            return
+        window.show()
 
         # 主线程心跳，给 freeze-watchdog 用
         hb_timer = QTimer()

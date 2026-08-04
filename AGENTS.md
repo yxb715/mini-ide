@@ -115,7 +115,7 @@ mini-ide 是本机开发指挥台，用 GUI 管理普通项目、聚合目录、
 --workspace-review <target>
 --workspace-delete-check <target>
 --workspace-sync <target> [--fetch] [--keep-conflicts]
---preflight-build
+--preflight-build [project]
 --can-quit
 --quit
 ```
@@ -132,7 +132,7 @@ mini-ide 是本机开发指挥台，用 GUI 管理普通项目、聚合目录、
 - `--auto-start` 可让 CLI 在 GUI 未运行时启动同目录的 `mini-ide.exe`；`--status`、`--preflight-build`、`--can-quit` 和 `--quit` 不自动拉起 GUI。
 - 模块名必须精确匹配；项目不传模块时表示该项目的全部模块。
 - 退出码：`0` 成功，`1` 操作失败，`2` 参数错误，`3` GUI 未运行，`4` 超时。
-- `--preflight-build` 和 `--can-quit` 用于确认构建/退出条件；打包前必须返回 `ok=true`。
+- `--preflight-build <project>` 只检查目标项目，其他项目可继续运行；不传项目和 `--can-quit` 都执行退出前的全局检查。打包前必须对目标项目执行并返回 `ok=true`。
 - `--compile` 只与目标项目自己的服务互斥：编译前记录目标项目原本运行的模块，完成后只恢复这些模块，不能为了编译停止其他项目。
 
 ## 开发约束

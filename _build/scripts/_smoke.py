@@ -180,6 +180,8 @@ def cli_parse_check() -> list[str]:
         (["mini-ide.exe", "--git-diff", "server", "--full", "--max-chars", "12000"],
          {"cmd": "git-diff", "project": "server", "mode": "full", "max_chars": 12000}),
         (["mini-ide.exe", "--preflight-build"], {"cmd": "preflight-build"}),
+        (["mini-ide.exe", "--preflight-build", "server"],
+         {"cmd": "preflight-build", "project": "server"}),
         (["mini-ide.exe", "--can-quit"], {"cmd": "preflight-build"}),
     ]
 
@@ -194,6 +196,8 @@ def cli_parse_check() -> list[str]:
         failed.append("workspace-sync must reject unknown flags")
     if _parse_args(["mini-ide.exe", "--workspace-sync"]) is not None:
         failed.append("workspace-sync must require a target")
+    if _parse_args(["mini-ide.exe", "--preflight-build", "server", "extra"]) is not None:
+        failed.append("preflight-build must accept at most one project target")
     for action in ("create-development-workspace", "workspace-sync"):
         if _response_timeout_ms({"cmd": action}) < 605000:
             failed.append(f"{action} should allow a complete workspace operation")
@@ -205,6 +209,52 @@ def cli_parse_check() -> list[str]:
             print(f"[FAIL] cli_parse: {msg}", flush=True)
     else:
         print("[OK]   cli_parse compatibility", flush=True)
+    return failed
+
+
+def preflight_isolation_check() -> list[str]:
+    """指定项目的构建预检不能被其它项目的运行服务阻塞。"""
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from src.core import cli_server
+
+    failed: list[str] = []
+    target = SimpleNamespace(
+        project_meta=SimpleNamespace(name="jl"),
+        running_service_items=lambda **_kwargs: [],
+    )
+    unrelated = [{"project": "codex-desktop", "state": "running"}]
+    with (
+        patch.object(cli_server, "_find_project_tab", return_value=(target, None)),
+        patch.object(cli_server, "_collect_running", return_value=unrelated),
+    ):
+        targeted = cli_server._cmd_preflight_build(object(), "jl")
+        global_result = cli_server._cmd_preflight_build(object())
+
+    if not targeted.get("ok") or not targeted.get("can_build"):
+        failed.append(f"targeted preflight should ignore unrelated services: {targeted!r}")
+    if global_result.get("ok") or global_result.get("can_build"):
+        failed.append("global preflight must still block while any project is running")
+
+    running_target = SimpleNamespace(
+        project_meta=SimpleNamespace(name="jl"),
+        running_service_items=lambda **_kwargs: [
+            {"project": "jl", "state": "running"}
+        ],
+    )
+    with patch.object(
+        cli_server, "_find_project_tab", return_value=(running_target, None)
+    ):
+        blocked = cli_server._cmd_preflight_build(object(), "jl")
+    if blocked.get("ok") or blocked.get("can_build"):
+        failed.append("targeted preflight must block its own running services")
+
+    if failed:
+        for msg in failed:
+            print(f"[FAIL] preflight_isolation: {msg}", flush=True)
+    else:
+        print("[OK]   targeted preflight isolation", flush=True)
     return failed
 
 
@@ -1746,6 +1796,7 @@ if __name__ == "__main__":
     failed = import_check()
     model_failed = service_state_check()
     cli_failed = cli_parse_check()
+    preflight_failed = preflight_isolation_check()
     cli_encoding_failed = cli_output_encoding_check()
     launcher_failed = external_launcher_check()
     git_executable_failed = git_executable_resolution_check()
@@ -1780,7 +1831,7 @@ if __name__ == "__main__":
             print(f"[HEX]  {rel}:{ln}: {safe}")
 
     total_fail = (
-        len(failed) + len(model_failed) + len(cli_failed)
+        len(failed) + len(model_failed) + len(cli_failed) + len(preflight_failed)
         + len(cli_encoding_failed) + len(launcher_failed)
         + len(git_executable_failed)
         + len(cli_match_failed) + len(launch_guard_failed)
