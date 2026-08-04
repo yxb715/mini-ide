@@ -1102,6 +1102,7 @@ def aggregate_definition_management_check() -> list[str]:
         component_definition_from_path, suggest_stable_id,
     )
     from src.core.config import AppConfig
+    from src.ui.main_window import _is_aggregate_directory
 
     failed: list[str] = []
     with tempfile.TemporaryDirectory() as tmp:
@@ -1146,6 +1147,8 @@ def aggregate_definition_management_check() -> list[str]:
         config.unregister_aggregate_project(str(root))
         if config.is_aggregate_project(str(root)) or not loaded.config_path.is_file():
             failed.append("ordinary classification must preserve the existing aggregate definition")
+        if not _is_aggregate_directory(config, root):
+            failed.append("a valid on-disk aggregate definition must override stale ordinary history")
 
     if failed:
         for msg in failed:

@@ -44,6 +44,11 @@ def _restored_tab_index(entries: list[str], saved_index: int) -> int:
     return max(0, saved_index)
 
 
+def _is_aggregate_directory(config: AppConfig, path: str | Path) -> bool:
+    """目录定义本身优先；注册表只负责兼容没有定义的历史入口。"""
+    return config.is_aggregate_project(str(path)) or aggregate_config_path(path).is_file()
+
+
 class _CreateAggregateProjectWorker(QThread):
     done = Signal(object, str)
 
@@ -254,7 +259,7 @@ class MainWindow(QMainWindow):
             self._add_aggregate_directory(path)
 
     def _open_or_classify_directory(self, path: str) -> None:
-        if self.config.find_project(path) or self.config.is_aggregate_project(path):
+        if self.config.find_project(path) or _is_aggregate_directory(self.config, path):
             self.open_project(path)
         else:
             self._choose_directory_type(path)
@@ -305,7 +310,7 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "路径无效", f"{path} 不是有效目录")
             return None
 
-        if self.config.is_aggregate_project(str(p)):
+        if _is_aggregate_directory(self.config, p):
             return self.open_aggregate_project(str(p), quiet=quiet)
         if (p / "workspace.json").is_file():
             try:
@@ -730,4 +735,3 @@ class MainWindow(QMainWindow):
 
         if opened and target_index < self.tabs.count():
             self.tabs.setCurrentIndex(target_index)
-
