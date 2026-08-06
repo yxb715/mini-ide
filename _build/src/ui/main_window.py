@@ -12,7 +12,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QApplication, QFileDialog, QLabel, QMainWindow, QMessageBox,
-    QStackedWidget, QTabWidget,
+    QMenu, QStackedWidget, QSystemTrayIcon, QTabWidget,
 )
 
 from src.core.config import AppConfig, ProjectEntry
@@ -79,6 +79,7 @@ class MainWindow(QMainWindow):
     def __init__(self, config: AppConfig):
         super().__init__()
         self.config = config
+        self._quit_requested = False
         self.setWindowTitle("mini-ide")
         self.resize(1400, 860)
         self.setMinimumSize(960, 600)
@@ -111,6 +112,7 @@ class MainWindow(QMainWindow):
         self._aggregate_create_worker: _CreateAggregateProjectWorker | None = None
 
         self._build_menu()
+        self._setup_tray()
         self._build_statusbar()
         self._register_global_shortcuts()
 
@@ -174,7 +176,7 @@ class MainWindow(QMainWindow):
         self.file_menu.addSeparator()
         quit_act = QAction("退出", self)
         quit_act.setShortcut("Ctrl+Q")
-        quit_act.triggered.connect(self.close)
+        quit_act.triggered.connect(self._request_quit)
         self.file_menu.addAction(quit_act)
 
         help_menu = mb.addMenu("帮助(&H)")
@@ -188,6 +190,50 @@ class MainWindow(QMainWindow):
         about = QAction("关于", self)
         about.triggered.connect(self._about)
         help_menu.addAction(about)
+
+    def _setup_tray(self) -> None:
+        """创建托盘入口；窗口关闭后仍由托盘菜单负责唤回或退出。"""
+        icon = self.windowIcon()
+        if icon.isNull():
+            icon = QApplication.instance().windowIcon()
+        self._tray_icon = QSystemTrayIcon(icon, self)
+        self._tray_icon.setToolTip("mini-ide")
+
+        menu = QMenu(self)
+        show_action = QAction("显示 mini-ide", self)
+        show_action.triggered.connect(self._show_from_tray)
+        menu.addAction(show_action)
+        menu.addSeparator()
+        quit_action = QAction("退出 mini-ide", self)
+        quit_action.triggered.connect(self._request_quit)
+        menu.addAction(quit_action)
+        self._tray_icon.setContextMenu(menu)
+        self._tray_icon.activated.connect(self._on_tray_activated)
+        if QSystemTrayIcon.isSystemTrayAvailable():
+            self._tray_icon.show()
+        else:
+            log.warning("系统托盘不可用，关闭窗口后只能通过 CLI --quit 退出")
+
+    def _on_tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
+        if reason in {
+            QSystemTrayIcon.ActivationReason.Trigger,
+            QSystemTrayIcon.ActivationReason.DoubleClick,
+        }:
+            self._show_from_tray()
+
+    def _show_from_tray(self) -> None:
+        from PySide6.QtCore import Qt
+
+        self.show()
+        if self.isMinimized():
+            self.setWindowState(self.windowState() & ~Qt.WindowState.WindowMinimized)
+        self.raise_()
+        self.activateWindow()
+
+    def _request_quit(self) -> None:
+        """托盘/菜单的显式退出，复用 closeEvent 中的服务停止检查。"""
+        self._quit_requested = True
+        self.close()
 
     def _rebuild_recent_menu(self) -> None:
         self.recent_menu.clear()
@@ -572,11 +618,21 @@ class MainWindow(QMainWindow):
                 break
 
     def closeEvent(self, e: QCloseEvent) -> None:
+        if not self._quit_requested:
+            self._persist_geometry()
+            self._persist_tabs()
+            self.config.save()
+            self.hide()
+            e.ignore()
+            log.info("关闭窗口：隐藏到系统托盘")
+            return
+
         running = self._collect_running_services()
         stop_running = True
         if running:
             choice = self._confirm_close_with_services(running)
             if choice == "cancel":
+                self._quit_requested = False
                 e.ignore()
                 return
             stop_running = choice == "stop"
@@ -585,6 +641,7 @@ class MainWindow(QMainWindow):
             w = self.tabs.widget(i)
             if w and hasattr(w, "request_close"):
                 if not w.request_close(confirm_running=False, stop_running=stop_running):
+                    self._quit_requested = False
                     e.ignore()
                     return
         self._persist_geometry()
@@ -600,7 +657,7 @@ class MainWindow(QMainWindow):
                 len(running), stop_running, len(kept),
             )
         super().closeEvent(e)
-        # 主窗口关闭后退出事件循环，避免后台对象残留。
+        # 显式退出时结束事件循环；普通关闭已在上面隐藏到托盘。
         QApplication.quit()
 
     def _collect_running_services(self) -> list[dict]:
@@ -700,6 +757,8 @@ class MainWindow(QMainWindow):
         from PySide6.QtCore import Qt
         if path:
             self.open_project(path)
+        if not self.isVisible():
+            self.show()
         # 只清掉「最小化」标志把窗口唤回前台，不能无脑 showNormal——
         # 那会把最大化的窗口一并降级成普通大小（用户从空目录右键 open ide
         # 时窗口突然缩小就是这么来的）。最大化/普通状态原样保留。

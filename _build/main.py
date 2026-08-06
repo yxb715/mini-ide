@@ -166,6 +166,8 @@ def main():
         app = QApplication(sys.argv)
         app.setApplicationName("mini-ide")
         app.setOrganizationName("whaty")
+        # 主窗口关闭时会隐藏到系统托盘，不能因最后一个窗口隐藏而结束事件循环。
+        app.setQuitOnLastWindowClosed(False)
 
         # 全局基准字体：用 setFont 直接定基准字号（比 QSS font-size 优先级更稳，
         # 不会被个别 widget 的局部样式或平台默认覆盖）。具体字号取 theme 的主 UI token。
