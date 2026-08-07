@@ -15,8 +15,22 @@
 - 未勾选项目不复制。
 - 共享项目只引用源目录，不创建 Worktree。
 - 默认目录为 `workspace/<任务 ID>/`，写入 `workspace.json`、`AGENTS.md` 和 `context.md`。
+- 组件可在聚合配置中通过 `workspaceCopyFiles` 声明需要从源项目复制到 Worktree 的本地文件，例如 `.env`；只接受项目内相对路径和普通文件。
 - 创建前检查 Git 仓库、源目录非 detached HEAD、基准分支和提交可读、任务分支及远端同名分支不存在、Worktree 不重复。
-- 任一步骤失败都回滚已经创建的 Worktree、分支和元数据。
+- 白名单文件缺失、越界、是软链接或目标已存在时创建失败；任一步骤失败都回滚已经创建的 Worktree、分支和元数据。
+
+示例：
+
+```json
+{
+  "id": "server",
+  "path": "server",
+  "type": "java",
+  "workspaceCopyFiles": [".env"]
+}
+```
+
+`workspaceCopyFiles` 不支持通配符，也不会自动复制其它未跟踪或被 Git 忽略的文件。
 
 工作区只允许 `created`、`active`、`reviewing`、`merged` 四种状态；当前创建流程通常直接进入 `active`。
 

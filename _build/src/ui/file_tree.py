@@ -1059,12 +1059,12 @@ class FileTree(QWidget):
             self._apply_filter(self.filter_input.text())
 
     def _open_codex(self, target_dir: Path) -> None:
-        """在当前目录打开 Codex，按当前电脑环境动态选择终端。"""
+        """在 Codex Desktop 中为当前目录新建会话。"""
         command = open_in_codex_args(target_dir)
         if not command:
             QMessageBox.warning(
                 self, "启动 Codex 失败",
-                "没有找到可用的终端来启动 Codex。",
+                "没有找到 Codex Desktop，请先安装或配置 CODEX_DESKTOP_EXE。",
             )
             return
         try:

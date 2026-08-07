@@ -91,6 +91,7 @@ class AggregateComponent:
     name: str = ""
     shared: bool = False
     overrides: dict[str, Any] = field(default_factory=dict)
+    workspace_copy_files: tuple[str, ...] = ()
 
     @classmethod
     def from_dict(cls, raw: dict, aggregate_root: str | Path) -> "AggregateComponent":
@@ -109,6 +110,31 @@ class AggregateComponent:
             raise AggregateConfigError(
                 f"component {component_id} overrides must be an object"
             )
+        component_root = resolve_path_within(
+            aggregate_root, path, label=f"component {component_id} path",
+        )
+        raw_copy_files = raw.get("workspaceCopyFiles", [])
+        copy_files = _list(
+            raw_copy_files, f"component {component_id} workspaceCopyFiles",
+        )
+        normalized_copy_files: list[str] = []
+        seen_copy_files: set[str] = set()
+        for index, value in enumerate(copy_files):
+            if not isinstance(value, str) or not value.strip():
+                raise AggregateConfigError(
+                    f"component {component_id} workspaceCopyFiles[{index}] must be a non-empty string"
+                )
+            relative = relative_path_within(
+                component_root, value.strip(),
+                label=f"component {component_id} workspaceCopyFiles[{index}]",
+            )
+            key = relative.casefold()
+            if key in seen_copy_files:
+                raise AggregateConfigError(
+                    f"component {component_id} workspaceCopyFiles contains duplicate path: {relative}"
+                )
+            seen_copy_files.add(key)
+            normalized_copy_files.append(relative)
         return cls(
             id=component_id,
             path=path,
@@ -116,6 +142,7 @@ class AggregateComponent:
             name=str(raw.get("name", "") or "").strip(),
             shared=bool(raw.get("shared", False)),
             overrides=dict(overrides),
+            workspace_copy_files=tuple(normalized_copy_files),
         )
 
     def absolute_path(self, aggregate_root: str | Path) -> Path:
@@ -131,6 +158,8 @@ class AggregateComponent:
             data["shared"] = True
         if self.overrides:
             data["overrides"] = dict(self.overrides)
+        if self.workspace_copy_files:
+            data["workspaceCopyFiles"] = list(self.workspace_copy_files)
         return data
 
 
@@ -273,6 +302,7 @@ class WorkspaceComponent:
     base_branch: str = ""
     base_commit: str = ""
     task_branch: str = ""
+    workspace_copy_files: tuple[str, ...] = ()
 
     @classmethod
     def from_dict(
@@ -301,6 +331,34 @@ class WorkspaceComponent:
         base_branch = str(raw.get("baseBranch", "") or "").strip()
         base_commit = str(raw.get("baseCommit", "") or "").strip()
         task_branch = str(raw.get("taskBranch", "") or "").strip()
+        raw_copy_files = raw.get("workspaceCopyFiles", [])
+        copy_files = _list(
+            raw_copy_files,
+            f"workspace component {component_id} workspaceCopyFiles",
+        )
+        normalized_copy_files: list[str] = []
+        seen_copy_files: set[str] = set()
+        for index, value in enumerate(copy_files):
+            if not isinstance(value, str) or not value.strip():
+                raise AggregateConfigError(
+                    f"workspace component {component_id} workspaceCopyFiles[{index}] "
+                    "must be a non-empty string"
+                )
+            relative = relative_path_within(
+                source_path, value.strip(),
+                label=(
+                    f"workspace component {component_id} "
+                    f"workspaceCopyFiles[{index}]"
+                ),
+            )
+            key = relative.casefold()
+            if key in seen_copy_files:
+                raise AggregateConfigError(
+                    f"workspace component {component_id} workspaceCopyFiles "
+                    f"contains duplicate path: {relative}"
+                )
+            seen_copy_files.add(key)
+            normalized_copy_files.append(relative)
         if mode == "worktree":
             worktree_path = str(resolve_path_within(
                 workspace_root,
@@ -328,6 +386,7 @@ class WorkspaceComponent:
             base_branch=base_branch,
             base_commit=base_commit,
             task_branch=task_branch,
+            workspace_copy_files=tuple(normalized_copy_files),
         )
 
     def to_dict(self) -> dict:
@@ -344,6 +403,8 @@ class WorkspaceComponent:
             data["baseCommit"] = self.base_commit
         if self.task_branch:
             data["taskBranch"] = self.task_branch
+        if self.workspace_copy_files:
+            data["workspaceCopyFiles"] = list(self.workspace_copy_files)
         return data
 
 

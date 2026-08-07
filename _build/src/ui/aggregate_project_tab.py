@@ -741,6 +741,12 @@ class AggregateProjectTab(QWidget):
 
     def _open_in_codex(self, target: Path) -> None:
         command = open_in_codex_args(target)
+        if not command:
+            QMessageBox.warning(
+                self, "启动 Codex 失败",
+                "没有找到 Codex Desktop，请先安装或配置 CODEX_DESKTOP_EXE。",
+            )
+            return
         try:
             subprocess.Popen(
                 command, cwd=str(target), creationflags=CREATE_NO_WINDOW, close_fds=True,

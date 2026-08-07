@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -14,7 +15,9 @@ from src.core.aggregate_workspace import (
     AggregateProject, DevelopmentWorkspace, WorkspaceComponent,
     save_development_workspace, validate_stable_id,
 )
-from src.core.path_utils import canonical_path, is_path_within, normalized_path_key
+from src.core.path_utils import (
+    canonical_path, is_path_within, normalized_path_key, resolve_path_within,
+)
 from src.util.git_executable import resolve_git_executable
 
 
@@ -38,6 +41,7 @@ class WorkspacePlanComponent:
     base_commit: str = ""
     task_branch: str = ""
     remote: str = ""
+    workspace_copy_files: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -275,6 +279,7 @@ def build_workspace_creation_plan(
             base_commit=base_commit,
             task_branch=task_branch,
             remote=remote,
+            workspace_copy_files=component.workspace_copy_files,
         ))
 
     selected_plans = [item for item in plan_components if item.mode == "worktree"]
@@ -375,6 +380,63 @@ def _context_text(plan: WorkspaceCreationPlan) -> str:
     )
 
 
+def _copy_workspace_files(item: WorkspacePlanComponent) -> list[Path]:
+    source_root = canonical_path(item.source_path)
+    target_root = canonical_path(item.target_path)
+    copied: list[Path] = []
+    try:
+        for relative in item.workspace_copy_files:
+            source = resolve_path_within(
+                source_root, relative,
+                label=f"{item.id} workspaceCopyFiles source",
+            )
+            target = resolve_path_within(
+                target_root, relative,
+                label=f"{item.id} workspaceCopyFiles target",
+            )
+            if source.is_symlink():
+                raise WorkspaceOperationError(
+                    f"{item.id} 白名单文件不能是软链接：{relative}"
+                )
+            if not source.is_file():
+                raise WorkspaceOperationError(
+                    f"{item.id} 白名单文件不存在或不是普通文件：{relative}"
+                )
+            if target.exists() or target.is_symlink():
+                raise WorkspaceOperationError(
+                    f"{item.id} 白名单文件目标已存在：{relative}"
+                )
+            target.parent.mkdir(parents=True, exist_ok=True)
+            copied.append(target)
+            shutil.copy2(source, target)
+        return copied
+    except Exception:
+        for target in reversed(copied):
+            try:
+                target.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise
+
+
+def _unexpected_worktree_status(
+    status: str,
+    workspace_copy_files: tuple[str, ...],
+) -> str:
+    managed = {
+        path.replace("\\", "/").casefold()
+        for path in workspace_copy_files
+    }
+    unexpected: list[str] = []
+    for line in status.splitlines():
+        if line.startswith("?? "):
+            relative = line[3:].replace("\\", "/").casefold()
+            if relative in managed:
+                continue
+        unexpected.append(line)
+    return "\n".join(unexpected)
+
+
 def create_development_workspace(plan: WorkspaceCreationPlan) -> WorkspaceCreationResult:
     operation_key = normalized_path_key(plan.root_path)
     with _OPERATION_LOCK:
@@ -384,6 +446,7 @@ def create_development_workspace(plan: WorkspaceCreationPlan) -> WorkspaceCreati
             )
         _ACTIVE_OPERATIONS.add(operation_key)
     created: list[WorkspacePlanComponent] = []
+    copied_files: dict[str, list[Path]] = {}
     rolled_back: list[str] = []
     try:
         root = Path(plan.root_path)
@@ -398,6 +461,8 @@ def create_development_workspace(plan: WorkspaceCreationPlan) -> WorkspaceCreati
             if code != 0:
                 raise WorkspaceOperationError(err or out or f"创建 {item.id} 失败")
             created.append(item)
+            if item.workspace_copy_files:
+                copied_files[item.id] = _copy_workspace_files(item)
 
         workspace_components = [
             WorkspaceComponent(
@@ -408,6 +473,7 @@ def create_development_workspace(plan: WorkspaceCreationPlan) -> WorkspaceCreati
                 base_branch=item.base_branch,
                 base_commit=item.base_commit,
                 task_branch=item.task_branch,
+                workspace_copy_files=item.workspace_copy_files,
             )
             for item in plan.components
         ]
@@ -430,6 +496,11 @@ def create_development_workspace(plan: WorkspaceCreationPlan) -> WorkspaceCreati
         )
     except Exception as exc:
         for item in reversed(created):
+            for copied in reversed(copied_files.get(item.id, [])):
+                try:
+                    copied.unlink(missing_ok=True)
+                except OSError:
+                    pass
             code, dirty, _err = _run_git(item.target_path, ["status", "--porcelain"], 10)
             if code != 0 or dirty:
                 continue
@@ -502,7 +573,9 @@ def review_development_workspace(
             base_branch=item.base_branch,
             base_commit=item.base_commit,
             task_branch=item.task_branch,
-            changed_files=len(status.splitlines()) if status else 0,
+            changed_files=len(_unexpected_worktree_status(
+                status, item.workspace_copy_files,
+            ).splitlines()) if status else 0,
             commits=tuple(line for line in commits_out.splitlines() if line),
             diff_stat=diff_out,
             pushed=pushed_code == 0 and bool(pushed_out),
@@ -524,7 +597,7 @@ def _merge_preflight_error(item: WorkspaceComponent) -> str:
     code, status, err = _run_git(item.worktree_path, ["status", "--porcelain"], 15)
     if code != 0:
         return err or "无法读取工作区状态"
-    if status:
+    if _unexpected_worktree_status(status, item.workspace_copy_files):
         return "工作区有未提交或未跟踪文件"
     code, branch, err = _run_git(
         item.worktree_path, ["branch", "--show-current"], 10,
@@ -676,7 +749,7 @@ def _sync_preflight_error(item: WorkspaceComponent) -> str:
     code, status, err = _run_git(item.worktree_path, ["status", "--porcelain"], 15)
     if code != 0:
         return err or "无法读取工作区状态"
-    if status:
+    if _unexpected_worktree_status(status, item.workspace_copy_files):
         return "工作区有未提交或未跟踪文件"
     code, branch, err = _run_git(item.worktree_path, ["branch", "--show-current"], 10)
     if code != 0:
@@ -861,7 +934,9 @@ def inspect_workspace_delete(
         if item.mode != "worktree":
             continue
         code, status, err = _run_git(item.worktree_path, ["status", "--porcelain"], 15)
-        dirty = code != 0 or bool(status)
+        dirty = code != 0 or bool(_unexpected_worktree_status(
+            status, item.workspace_copy_files,
+        ))
         pushed_code, pushed_out, _ = _run_git(
             item.source_repository_path,
             ["branch", "-r", "--contains", item.task_branch], 15,
@@ -916,6 +991,18 @@ def delete_development_workspace(
         for item in plan.workspace.components:
             if item.mode != "worktree":
                 continue
+            for relative in item.workspace_copy_files:
+                try:
+                    target = resolve_path_within(
+                        item.worktree_path, relative,
+                        label=f"{item.id} workspaceCopyFiles target",
+                    )
+                    target.unlink(missing_ok=True)
+                except (OSError, ValueError) as exc:
+                    return (
+                        False, tuple(kept_branches),
+                        f"删除 {item.id} 白名单文件失败：{exc}",
+                    )
             code, out, err = _run_git(
                 item.source_repository_path,
                 ["worktree", "remove", item.worktree_path],

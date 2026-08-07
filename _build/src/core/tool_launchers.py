@@ -1,6 +1,7 @@
 """Launch command builders for external coding tools."""
 from __future__ import annotations
 
+import os
 import shutil
 import winreg
 from pathlib import Path
@@ -14,6 +15,17 @@ _CC_REGISTRY_COMMANDS = [
     (winreg.HKEY_CLASSES_ROOT, r"Directory\Background\shell\Claude Code\command"),
 ]
 
+_CODEX_DESKTOP_APP_PATHS = [
+    (winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\App Paths\Codex Desktop.exe"),
+    (winreg.HKEY_LOCAL_MACHINE, r"Software\Microsoft\Windows\CurrentVersion\App Paths\Codex Desktop.exe"),
+]
+
+_CODEX_DESKTOP_UNINSTALL_ROOTS = [
+    (winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Uninstall"),
+    (winreg.HKEY_LOCAL_MACHINE, r"Software\Microsoft\Windows\CurrentVersion\Uninstall"),
+    (winreg.HKEY_LOCAL_MACHINE, r"Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
+]
+
 
 def find_powershell() -> str:
     for name in ("pwsh.exe", "pwsh", "powershell.exe", "powershell"):
@@ -23,24 +35,60 @@ def find_powershell() -> str:
     return ""
 
 
-def open_in_codex_args(target_dir: Path) -> list[str]:
-    """Build a portable Codex launcher for the current machine."""
-    target = str(target_dir)
-    wt = shutil.which("wt.exe") or shutil.which("wt")
-    ps = find_powershell()
-    if wt and ps:
-        return [
-            wt, "-w", "0", "new-tab", "-d", target,
-            ps, "-NoExit", "-NoLogo", "-Command", "codex",
-        ]
+def _codex_desktop_candidate(value: str) -> Path | None:
+    raw = os.path.expandvars((value or "").strip())
+    if not raw:
+        return None
+    if raw.startswith('"'):
+        end = raw.find('"', 1)
+        raw = raw[1:end] if end > 1 else raw.strip('"')
+    raw = raw.rsplit(",", 1)[0].strip()
+    candidate = Path(raw)
+    return candidate if candidate.is_file() else None
 
-    cmd = shutil.which("cmd.exe") or "cmd.exe"
-    if ps:
-        return [
-            cmd, "/c", "start", "", "/D", target,
-            ps, "-NoExit", "-NoLogo", "-Command", "codex",
-        ]
-    return [cmd, "/c", "start", "", "/D", target, cmd, "/k", "codex"]
+
+def find_codex_desktop() -> Path | None:
+    """Locate the installed Codex Desktop executable without hard-coding a drive."""
+    configured = _codex_desktop_candidate(os.environ.get("CODEX_DESKTOP_EXE", ""))
+    if configured:
+        return configured
+
+    for hive, subkey in _CODEX_DESKTOP_APP_PATHS:
+        try:
+            with winreg.OpenKey(hive, subkey) as key:
+                value, _kind = winreg.QueryValueEx(key, "")
+        except OSError:
+            continue
+        candidate = _codex_desktop_candidate(str(value))
+        if candidate:
+            return candidate
+
+    for hive, root in _CODEX_DESKTOP_UNINSTALL_ROOTS:
+        try:
+            with winreg.OpenKey(hive, root) as uninstall_root:
+                subkey_count = winreg.QueryInfoKey(uninstall_root)[0]
+                subkeys = [winreg.EnumKey(uninstall_root, index) for index in range(subkey_count)]
+        except OSError:
+            continue
+        for name in subkeys:
+            try:
+                with winreg.OpenKey(hive, f"{root}\\{name}") as key:
+                    display_name = str(winreg.QueryValueEx(key, "DisplayName")[0])
+                    if not display_name.lower().startswith("codex desktop"):
+                        continue
+                    display_icon = str(winreg.QueryValueEx(key, "DisplayIcon")[0])
+            except OSError:
+                continue
+            candidate = _codex_desktop_candidate(display_icon)
+            if candidate:
+                return candidate
+    return None
+
+
+def open_in_codex_args(target_dir: Path) -> list[str]:
+    """Open a new Codex Desktop session for target_dir."""
+    executable = find_codex_desktop()
+    return [str(executable), "--", "--cwd", str(target_dir)] if executable else []
 
 
 def open_in_cc_command(target_dir: Path) -> str:

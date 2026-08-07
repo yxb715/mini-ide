@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot
+from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal, Slot
 from PySide6.QtNetwork import QLocalSocket
 
 if TYPE_CHECKING:
@@ -524,6 +524,12 @@ class _GitDiffResponder(QObject):
         self.worker = worker
 
     @Slot(dict)
+    def receive(self, payload: dict) -> None:
+        # PySide 对被子类覆盖的 Python slot 可能绕过 receiver 的线程归属。
+        # 信号固定连接到这个未覆盖的入口，再由 GUI 线程分派具体处理。
+        self.finish(payload)
+
+    @Slot(dict)
     def finish(self, payload: dict) -> None:
         if self.sock.state() == QLocalSocket.LocalSocketState.ConnectedState:
             _send_response(self.sock, payload)
@@ -549,18 +555,34 @@ class _WorkspaceCommandResponder(_GitDiffResponder):
         result = dict(payload)
         open_path = result.pop("_open_path", "")
         if result.get("ok") and open_path:
-            tab = self.window.open_development_workspace(open_path, quiet=True)
-            if tab is None:
+            if QThread.currentThread() != self.window.thread():
+                log.critical("CLI 打开工作区结果未切回 GUI 主线程: %s", open_path)
                 result = {
                     "ok": False,
-                    "error": f"open workspace failed: {open_path}",
+                    "error": "open workspace callback is not on the GUI thread",
                 }
             else:
-                result["environment"] = _environment_snapshot(tab)
+                tab = self.window.open_development_workspace(open_path, quiet=True)
+                if tab is None:
+                    result = {
+                        "ok": False,
+                        "error": f"open workspace failed: {open_path}",
+                    }
+                else:
+                    result["environment"] = _environment_snapshot(tab)
         super().finish(result)
 
 
 _active_workers: list[tuple[QThread, QObject, QObject]] = []
+
+
+def _connect_async_worker(worker: QObject, responder: _GitDiffResponder) -> None:
+    """后台结果必须排队回 responder 所属的 GUI 线程。"""
+    worker.done.connect(responder.receive, Qt.ConnectionType.QueuedConnection)
+    worker.done.connect(worker.dispose, Qt.ConnectionType.DirectConnection)
+    responder.thread.finished.connect(
+        responder.cleanup, Qt.ConnectionType.QueuedConnection,
+    )
 
 
 def _run_git_diff_async(tab, mode: str, max_chars: int, sock: QLocalSocket) -> None:
@@ -569,10 +591,8 @@ def _run_git_diff_async(tab, mode: str, max_chars: int, sock: QLocalSocket) -> N
     responder = _GitDiffResponder(sock, thread, worker)
     worker.moveToThread(thread)
 
-    worker.done.connect(responder.finish)
-    worker.done.connect(worker.dispose)
+    _connect_async_worker(worker, responder)
     thread.started.connect(worker.run)
-    thread.finished.connect(responder.cleanup)
     _active_workers.append((thread, worker, responder))
     thread.start()
 
@@ -596,10 +616,8 @@ def _run_workspace_command_async(cmd: dict, window: "MainWindow", sock: QLocalSo
     )
     responder = _WorkspaceCommandResponder(window, sock, thread, worker)
     worker.moveToThread(thread)
-    worker.done.connect(responder.finish)
-    worker.done.connect(worker.dispose)
+    _connect_async_worker(worker, responder)
     thread.started.connect(worker.run)
-    thread.finished.connect(responder.cleanup)
     _active_workers.append((thread, worker, responder))
     thread.start()
 

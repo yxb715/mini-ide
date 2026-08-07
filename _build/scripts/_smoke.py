@@ -330,30 +330,29 @@ def cli_output_encoding_check() -> list[str]:
 
 
 def external_launcher_check() -> list[str]:
-    """验证 Codex 右键入口使用参数数组且保留目标目录。"""
+    """验证 Codex Desktop 入口使用参数数组且保留目标目录。"""
+    import os
+    import tempfile
+
     from src.core import tool_launchers
 
     failed: list[str] = []
     target = Path(r"E:\race workspace\certificate")
-    original_which = tool_launchers.shutil.which
+    original_executable = os.environ.get("CODEX_DESKTOP_EXE")
+    with tempfile.TemporaryDirectory() as temporary:
+        executable = Path(temporary) / "Codex Desktop.exe"
+        executable.touch()
+        os.environ["CODEX_DESKTOP_EXE"] = str(executable)
+        try:
+            args = tool_launchers.open_in_codex_args(target)
+        finally:
+            if original_executable is None:
+                os.environ.pop("CODEX_DESKTOP_EXE", None)
+            else:
+                os.environ["CODEX_DESKTOP_EXE"] = original_executable
 
-    def fake_which(name: str) -> str | None:
-        values = {
-            "wt.exe": r"C:\Windows\wt.exe",
-            "pwsh.exe": r"C:\Program Files\PowerShell\7\pwsh.exe",
-        }
-        return values.get(name)
-
-    tool_launchers.shutil.which = fake_which
-    try:
-        args = tool_launchers.open_in_codex_args(target)
-    finally:
-        tool_launchers.shutil.which = original_which
-
-    if not isinstance(args, list) or str(target) not in args:
-        failed.append("Codex launcher must preserve the target directory in argv")
-    if not args or args[-1] != "codex":
-        failed.append("Codex launcher must invoke the codex command")
+    if args != [str(executable), "--", "--cwd", str(target)]:
+        failed.append("Codex launcher must separate Electron arguments and preserve the target directory")
     if tool_launchers.CREATE_NO_WINDOW != 0x08000000:
         failed.append("Codex launcher subprocess must keep CREATE_NO_WINDOW")
 
@@ -361,7 +360,7 @@ def external_launcher_check() -> list[str]:
         for msg in failed:
             print(f"[FAIL] external_launcher: {msg}", flush=True)
     else:
-        print("[OK]   Codex external launcher", flush=True)
+        print("[OK]   Codex Desktop external launcher", flush=True)
     return failed
 
 
@@ -625,6 +624,10 @@ def development_workspace_lifecycle_check() -> list[str]:
             git("-C", str(repo), "config", "user.email", "smoke@mini-ide.local")
             git("-C", str(repo), "add", "README.md")
             git("-C", str(repo), "commit", "-m", "seed")
+        (repo_one / ".gitignore").write_text(".env\n", encoding="utf-8")
+        (repo_one / ".env").write_text("DEV_TAG=smoke\n", encoding="utf-8")
+        git("-C", str(repo_one), "add", ".gitignore")
+        git("-C", str(repo_one), "commit", "-m", "ignore local env")
         shared.mkdir(parents=True)
         project = AggregateProject.from_dict(root, {
             "schemaVersion": 1,
@@ -633,7 +636,10 @@ def development_workspace_lifecycle_check() -> list[str]:
             "kind": "aggregate",
             "workspaceDirectory": "workspace",
             "components": [
-                {"id": "server", "path": "server", "type": "java"},
+                {
+                    "id": "server", "path": "server", "type": "java",
+                    "workspaceCopyFiles": [".env"],
+                },
                 {"id": "webapp", "path": "webapp", "type": "frontend"},
                 {"id": "nginx", "path": "nginx", "type": "nginx", "shared": True},
             ],
@@ -642,6 +648,22 @@ def development_workspace_lifecycle_check() -> list[str]:
                 "startGroups": [["server", "webapp"], ["nginx"]],
             }],
         })
+        try:
+            AggregateProject.from_dict(root, {
+                "schemaVersion": 1,
+                "id": "invalid-suite",
+                "name": "invalid-suite",
+                "kind": "aggregate",
+                "workspaceDirectory": "workspace",
+                "components": [{
+                    "id": "server", "path": "server", "type": "java",
+                    "workspaceCopyFiles": ["../outside"],
+                }],
+                "profiles": [],
+            })
+            failed.append("workspaceCopyFiles must reject paths outside the component")
+        except ValueError:
+            pass
 
         remote_task_branch = "feature/remote-conflict-server"
         git(
@@ -673,6 +695,16 @@ def development_workspace_lifecycle_check() -> list[str]:
             workspace = result.workspace
             if not (Path(workspace.root_path) / "server" / ".git").is_file():
                 failed.append("selected Git component should be a linked Worktree")
+            copied_env = Path(workspace.root_path) / "server" / ".env"
+            if not copied_env.is_file() or copied_env.read_text(encoding="utf-8") != "DEV_TAG=smoke\n":
+                failed.append("workspaceCopyFiles should copy the configured local file")
+            loaded_server = next(
+                item for item in load_development_workspace(
+                    workspace.root_path, aggregate_project=project,
+                ).components if item.id == "server"
+            )
+            if loaded_server.workspace_copy_files != (".env",):
+                failed.append("workspaceCopyFiles should round-trip in workspace metadata")
             if (Path(workspace.root_path) / "webapp").exists():
                 failed.append("unselected repository must not be copied")
             if (Path(workspace.root_path) / "nginx").exists():
@@ -825,6 +857,8 @@ def development_workspace_lifecycle_check() -> list[str]:
                 ok, kept, error = service.delete_development_workspace(delete_plan)
                 if not ok or error or Path(workspace.root_path).exists():
                     failed.append(f"safe workspace deletion failed: {error}; kept={kept!r}")
+                elif copied_env.exists():
+                    failed.append("workspace deletion should remove managed copied files with the Worktree")
         # 第二个仓库创建失败时，只回滚本次已创建且仍干净的 Worktree。
         partial_plan = service.build_workspace_creation_plan(
             project, "partial", "失败回滚", ["server", "webapp"],
@@ -1597,6 +1631,86 @@ def compile_wait_check() -> list[str]:
     return failed
 
 
+def workspace_cli_thread_check() -> list[str]:
+    """验证工作区 CLI 的 UI 回调始终排队回 GUI 主线程。"""
+    import time
+
+    from PySide6.QtCore import QObject, QThread, Signal, Slot
+    from PySide6.QtNetwork import QLocalSocket
+    from PySide6.QtWidgets import QApplication
+
+    from src.core import cli_server
+
+    failed: list[str] = []
+    app = QApplication.instance() or QApplication([])
+    gui_thread = app.thread()
+    callback_threads = []
+    thread_finished = []
+
+    class Worker(QObject):
+        done = Signal(dict)
+
+        @Slot()
+        def run(self) -> None:
+            self.done.emit({"ok": True, "_open_path": "smoke-workspace"})
+
+        @Slot(dict)
+        def dispose(self, _payload: dict) -> None:
+            self.deleteLater()
+
+    class FakeSocket:
+        def state(self):
+            return QLocalSocket.LocalSocketState.UnconnectedState
+
+    class FakeWindow(QObject):
+        def open_development_workspace(self, _path: str, quiet: bool = False):
+            callback_threads.append(QThread.currentThread())
+            return object()
+
+    thread = QThread()
+    worker = Worker()
+    window = FakeWindow()
+    responder = cli_server._WorkspaceCommandResponder(
+        window, FakeSocket(), thread, worker,
+    )
+    original_snapshot = cli_server._environment_snapshot
+    cli_server._environment_snapshot = lambda _tab: {"id": "smoke"}
+    worker.moveToThread(thread)
+    cli_server._connect_async_worker(worker, responder)
+    thread.started.connect(worker.run)
+    thread.finished.connect(lambda: thread_finished.append(True))
+    tracked = (thread, worker, responder)
+    cli_server._active_workers.append(tracked)
+    try:
+        thread.start()
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and (not thread_finished or not callback_threads):
+            app.processEvents()
+            time.sleep(0.01)
+        app.processEvents()
+        if callback_threads != [gui_thread]:
+            failed.append("workspace UI callback must run exactly once on the GUI thread")
+        if not thread_finished:
+            failed.append("workspace CLI worker thread must stop after responding")
+    finally:
+        cli_server._environment_snapshot = original_snapshot
+        if not thread_finished:
+            try:
+                thread.quit()
+                thread.wait(1000)
+            except RuntimeError:
+                pass
+        if tracked in cli_server._active_workers:
+            cli_server._active_workers.remove(tracked)
+
+    if failed:
+        for msg in failed:
+            print(f"[FAIL] workspace_cli_thread: {msg}", flush=True)
+    else:
+        print("[OK]   workspace CLI callback stays on the GUI thread", flush=True)
+    return failed
+
+
 def cli_response_and_packaging_check() -> list[str]:
     """验证空响应失败语义和独立 console CLI 的打包约束。"""
     from src.core.cli_client import _decode_response
@@ -1803,6 +1917,7 @@ if __name__ == "__main__":
     cli_match_failed = cli_project_match_check()
     launch_guard_failed = launch_and_operation_guard_check()
     compile_wait_failed = compile_wait_check()
+    workspace_cli_thread_failed = workspace_cli_thread_check()
     cli_reliability_failed = cli_response_and_packaging_check()
     file_failed = file_action_check()
     preview_failed = file_preview_model_check()
@@ -1835,7 +1950,8 @@ if __name__ == "__main__":
         + len(cli_encoding_failed) + len(launcher_failed)
         + len(git_executable_failed)
         + len(cli_match_failed) + len(launch_guard_failed)
-        + len(compile_wait_failed) + len(cli_reliability_failed)
+        + len(compile_wait_failed) + len(workspace_cli_thread_failed)
+        + len(cli_reliability_failed)
         + len(file_failed) + len(preview_failed)
         + len(aggregate_scan_failed)
         + len(git_failed) + len(nginx_failed)
