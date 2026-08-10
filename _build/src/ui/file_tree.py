@@ -23,7 +23,7 @@ from src.core.git_ops import (
 )
 from src.core.file_actions import paste_paths
 from src.core.tool_launchers import (
-    CREATE_NO_WINDOW, open_in_cc_command, open_in_codex_args,
+    CREATE_NO_WINDOW, open_in_cc_args, open_in_codex_args,
 )
 from src.ui.theme import (
     ACCENT_SUBTLE, BG_L2, BG_L4, FG_BRIGHT, FG_PRIMARY, GIT_ADD, GIT_CONFLICT,
@@ -1059,12 +1059,12 @@ class FileTree(QWidget):
             self._apply_filter(self.filter_input.text())
 
     def _open_codex(self, target_dir: Path) -> None:
-        """在 Codex Desktop 中为当前目录新建会话。"""
+        """在 AgentDesk 中为 Codex 入口打开当前目录。"""
         command = open_in_codex_args(target_dir)
         if not command:
             QMessageBox.warning(
-                self, "启动 Codex 失败",
-                "没有找到 Codex Desktop，请先安装或配置 CODEX_DESKTOP_EXE。",
+                self, "启动 AgentDesk 失败",
+                "没有找到 AgentDesk，请先安装或配置 AGENTDESK_EXE。",
             )
             return
         try:
@@ -1075,24 +1075,26 @@ class FileTree(QWidget):
                 close_fds=True,
             )
         except OSError as e:
-            QMessageBox.warning(self, "启动 Codex 失败", f"{e}")
+            QMessageBox.warning(self, "启动 AgentDesk 失败", f"{e}")
 
     def _open_cc(self, target_dir: Path) -> None:
-        """在终端中打开 Claude Code (cc)。"""
-        command = open_in_cc_command(target_dir)
+        """在 AgentDesk 中为 cc 入口打开当前目录。"""
+        command = open_in_cc_args(target_dir)
         if not command:
             QMessageBox.warning(
-                self, "启动 Claude Code 失败",
-                "没有找到可用的终端来启动 Claude Code。",
+                self, "启动 AgentDesk 失败",
+                "没有找到 AgentDesk，请先安装或配置 AGENTDESK_EXE。",
             )
             return
         try:
             subprocess.Popen(
                 command,
+                cwd=str(target_dir),
+                creationflags=CREATE_NO_WINDOW,
                 close_fds=True,
             )
         except OSError as e:
-            QMessageBox.warning(self, "启动 Claude Code 失败", f"{e}")
+            QMessageBox.warning(self, "启动 AgentDesk 失败", f"{e}")
 
     def _create_new_file(self, target_dir: Path, default_ext: str = "") -> None:
         """在指定目录下新建文件。用户输入文件名，自动补 default_ext 后缀。"""

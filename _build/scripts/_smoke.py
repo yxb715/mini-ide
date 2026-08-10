@@ -330,7 +330,7 @@ def cli_output_encoding_check() -> list[str]:
 
 
 def external_launcher_check() -> list[str]:
-    """验证 Codex Desktop 入口使用参数数组且保留目标目录。"""
+    """验证 AgentDesk 入口使用参数数组且保留目标目录。"""
     import os
     import tempfile
 
@@ -338,29 +338,36 @@ def external_launcher_check() -> list[str]:
 
     failed: list[str] = []
     target = Path(r"E:\race workspace\certificate")
-    original_executable = os.environ.get("CODEX_DESKTOP_EXE")
+    original_executable = os.environ.get("AGENTDESK_EXE")
     with tempfile.TemporaryDirectory() as temporary:
-        executable = Path(temporary) / "Codex Desktop.exe"
+        executable = Path(temporary) / "AgentDesk.exe"
         executable.touch()
-        os.environ["CODEX_DESKTOP_EXE"] = str(executable)
+        os.environ["AGENTDESK_EXE"] = str(executable)
         try:
-            args = tool_launchers.open_in_codex_args(target)
+            agentdesk_args = tool_launchers.open_in_agentdesk_args(target)
+            codex_args = tool_launchers.open_in_codex_args(target)
+            cc_args = tool_launchers.open_in_cc_args(target)
         finally:
             if original_executable is None:
-                os.environ.pop("CODEX_DESKTOP_EXE", None)
+                os.environ.pop("AGENTDESK_EXE", None)
             else:
-                os.environ["CODEX_DESKTOP_EXE"] = original_executable
+                os.environ["AGENTDESK_EXE"] = original_executable
 
-    if args != [str(executable), "--", "--cwd", str(target)]:
-        failed.append("Codex launcher must separate Electron arguments and preserve the target directory")
+    base = [str(executable), "--", "--cwd", str(target)]
+    if agentdesk_args != base:
+        failed.append("AgentDesk launcher must separate Electron arguments and preserve the target directory")
+    if codex_args != [*base, "--provider=codex"]:
+        failed.append("Codex entry must launch the Codex provider in AgentDesk")
+    if cc_args != [*base, "--provider=claude"]:
+        failed.append("cc entry must launch the Claude provider in AgentDesk")
     if tool_launchers.CREATE_NO_WINDOW != 0x08000000:
-        failed.append("Codex launcher subprocess must keep CREATE_NO_WINDOW")
+        failed.append("AgentDesk launcher subprocess must keep CREATE_NO_WINDOW")
 
     if failed:
         for msg in failed:
             print(f"[FAIL] external_launcher: {msg}", flush=True)
     else:
-        print("[OK]   Codex Desktop external launcher", flush=True)
+        print("[OK]   AgentDesk external launcher", flush=True)
     return failed
 
 
@@ -949,7 +956,7 @@ def aggregate_runtime_ui_check() -> list[str]:
                 tab.codex_button, tab.cc_button,
             )
         ):
-            failed.append("short Codex and cc labels must keep an explanatory tooltip")
+            failed.append("short codex and cc labels must keep an explanatory tooltip")
         if tab._current_environment_root() != Path(project.root_path):
             failed.append("project tools must open the aggregate root in source mode")
         if hasattr(tab, "enter_workspace_button") or hasattr(tab, "review_button"):

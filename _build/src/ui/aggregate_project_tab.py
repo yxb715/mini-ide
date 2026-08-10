@@ -33,7 +33,7 @@ from src.core.service_state import (
     STATE_RUNNING_EXTERNAL, STATE_STARTING, STATE_STOPPING, STATE_UNKNOWN,
 )
 from src.core.tool_launchers import (
-    CREATE_NO_WINDOW, open_in_cc_command, open_in_codex_args,
+    CREATE_NO_WINDOW, open_in_cc_args, open_in_codex_args,
 )
 from src.ui.aggregate_project_dialog import AggregateProjectDialog
 from src.ui.development_workspace_dialog import DevelopmentWorkspaceDialog
@@ -281,11 +281,11 @@ class AggregateProjectTab(QWidget):
         progress_row.setSpacing(GAP_SM)
         progress_row.addWidget(self.project_progress, 1)
         self.project_codex_button = QPushButton("codex")
-        self.project_codex_button.setToolTip("在 codex 中打开当前代码环境")
+        self.project_codex_button.setToolTip("在 AgentDesk 中打开当前代码环境")
         self.project_codex_button.clicked.connect(self._open_current_in_codex)
         progress_row.addWidget(self.project_codex_button)
         self.project_cc_button = QPushButton("cc")
-        self.project_cc_button.setToolTip("在 cc 中打开当前代码环境")
+        self.project_cc_button.setToolTip("在 AgentDesk 中打开当前代码环境")
         self.project_cc_button.clicked.connect(self._open_current_in_cc)
         progress_row.addWidget(self.project_cc_button)
         layout.addLayout(progress_row)
@@ -341,11 +341,11 @@ class AggregateProjectTab(QWidget):
         self.new_workspace_button.clicked.connect(self._create_workspace)
         actions.addWidget(self.new_workspace_button)
         self.codex_button = QPushButton("codex")
-        self.codex_button.setToolTip("在 codex 中打开选中的需求工作区")
+        self.codex_button.setToolTip("在 AgentDesk 中打开选中的需求工作区")
         self.codex_button.clicked.connect(self._open_selected_in_codex)
         actions.addWidget(self.codex_button)
         self.cc_button = QPushButton("cc")
-        self.cc_button.setToolTip("在 cc 中打开选中的需求工作区")
+        self.cc_button.setToolTip("在 AgentDesk 中打开选中的需求工作区")
         self.cc_button.clicked.connect(self._open_selected_in_cc)
         actions.addWidget(self.cc_button)
         self.sync_button = QPushButton("同步源分支")
@@ -739,12 +739,11 @@ class AggregateProjectTab(QWidget):
             else self.aggregate_project.root_path
         )
 
-    def _open_in_codex(self, target: Path) -> None:
-        command = open_in_codex_args(target)
+    def _open_external_tool(self, target: Path, command: list[str]) -> None:
         if not command:
             QMessageBox.warning(
-                self, "启动 Codex 失败",
-                "没有找到 Codex Desktop，请先安装或配置 CODEX_DESKTOP_EXE。",
+                self, "启动 AgentDesk 失败",
+                "没有找到 AgentDesk，请先安装或配置 AGENTDESK_EXE。",
             )
             return
         try:
@@ -752,35 +751,27 @@ class AggregateProjectTab(QWidget):
                 command, cwd=str(target), creationflags=CREATE_NO_WINDOW, close_fds=True,
             )
         except OSError as exc:
-            QMessageBox.warning(self, "启动 Codex 失败", str(exc))
-
-    def _open_in_cc(self, target: Path) -> None:
-        command = open_in_cc_command(target)
-        if not command:
-            QMessageBox.warning(self, "启动 cc 失败", "没有找到可用的 cc 启动方式。")
-            return
-        try:
-            subprocess.Popen(
-                command, cwd=str(target), creationflags=CREATE_NO_WINDOW, close_fds=True,
-            )
-        except OSError as exc:
-            QMessageBox.warning(self, "启动 cc 失败", str(exc))
+            QMessageBox.warning(self, "启动 AgentDesk 失败", str(exc))
 
     def _open_current_in_codex(self) -> None:
-        self._open_in_codex(self._current_environment_root())
+        target = self._current_environment_root()
+        self._open_external_tool(target, open_in_codex_args(target))
 
     def _open_current_in_cc(self) -> None:
-        self._open_in_cc(self._current_environment_root())
+        target = self._current_environment_root()
+        self._open_external_tool(target, open_in_cc_args(target))
 
     def _open_selected_in_codex(self) -> None:
         summary = self._selected_workspace_summary()
         if summary and summary.workspace is not None:
-            self._open_in_codex(Path(summary.workspace.root_path))
+            target = Path(summary.workspace.root_path)
+            self._open_external_tool(target, open_in_codex_args(target))
 
     def _open_selected_in_cc(self) -> None:
         summary = self._selected_workspace_summary()
         if summary and summary.workspace is not None:
-            self._open_in_cc(Path(summary.workspace.root_path))
+            target = Path(summary.workspace.root_path)
+            self._open_external_tool(target, open_in_cc_args(target))
 
     def _sync_selected_workspace(self) -> None:
         summary = self._selected_workspace_summary()
