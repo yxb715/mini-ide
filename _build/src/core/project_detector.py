@@ -16,6 +16,10 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from src.core.runtime_units import (
+    RuntimeUnit, runtime_kind_for_project, runtime_start_groups,
+)
+
 
 # ---------- 数据结构 ----------
 
@@ -53,6 +57,43 @@ class ProjectMeta:
     # port 从该模块自己的 application*.yml 扫出，扫不到填 None（运行时仍能启动）。
     # main_class 是 @SpringBootApplication 主类全限定名，供外部进程感知按命令行匹配。
     spring_boot_modules: list[tuple[str, str, int | None, str]] = field(default_factory=list)
+    # 统一运行单元。旧字段保留用于 CLI、外部进程感知和兼容旧调用方。
+    runtime_units: list[RuntimeUnit] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if self.runtime_units:
+            return
+        primary = next((profile for profile in self.profiles if profile.primary), None)
+        if primary is None:
+            return
+        profile_names = tuple(profile.name for profile in self.profiles)
+        self.runtime_units.append(RuntimeUnit(
+            id=self.name,
+            name=self.name,
+            kind=runtime_kind_for_project(self.project_type),
+            cwd=self.path,
+            start_profile=primary.name,
+            profile_names=profile_names,
+            expected_port=self.default_port,
+            health_check_path=self.health_check_path,
+            source="detected",
+            metadata={"project_type": self.project_type},
+        ))
+
+    @property
+    def has_multiple_runtimes(self) -> bool:
+        return len(self.runtime_units) >= 2
+
+    def runtime_unit(self, unit_id: str) -> RuntimeUnit | None:
+        key = (unit_id or "").casefold()
+        return next((unit for unit in self.runtime_units if unit.id.casefold() == key), None)
+
+    def runtime_for_profile(self, profile_name: str) -> RuntimeUnit | None:
+        """返回拥有该 profile 的运行单元。"""
+        return next(
+            (unit for unit in self.runtime_units if profile_name in unit.profile_names),
+            None,
+        )
 
 
 # ---------- 工具函数 ----------
@@ -117,9 +158,25 @@ def _scan_spring_profiles(root: Path) -> tuple[list[str], int | None, str]:
             profiles.append(m.group(1))
         content = _read(f, limit=30_000)
         if port is None:
-            m_port = re.search(r"^\s*(?:server\.)?port\s*[:=]\s*(\d+)", content, re.MULTILINE)
+            # Only accept the explicit Spring server port. A loose `port:` match
+            # can mistake Redis/Mongo ports for the HTTP service port.
+            m_port = re.search(r"^\s*server\.port\s*[:=]\s*(\d+)", content, re.MULTILINE)
             if not m_port:
-                m_port = re.search(r"server:\s*\n(?:\s+.*\n)*?\s+port:\s*(\d+)", content)
+                server_indent = None
+                for line in content.splitlines():
+                    stripped = line.strip()
+                    indent = len(line) - len(line.lstrip())
+                    if stripped == "server:":
+                        server_indent = indent
+                        continue
+                    if server_indent is None or not stripped or stripped.startswith("#"):
+                        continue
+                    if indent <= server_indent:
+                        server_indent = None
+                        continue
+                    m_port = re.match(r"port\s*:\s*(\d+)", stripped)
+                    if m_port:
+                        break
             if m_port:
                 port = int(m_port.group(1))
         if not ctx:
@@ -187,6 +244,199 @@ def _find_spring_boot_modules(root: Path, subprojects: list[tuple[str, Path]]) -
     return hits
 
 
+def _workspace_patterns(data: dict, lerna_data: dict | None) -> list[str]:
+    """返回 Node workspace/Lerna 的 package glob，保留配置顺序。"""
+    patterns: list[str] = []
+    raw_workspaces = data.get("workspaces", [])
+    if isinstance(raw_workspaces, list):
+        patterns.extend(str(item).strip() for item in raw_workspaces if str(item).strip())
+    elif isinstance(raw_workspaces, dict):
+        raw_packages = raw_workspaces.get("packages", [])
+        if isinstance(raw_packages, list):
+            patterns.extend(str(item).strip() for item in raw_packages if str(item).strip())
+    if isinstance(lerna_data, dict):
+        raw_packages = lerna_data.get("packages", [])
+        if isinstance(raw_packages, list):
+            patterns.extend(str(item).strip() for item in raw_packages if str(item).strip())
+    result: list[str] = []
+    seen: set[str] = set()
+    for pattern in patterns:
+        key = pattern.casefold()
+        if key not in seen:
+            seen.add(key)
+            result.append(pattern)
+    return result
+
+
+def _pnpm_workspace_patterns(root: Path) -> list[str]:
+    """轻量读取 pnpm-workspace.yaml 的 packages 列表，不额外引入 YAML 依赖。"""
+    content = _read(root / "pnpm-workspace.yaml", limit=50_000)
+    if not content:
+        return []
+    patterns: list[str] = []
+    in_packages = False
+    base_indent = 0
+    for line in content.splitlines():
+        clean = line.split("#", 1)[0].rstrip()
+        if not clean.strip():
+            continue
+        indent = len(clean) - len(clean.lstrip())
+        stripped = clean.strip()
+        if stripped == "packages:":
+            in_packages = True
+            base_indent = indent
+            continue
+        if in_packages and indent <= base_indent and not stripped.startswith("-"):
+            break
+        if in_packages:
+            match = re.match(r"-\s*['\"]?([^'\"]+)['\"]?\s*$", stripped)
+            if match and match.group(1).strip():
+                patterns.append(match.group(1).strip())
+    return patterns
+
+
+def _workspace_packages(root: Path, patterns: list[str]) -> list[tuple[str, Path, dict]]:
+    """展开 workspace package，返回 (package_name, path, package.json)。"""
+    result: list[tuple[str, Path, dict]] = []
+    seen: set[str] = set()
+    for pattern in patterns:
+        # pathlib.glob 只在根目录内展开；忽略 node_modules 和隐藏目录。
+        try:
+            candidates = sorted(root.glob(pattern))
+        except (OSError, ValueError):
+            continue
+        for candidate in candidates:
+            if not candidate.is_dir() or candidate.name.startswith("."):
+                continue
+            if any(part in {"node_modules", ".git", "dist", "build"} for part in candidate.parts):
+                continue
+            pkg_path = candidate / "package.json"
+            if not pkg_path.is_file():
+                continue
+            try:
+                package_data = json.loads(_read(pkg_path))
+            except json.JSONDecodeError:
+                continue
+            package_name = str(package_data.get("name") or candidate.name).strip()
+            key = str(candidate.resolve()).casefold()
+            if not package_name or key in seen:
+                continue
+            seen.add(key)
+            result.append((package_name, candidate, package_data))
+    return result
+
+
+def _workspace_script_name(scripts: dict, action: str, package_name: str) -> str | None:
+    """查找根 package.json 中针对 package 的脚本。
+
+    约定优先支持 `dev-pc-teacher`、`build-pc-teacher`，同时兼容
+    `dev:pc-teacher` 和 `dev --scope=pc-teacher` 形式。
+    """
+    suffix = package_name.strip().lstrip("@").replace("/", "-")
+    candidates = (
+        f"{action}-{suffix}",
+        f"{action}:{suffix}",
+        f"{suffix}:{action}",
+    )
+    for name in candidates:
+        if name in scripts:
+            return name
+    for name, command in scripts.items():
+        if name.startswith(f"{action}-") or name.startswith(f"{action}:"):
+            if re.search(rf"(?:^|[ =])(?:--scope(?:=|\s+))?{re.escape(package_name)}(?:$|\s)", str(command)):
+                return name
+    return None
+
+
+def _workspace_runtime_units(
+    root: Path,
+    data: dict,
+    scripts: dict,
+    pm: str,
+) -> tuple[list[RuntimeUnit], list[RunProfile]]:
+    """把可独立启动的 workspace package 转换为运行单元。"""
+    lerna_data: dict | None = None
+    lerna_path = root / "lerna.json"
+    if lerna_path.is_file():
+        try:
+            raw = json.loads(_read(lerna_path))
+            lerna_data = raw if isinstance(raw, dict) else None
+        except json.JSONDecodeError:
+            lerna_data = None
+    patterns = _workspace_patterns(data, lerna_data)
+    for pattern in _pnpm_workspace_patterns(root):
+        if pattern.casefold() not in {item.casefold() for item in patterns}:
+            patterns.append(pattern)
+    if not patterns:
+        return [], []
+
+    packages = _workspace_packages(root, patterns)
+    units: list[RuntimeUnit] = []
+    profiles: list[RunProfile] = []
+    command_prefix = [pm, "run"]
+    for package_name, package_path, package_data in packages:
+        package_scripts = package_data.get("scripts", {}) or {}
+        dev_script = "dev" if "dev" in package_scripts else None
+        root_dev = _workspace_script_name(scripts, "dev", package_name)
+        start_command: list[str] | None = None
+        start_profile = ""
+        cwd = str(package_path if dev_script and not root_dev else root)
+        if root_dev:
+            start_profile = f"runtime:{package_name}:dev"
+            start_command = [*command_prefix, root_dev]
+        elif dev_script:
+            start_profile = f"runtime:{package_name}:dev"
+            start_command = [*command_prefix, dev_script]
+        if not start_command:
+            # 没有独立 dev 脚本的共享库不是运行单元，但仍可被文件树访问。
+            continue
+
+        profile_names: list[str] = []
+        profiles.append(RunProfile(
+            name=start_profile,
+            label=f"启动 {package_name}",
+            command=start_command,
+            kind="run",
+            icon="▶",
+            description=f"{pm} run {root_dev or dev_script} ({package_name})",
+        ))
+        profile_names.append(start_profile)
+
+        root_build = _workspace_script_name(scripts, "build", package_name)
+        package_build = "build" if "build" in package_scripts else None
+        build_name = root_build or package_build
+        if build_name:
+            build_profile = f"runtime:{package_name}:build"
+            profiles.append(RunProfile(
+                name=build_profile,
+                label=f"打包 {package_name}",
+                command=[*command_prefix, build_name],
+                kind="build",
+                icon="🔒",
+                description=f"{pm} run {build_name} ({package_name})",
+            ))
+            profile_names.append(build_profile)
+
+        package_port = _detect_frontend_dev_port(package_path)
+        unit_id = package_name.replace("/", "-").lstrip("@")
+        units.append(RuntimeUnit(
+            id=unit_id,
+            name=package_name,
+            kind="frontend",
+            cwd=cwd,
+            start_profile=start_profile,
+            profile_names=tuple(profile_names),
+            expected_port=package_port,
+            source="detected",
+            metadata={
+                "adapter": "workspace",
+                "package_name": package_name,
+                "package_path": str(package_path),
+            },
+        ))
+    return units, profiles
+
+
 # ---------- 具体识别器 ----------
 
 def _detect_gradle(root: Path) -> ProjectMeta | None:
@@ -232,6 +482,7 @@ def _detect_gradle(root: Path) -> ProjectMeta | None:
         # 主类用于外部进程感知——gradle bootRun 把 classpath 塞进 Temp jar 后，
         # 进程命令行里没有项目路径，只剩主类名，靠它才能认出本项目的服务进程。
         module_list: list[tuple[str, str, int | None, str]] = []
+        runtime_units: list[RuntimeUnit] = []
         if boot_modules:
             run_module = boot_modules[0][0]
             main_class = boot_modules[0][2]
@@ -299,6 +550,28 @@ def _detect_gradle(root: Path) -> ProjectMeta | None:
                 pre_compile=True,
             ))
 
+        # 只要发现 Spring Boot 子模块就暴露 RuntimeUnit。单子模块仍使用项目级
+        # runner，但保留旧的子模块 ID，避免旧 CLI/脚本出现 module not found。
+        if boot_modules:
+            for index, (mod_name, mod_path, main_cls, scan) in enumerate(per_module_scan):
+                profile_name = "bootRun" if index == 0 else f"bootRun:{mod_name}"
+                runtime_units.append(RuntimeUnit(
+                    id=mod_name,
+                    name=mod_name.rsplit(":", 1)[-1],
+                    kind="service",
+                    cwd=str(root),
+                    start_profile=profile_name,
+                    profile_names=("compile", profile_name, "clean"),
+                    expected_port=scan[1],
+                    health_check_path=f"{scan[2]}/actuator/health" if scan[2] else "/actuator/health",
+                    source="detected",
+                    metadata={
+                        "adapter": "spring-gradle",
+                        "module_path": str(mod_path),
+                        "main_class": main_cls,
+                    },
+                ))
+
         return ProjectMeta(
             path=str(root),
             name=name,
@@ -314,6 +587,7 @@ def _detect_gradle(root: Path) -> ProjectMeta | None:
             spring_profiles=profiles_list,
             notes=notes,
             spring_boot_modules=module_list,
+            runtime_units=runtime_units,
         )
 
     # 普通 Gradle Java
@@ -414,16 +688,17 @@ def _detect_node(root: Path) -> ProjectMeta | None:
     run_word = "run" if pm in ("npm", "yarn", "bun") else "run"
     # yarn 可省略 run，但统一写上兼容性更好
 
+    configured_port = _detect_frontend_dev_port(root)
     if has_next:
-        ptype, disp, icon, port = "next", "Next.js", "▲", 3000
+        ptype, disp, icon, port = "next", "Next.js", "▲", configured_port or 3000
     elif has_nuxt:
-        ptype, disp, icon, port = "nuxt", "Nuxt", "💚", 3000
+        ptype, disp, icon, port = "nuxt", "Nuxt", "💚", configured_port or 3000
     elif has_vue:
-        ptype, disp, icon, port = "vue", "Vue", "💚", 5173
+        ptype, disp, icon, port = "vue", "Vue", "💚", configured_port or 5173
     elif has_react:
-        ptype, disp, icon, port = "react", "React", "⚛", 3000
+        ptype, disp, icon, port = "react", "React", "⚛", configured_port or 3000
     elif has_svelte:
-        ptype, disp, icon, port = "svelte", "Svelte", "🔥", 5173
+        ptype, disp, icon, port = "svelte", "Svelte", "🔥", configured_port or 5173
     else:
         ptype, disp, icon, port = "node", "Node.js", "🟨", None
 
@@ -482,6 +757,16 @@ def _detect_node(root: Path) -> ProjectMeta | None:
             description=scripts.get(s, ""),
         ))
 
+    runtime_units, runtime_profiles = _workspace_runtime_units(
+        root, data, scripts, pm,
+    )
+    profiles.extend(runtime_profiles)
+    if runtime_units:
+        ptype = "frontend-workspace"
+        disp = "前端聚合 (Lerna)" if (root / "lerna.json").is_file() else "前端工作区"
+        icon = "🧩"
+        port = None
+
     return ProjectMeta(
         path=str(root),
         name=name,
@@ -492,7 +777,34 @@ def _detect_node(root: Path) -> ProjectMeta | None:
         default_port=port,
         ignored_dirs=["node_modules", "dist", ".nuxt", ".next", ".output", "build"],
         profiles=profiles,
+        runtime_units=runtime_units,
     )
+
+
+def _detect_frontend_dev_port(root: Path) -> int | None:
+    """读取常见前端开发服务器配置中的端口。"""
+    candidates = (
+        root / "config" / "index.js",
+        root / "vue.config.js",
+        root / "vite.config.js",
+        root / "vite.config.ts",
+        root / "webpack.config.js",
+        root / "webpack.config.ts",
+    )
+    for path in candidates:
+        content = _read(path, limit=50_000)
+        if not content:
+            continue
+        for pattern in (
+            r"(?:^|\n)\s*port\s*:\s*(\d+)",
+            r"\bserver\.port\s*[:=]\s*(\d+)",
+            r"--port\s+(\d+)",
+            r"\bPORT\s*=\s*(\d+)",
+        ):
+            match = re.search(pattern, content)
+            if match:
+                return int(match.group(1))
+    return None
 
 
 def _detect_python(root: Path) -> ProjectMeta | None:
@@ -694,18 +1006,170 @@ def _detect_nginx(root: Path) -> ProjectMeta | None:
     )
 
 
+def _runtime_command(value, label: str) -> list[str]:
+    if not isinstance(value, list) or not value:
+        raise ValueError(f"{label} must be a non-empty argv array")
+    command = []
+    for index, item in enumerate(value):
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError(f"{label}[{index}] must be a non-empty string")
+        command.append(item)
+    return command
+
+
+def _runtime_cwd(root: Path, value, label: str) -> str:
+    text = str(value or ".").strip() or "."
+    candidate = (root / text).resolve()
+    base = root.resolve()
+    try:
+        candidate.relative_to(base)
+    except ValueError as exc:
+        raise ValueError(f"{label} must stay inside project root") from exc
+    if not candidate.is_dir():
+        raise ValueError(f"{label} directory not found: {text}")
+    return str(candidate)
+
+
+def _apply_runtime_config(meta: ProjectMeta, config: dict | None) -> ProjectMeta:
+    """用显式配置覆盖自动识别的运行单元。"""
+    if not config:
+        return meta
+    if not isinstance(config, dict):
+        raise ValueError("runtime config must be an object")
+    raw_units = config.get("units")
+    if raw_units is None:
+        return meta
+    if not isinstance(raw_units, list) or not raw_units:
+        raise ValueError("runtime units must be a non-empty array")
+
+    root = Path(meta.path)
+    units: list[RuntimeUnit] = []
+    used: set[str] = set()
+    configured_profiles: list[RunProfile] = []
+    for index, raw in enumerate(raw_units):
+        if not isinstance(raw, dict):
+            raise ValueError(f"runtime units[{index}] must be an object")
+        unit_id = str(raw.get("id") or "").strip()
+        if not unit_id:
+            raise ValueError(f"runtime units[{index}].id is required")
+        key = unit_id.casefold()
+        if key in used:
+            raise ValueError(f"duplicate runtime unit id: {unit_id}")
+        used.add(key)
+        name = str(raw.get("name") or unit_id).strip() or unit_id
+        cwd = _runtime_cwd(root, raw.get("cwd", "."), f"runtime {unit_id} cwd")
+        start = _runtime_command(raw.get("start"), f"runtime {unit_id} start")
+        start_profile = f"configured:{unit_id}:start"
+        configured_profiles.append(RunProfile(
+            name=start_profile,
+            label=f"启动 {name}",
+            command=start,
+            kind="run",
+            icon="▶",
+            description=f"显式配置的运行单元 {name}",
+            primary=len(raw_units) == 1,
+        ))
+        profile_names = [start_profile]
+        raw_profiles = raw.get("profiles", {})
+        if raw_profiles is not None and not isinstance(raw_profiles, dict):
+            raise ValueError(f"runtime {unit_id} profiles must be an object")
+        for action, command_value in (raw_profiles or {}).items():
+            action_name = str(action or "").strip()
+            if not action_name:
+                raise ValueError(f"runtime {unit_id} profile name is required")
+            command = _runtime_command(
+                command_value, f"runtime {unit_id} profile {action_name}",
+            )
+            profile_name = f"configured:{unit_id}:{action_name}"
+            kind = action_name if action_name in {"build", "clean", "test", "compile"} else "run"
+            configured_profiles.append(RunProfile(
+                name=profile_name,
+                label=f"{action_name} {name}",
+                command=command,
+                kind=kind,
+                icon="",
+            ))
+            profile_names.append(profile_name)
+        expected_port = raw.get("expectedPort")
+        if expected_port is not None and (
+            not isinstance(expected_port, int) or isinstance(expected_port, bool)
+            or not 1 <= expected_port <= 65535
+        ):
+            raise ValueError(f"runtime {unit_id} expectedPort must be 1..65535")
+        raw_depends = raw.get("dependsOn", [])
+        if not isinstance(raw_depends, list):
+            raise ValueError(f"runtime {unit_id} dependsOn must be an array")
+        depends_on = tuple(str(item).strip() for item in raw_depends if str(item).strip())
+        stop = raw.get("stop")
+        stop_command = _runtime_command(stop, f"runtime {unit_id} stop") if stop is not None else []
+        units.append(RuntimeUnit(
+            id=unit_id,
+            name=name,
+            kind=str(raw.get("kind") or runtime_kind_for_project(meta.project_type)),
+            cwd=cwd,
+            start_profile=start_profile,
+            profile_names=tuple(profile_names),
+            expected_port=expected_port,
+            health_check_path=str(raw.get("healthCheckPath") or ""),
+            stop_command=tuple(stop_command),
+            depends_on=depends_on,
+            source="configured",
+            metadata={
+                "adapter": str(config.get("detector") or "configured"),
+                "stop_command": stop_command,
+            },
+        ))
+
+    ids = {unit.id.casefold() for unit in units}
+    for unit in units:
+        for dependency in unit.depends_on:
+            if dependency.casefold() not in ids:
+                raise ValueError(
+                    f"runtime {unit.id} depends on unknown unit: {dependency}"
+                )
+            if dependency.casefold() == unit.id.casefold():
+                raise ValueError(f"runtime {unit.id} cannot depend on itself")
+    # 显式配置拥有最高优先级，不能让旧探测器留下的 primary 抢先启动。
+    for profile in meta.profiles:
+        profile.primary = False
+    meta.profiles.extend(configured_profiles)
+    meta.runtime_units = units
+    # 显式运行单元覆盖 Spring 自动模块，避免外部 JVM 探测混入旧模块 ID。
+    meta.spring_boot_modules = []
+    runtime_start_groups(units)
+    if len(units) == 1:
+        meta.default_port = units[0].expected_port
+        meta.health_check_path = units[0].health_check_path
+    return meta
+
+
+def _local_runtime_config(root: Path) -> dict:
+    path = root / ".mini-ide" / "runtime.json"
+    if not path.is_file():
+        return {}
+    try:
+        raw = json.loads(_read(path))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid runtime config: {path}") from exc
+    if not isinstance(raw, dict):
+        raise ValueError(f"runtime config must be an object: {path}")
+    return raw
+
+
 # ---------- 对外入口 ----------
 
-def detect_project(path: str) -> ProjectMeta:
+def detect_project(path: str, runtime_config: dict | None = None) -> ProjectMeta:
     """按优先级探测项目类型，识别不出时返回 generic。"""
     root = Path(path)
 
     for detector in (_detect_gradle, _detect_maven, _detect_node, _detect_python, _detect_go, _detect_nginx):
         meta = detector(root)
         if meta:
-            return meta
+            merged = dict(runtime_config or {})
+            merged.update(_local_runtime_config(root))
+            return _apply_runtime_config(meta, merged)
 
-    return ProjectMeta(
+    meta = ProjectMeta(
         path=str(root),
         name=root.name,
         project_type="generic",
@@ -714,3 +1178,6 @@ def detect_project(path: str) -> ProjectMeta:
         ignored_dirs=[".git", ".idea", ".vscode", "node_modules", "build", "target", "__pycache__"],
         notes=["未识别出已知的项目类型，请手动配置运行命令"],
     )
+    merged = dict(runtime_config or {})
+    merged.update(_local_runtime_config(root))
+    return _apply_runtime_config(meta, merged)

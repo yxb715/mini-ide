@@ -167,6 +167,7 @@ def _parse_args(argv: list[str]) -> dict | None:
         "status": "status",
         "list-projects": "list-projects",
         "list-modules": "list-modules",
+        "list-runtimes": "list-runtimes",
         "open": "open",
         "close": "close",
         "list-workspaces": "list-workspaces",
@@ -277,7 +278,7 @@ def _parse_args(argv: list[str]) -> dict | None:
             return None
         return result
 
-    if cmd_name == "list-modules":
+    if cmd_name in ("list-modules", "list-runtimes"):
         if not rest:
             return None
         result["project"] = rest[0]
@@ -574,6 +575,7 @@ def _print_usage():
         "  --status                     Snapshot IDE/projects/services/workspaces\n"
         "  --list-projects              List all open projects\n"
         "  --list-modules <project>     List modules of a project\n"
+        "  --list-runtimes <project>    List runtime units of a project\n"
         "  --open <path>                Open a project path in the running IDE\n"
         "  --close <project>            Stop services and close a project tab\n"
         "  --list-workspaces            List aggregate development workspaces\n"

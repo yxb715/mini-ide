@@ -63,6 +63,8 @@ STATUS_REFRESH_MS = 3000
 GIT_FETCH_INTERVAL_MS = 5 * 60 * 1000
 GIT_FETCH_INITIAL_DELAY_MS = 8000
 MODULE_STOP_TIMEOUT_MS = 10000
+RUNTIME_STOP_COMMAND_TIMEOUT_MS = 3000
+RUNTIME_STOP_GRACE_MS = 3000
 RESTART_GAP_MS = 1800
 COMPILE_THEN_RUN_GAP_MS = 300
 
@@ -151,9 +153,9 @@ class ProjectTab(QWidget):
         self.config = config
         self.path = meta.path
 
-        # 多模块（Spring Cloud 那种）：每个 @SpringBootApplication 子模块一个独立 runner。
-        # 单模块项目这里就是 False，走 self.runner 的传统路径，行为 100% 不变。
-        self._is_multi_module = len(meta.spring_boot_modules) >= 2
+        # 多运行单元项目：Spring 服务、Lerna 角色等各有独立 runner。
+        # 名称保留用于兼容 CLI 和旧测试，判断依据已改为通用运行单元。
+        self._is_multi_module = bool(getattr(meta, "has_multiple_runtimes", False))
 
         # 是否 git 仓库：启动时判一次缓存住。非 git 项目不起染色/状态栏 worker，
         # 省得每 3s 白跑一堆注定失败的 git 子进程。
@@ -167,10 +169,12 @@ class ProjectTab(QWidget):
         self.runner.finished.connect(self._on_finished)
         self.service_controller = ProjectServiceController(self)
 
-        # 每个 Spring Boot 子模块独立的 runner + 日志 widget（仅多模块时有内容）
+        # 每个运行单元独立的 runner + 日志 widget（仅多运行单元时有内容）
         self.module_runners: dict[str, ProcessRunner] = {}
         self.module_logs: dict[str, LogWidget] = {}
         self._module_current: dict[str, RunProfile] = {}
+        # 显式 stop 命令使用独立 runner，不能覆盖仍在运行的服务 runner。
+        self._runtime_stop_runners: dict[str, ProcessRunner] = {}
         # 模块启动日志里抓到的真实监听端口（覆盖 application.yml 默认值）
         self._module_ports: dict[str, int] = {}
         # 用户关 tab 触发 stop 的模块集合；finished 时自动清理 tab
@@ -178,6 +182,7 @@ class ProjectTab(QWidget):
         # 「外部启动感知」：非 mini-ide 拉起、但端口快照里按 cmdline 匹配到的模块 → pid。
         # 这些模块面板显示「运行中(外部)」，停止按钮走 kill_pid 而非 runner.stop()。
         self._module_external_pids: dict[str, int] = {}
+        self._runtime_start_generation = 0
         self._nginx_status = None
         # 外部进程感知器：构造时一次性预算各模块的 match keys（模块列表不变），
         # 之后每轮刷新只做匹配。从 ProjectTab 抽到 core.external_detector 便于单测。
@@ -259,9 +264,14 @@ class ProjectTab(QWidget):
         if self._is_multi_module:
             left_wrap = QSplitter(Qt.Orientation.Vertical)
             left_wrap.setHandleWidth(2)
+            unit_title = "角色" if self.project_meta.project_type == "frontend-workspace" else "服务"
             self.service_panel = ServicePanel(
-                [(name, port) for name, _path, port, _cls in self.project_meta.spring_boot_modules],
+                [
+                    (unit.id, unit.name, unit.expected_port)
+                    for unit in self.project_meta.runtime_units
+                ],
                 parent=self,
+                title=unit_title,
             )
             self.service_panel.startRequested.connect(self._start_module)
             self.service_panel.stopRequested.connect(self._stop_module)
@@ -426,7 +436,7 @@ class ProjectTab(QWidget):
             # 事件驱动重启：记下待启动 profile，停止完成后由 _on_finished 接力，
             # 不赌固定延时——慢停止时既不会重复弹框，也不会叠加定时器。
             self._pending_restart = prof
-            self.runner.stop()
+            self._stop()
             return
 
         # 启动前强制编译
@@ -461,8 +471,9 @@ class ProjectTab(QWidget):
                 return False
         self._current_profile = prof
         self.log.begin_run(f"{self.project_meta.name}-{prof.name}")
+        runtime = self.project_meta.runtime_for_profile(prof.name)
         ctx = RunContext(
-            cwd=self.project_meta.path,
+            cwd=runtime.cwd if runtime is not None else self.project_meta.path,
             env={},
             jvm_opts="-Xmx768m -Xms256m",
             spring_profile="",
@@ -481,10 +492,20 @@ class ProjectTab(QWidget):
             self.service_controller.launch_started(None, generation, self.runner)
         return True
 
-    def _stop(self) -> None:
+    def _stop(self) -> bool:
         action_log.info("[GUI] 停止服务 project=%s", self.project_meta.name)
         self._pending_after_compile = None
-        self.runner.stop()
+        runtime = None
+        if self._current_profile is not None:
+            runtime = self.project_meta.runtime_for_profile(self._current_profile.name)
+        if runtime is None and len(self.project_meta.runtime_units) == 1:
+            runtime = self.project_meta.runtime_units[0]
+        if runtime is not None and runtime.stop_command:
+            return self._start_runtime_stop(runtime, self.runner, None)
+        if self.service_controller.runner_busy(self.runner):
+            self.runner.stop()
+            return True
+        return False
 
     def _on_main_clicked(self) -> None:
         """主按钮点击：根据当前状态决定启动 or 停止"""
@@ -539,14 +560,24 @@ class ProjectTab(QWidget):
         if self.service_controller.runner_busy(self.runner):
             # 同 _run_profile：事件驱动，停止完成后由 _on_finished 接力启动
             self._pending_restart = primary
-            self.runner.stop()
+            self._stop()
         else:
             self._run_profile(primary)
 
-    # ---- 多模块（Spring Cloud）专用动作 ----
+    # ---- 多运行单元动作 ----
 
     def _find_module_run_profile(self, module: str) -> RunProfile | None:
-        """模块名 → 对应的 bootRun RunProfile（project_detector 已生成）"""
+        """运行单元 ID → 对应的启动 profile。"""
+        unit = self.project_meta.runtime_unit(module)
+        if unit is not None and unit.start_profile:
+            profile = next(
+                (item for item in self.project_meta.profiles
+                 if item.name == unit.start_profile),
+                None,
+            )
+            if profile is not None:
+                return profile
+        # 兼容旧 Spring 元数据。
         # 子模块：profile.name == f"bootRun:{module}"
         for p in self.project_meta.profiles:
             if p.name == f"bootRun:{module}":
@@ -627,9 +658,16 @@ class ProjectTab(QWidget):
                 self._module_external_pids.pop(module, None)
         log_w = self._ensure_module_log_tab(module)
         log_w.begin_run(f"{self.project_meta.name}-{module}")
+        unit = self.project_meta.runtime_unit(module)
         ctx = RunContext(
-            cwd=self.project_meta.path,
-            env={}, jvm_opts="-Xmx768m -Xms256m", spring_profile="", extra_args=[],
+            cwd=unit.cwd if unit is not None else self.project_meta.path,
+            env={},
+            jvm_opts=(
+                "-Xmx768m -Xms256m"
+                if self.project_meta.project_type.startswith("spring-") else ""
+            ),
+            spring_profile="",
+            extra_args=[],
         )
         # 上次运行抓到的端口失效，等本次启动日志里重新抓
         self._module_ports.pop(module, None)
@@ -675,12 +713,19 @@ class ProjectTab(QWidget):
         return True
 
 
-    def _stop_module(self, module: str, silent: bool = False) -> None:
+    def _stop_module(self, module: str, silent: bool = False) -> bool:
         action_log.info("[GUI] 停止模块 project=%s module=%s", self.project_meta.name, module)
         runner = self.module_runners.get(module)
+        unit = self.project_meta.runtime_unit(module)
+        if unit is not None and unit.stop_command:
+            from src.core.process_runner import is_port_listening
+
+            port_active = bool(unit.expected_port and is_port_listening(unit.expected_port))
+            if (runner and self.service_controller.runner_busy(runner)) or port_active:
+                return self._start_runtime_stop(unit, runner, module)
         if runner and self.service_controller.runner_busy(runner):
             runner.stop()
-            return
+            return True
         # 外部进程（非 mini-ide 拉起）：按感知到的 pid 结束。
         # GUI 操作需用户确认避免误杀；CLI（silent）直接停。
         pid = self._module_external_pids.get(module)
@@ -694,7 +739,7 @@ class ProjectTab(QWidget):
                     QMessageBox.StandardButton.No,
                 )
                 if ret != QMessageBox.StandardButton.Yes:
-                    return
+                    return False
             from src.core.process_runner import kill_pid
             if self.service_panel:
                 self.service_panel.update_state(module, STATE_STOPPING)
@@ -707,9 +752,124 @@ class ProjectTab(QWidget):
                 self.log.append_line("stderr", f"[停止失败] 无法结束 {module} (PID {pid})")
                 # 刷新会重新感知真实状态
                 self._refresh_status_row()
+            return ok
+        return False
+
+    def _start_runtime_stop(
+        self, unit, service_runner: ProcessRunner | None, module: str | None,
+    ) -> bool:
+        """先执行显式 stop；超时后只兜底停止本 IDE 托管的 runner。"""
+        key = unit.id
+        current = self._runtime_stop_runners.get(key)
+        if current is not None and self.service_controller.runner_busy(current):
+            return True
+
+        stop_runner = ProcessRunner(self)
+        self._runtime_stop_runners[key] = stop_runner
+        stop_runner.outputLine.connect(
+            lambda stream, line, m=module: self._append_runtime_stop_output(m, stream, line)
+        )
+        stop_runner.finished.connect(
+            lambda code, u=unit, managed=service_runner, m=module, sr=stop_runner:
+            self._on_runtime_stop_command_finished(u, managed, m, sr, code)
+        )
+        if module is not None and self.service_panel:
+            self.service_panel.update_state(module, STATE_STOPPING)
+        elif module is None:
+            self._update_main_button("stopping")
+        self._append_runtime_stop_output(module, "meta", f"[停止命令] {unit.name}")
+        ok = stop_runner.start(
+            list(unit.stop_command),
+            RunContext(cwd=unit.cwd, env={}, extra_args=[]),
+        )
+        if not ok:
+            self._runtime_stop_runners.pop(key, None)
+            stop_runner.deleteLater()
+            if service_runner is not None and self.service_controller.runner_busy(service_runner):
+                service_runner.stop()
+                return True
+            self._append_runtime_stop_output(module, "stderr", "[停止失败] 无法启动停止命令")
+            return False
+        QTimer.singleShot(
+            RUNTIME_STOP_COMMAND_TIMEOUT_MS,
+            lambda k=key, sr=stop_runner: self._timeout_runtime_stop_command(k, sr),
+        )
+        return True
+
+    def _append_runtime_stop_output(
+        self, module: str | None, stream: str, line: str,
+    ) -> None:
+        target = self.module_logs.get(module) if module is not None else self.log
+        (target or self.log).append_line(stream, line)
+
+    def _timeout_runtime_stop_command(self, key: str, stop_runner: ProcessRunner) -> None:
+        if self._runtime_stop_runners.get(key) is not stop_runner:
+            return
+        if self.service_controller.runner_busy(stop_runner):
+            self.log.append_line("stderr", f"[停止命令超时] {key}，开始收尾")
+            stop_runner.stop(timeout_ms=1000)
+
+    def _on_runtime_stop_command_finished(
+        self, unit, service_runner: ProcessRunner | None, module: str | None,
+        stop_runner: ProcessRunner, exit_code: int,
+    ) -> None:
+        if self._runtime_stop_runners.get(unit.id) is stop_runner:
+            self._runtime_stop_runners.pop(unit.id, None)
+        stop_runner.deleteLater()
+        if exit_code not in (0,):
+            self._append_runtime_stop_output(
+                module, "stderr", f"[停止命令失败] 退出码 {exit_code}，使用托管进程兜底",
+            )
+            if service_runner is not None and self.service_controller.runner_busy(service_runner):
+                service_runner.stop()
+            return
+        deadline = time.time() + RUNTIME_STOP_GRACE_MS / 1000.0
+        QTimer.singleShot(
+            100,
+            lambda u=unit, managed=service_runner, m=module, d=deadline:
+            self._wait_runtime_stop_grace(u, managed, m, d),
+        )
+
+    def _wait_runtime_stop_grace(
+        self, unit, service_runner: ProcessRunner | None,
+        module: str | None, deadline: float,
+    ) -> None:
+        from src.core.process_runner import is_port_listening
+
+        managed_active = bool(
+            service_runner is not None
+            and self.service_controller.runner_busy(service_runner)
+        )
+        port_active = bool(
+            unit.expected_port and is_port_listening(unit.expected_port)
+        )
+        if not managed_active and not port_active:
+            if module is not None and self.service_panel:
+                self.service_panel.update_state(module, STATE_IDLE)
+            elif module is None:
+                self._update_main_button(self.runner.state())
+            self._refresh_status_row()
+            return
+        if time.time() < deadline:
+            QTimer.singleShot(
+                100,
+                lambda u=unit, managed=service_runner, m=module, d=deadline:
+                self._wait_runtime_stop_grace(u, managed, m, d),
+            )
+            return
+        if managed_active:
+            self._append_runtime_stop_output(
+                module, "meta", "[停止命令已执行] 服务未退出，停止托管进程树",
+            )
+            service_runner.stop()
+        elif port_active:
+            self._append_runtime_stop_output(
+                module, "stderr",
+                f"[停止未完成] 端口 {unit.expected_port} 仍被非托管进程占用，未执行强杀",
+            )
 
     def _start_all_modules(self, silent: bool = False) -> bool:
-        """并行启动所有未运行的模块（无依赖编排——用户砍掉 Workspace 时已认可）
+        """按依赖分组启动所有未运行的运行单元。
 
         silent=True（CLI 全部启动）：对靠端口感知到的外部进程也接管——先杀旧的
         再用 mini-ide 启动，使其纳入本实例管理。界面操作时仍跳过外部进程不重复拉起。
@@ -721,20 +881,91 @@ class ProjectTab(QWidget):
             if not silent:
                 notify.notify_info("操作已阻止", message)
             return False
-        # 先刷新一次外部感知，避免对已在外部运行的模块重复拉起
-        self._detect_and_apply_external()
-        all_ok = True
-        for mod_name, _path, _port, _cls in self.project_meta.spring_boot_modules:
-            r = self.module_runners.get(mod_name)
-            if r and self.service_controller.runner_busy(r):
-                continue
-            if mod_name in self._module_external_pids and not silent:
-                # 已在外部运行，跳过（不弹确认框）
-                continue
-            all_ok = self._start_module(mod_name, silent=silent) and all_ok
-        return all_ok
+        # Spring 服务可感知 IDE 外部启动的 JVM；其他适配器只管理本实例启动的进程。
+        if self.project_meta.spring_boot_modules:
+            self._detect_and_apply_external()
+        from src.core.runtime_units import runtime_start_groups
 
-    def _stop_all_modules(self, silent: bool = False) -> None:
+        try:
+            groups = runtime_start_groups(self.project_meta.runtime_units)
+        except ValueError as exc:
+            self.log.append_line("stderr", f"[启动失败] {exc}")
+            return False
+        if not groups:
+            return False
+        self._runtime_start_generation += 1
+        return self._start_runtime_group(
+            groups, 0, silent=silent, generation=self._runtime_start_generation,
+        )
+
+    def _start_runtime_group(
+        self, groups, index: int, *, silent: bool, generation: int,
+    ) -> bool:
+        if generation != self._runtime_start_generation:
+            return False
+        group = groups[index]
+        all_ok = True
+        for unit in group:
+            runner = self.module_runners.get(unit.id)
+            if runner and self.service_controller.runner_busy(runner):
+                continue
+            if unit.id in self._module_external_pids and not silent:
+                continue
+            all_ok = self._start_module(unit.id, silent=silent) and all_ok
+        if not all_ok:
+            self.log.append_line("stderr", "[启动中止] 当前依赖组存在启动失败项")
+            return False
+        if index + 1 >= len(groups):
+            return True
+        launch_generations = self.service_controller.snapshot_launch_generations(None)
+        deadline = time.time() + 90.0
+        QTimer.singleShot(250, lambda: self._wait_runtime_group_ready(
+            groups, index, silent=silent, generation=generation,
+            launch_generations=launch_generations, deadline=deadline,
+        ))
+        return True
+
+    def _wait_runtime_group_ready(
+        self, groups, index: int, *, silent: bool, generation: int,
+        launch_generations: dict[str, int | None], deadline: float,
+    ) -> None:
+        if generation != self._runtime_start_generation:
+            return
+        pending: list[str] = []
+        for unit in groups[index]:
+            ok, detail = self.service_controller.module_health_ok(
+                unit.id, launch_generations.get(unit.id),
+            )
+            runner = self.module_runners.get(unit.id)
+            # 无端口、无健康地址的 Worker/任务以托管进程稳定运行为就绪依据。
+            if (
+                not ok and unit.expected_port is None and not unit.health_check_path
+                and runner is not None and runner.is_running()
+            ):
+                ok = True
+            if not ok and detail.get("error"):
+                self.log.append_line(
+                    "stderr", f"[依赖启动失败] {unit.id}: {detail['error']}",
+                )
+                return
+            if not ok:
+                pending.append(unit.id)
+        if not pending:
+            self._start_runtime_group(
+                groups, index + 1, silent=silent, generation=generation,
+            )
+            return
+        if time.time() >= deadline:
+            self.log.append_line(
+                "stderr", f"[依赖启动超时] 等待就绪：{', '.join(pending)}",
+            )
+            return
+        QTimer.singleShot(250, lambda: self._wait_runtime_group_ready(
+            groups, index, silent=silent, generation=generation,
+            launch_generations=launch_generations, deadline=deadline,
+        ))
+
+    def _stop_all_modules(self, silent: bool = False) -> int:
         """停止所有运行中的模块。
 
         两类进程都要停：
@@ -746,17 +977,37 @@ class ProjectTab(QWidget):
         汇总确认框（避免误杀无关进程），确认后一并 kill。
         """
         from src.core.process_runner import kill_pid
+        self._runtime_start_generation += 1
 
-        # 先停自管理 runner
-        for runner in list(self.module_runners.values()):
-            if self.service_controller.runner_busy(runner):
-                runner.stop()
+        # 反向依赖顺序停止，避免先停依赖再停调用方。
+        from src.core.runtime_units import runtime_start_groups
+        try:
+            stop_order = [
+                unit.id
+                for group in reversed(runtime_start_groups(self.project_meta.runtime_units))
+                for unit in group
+            ]
+        except ValueError:
+            stop_order = [unit.id for unit in reversed(self.project_meta.runtime_units)]
+        stopped = 0
+        for module in stop_order:
+            runner = self.module_runners.get(module)
+            unit = self.project_meta.runtime_unit(module)
+            should_stop = bool(
+                runner is not None and self.service_controller.runner_busy(runner)
+            )
+            if unit is not None and unit.stop_command and unit.expected_port:
+                from src.core.process_runner import is_port_listening
+
+                should_stop = should_stop or is_port_listening(unit.expected_port)
+            if should_stop and self._stop_module(module, silent=silent):
+                stopped += 1
 
         # 再处理外部进程
         external = {m: pid for m, pid in self._module_external_pids.items()
                     if pid is not None}
         if not external:
-            return
+            return stopped
 
         if not silent:
             names = "、".join(sorted(external))
@@ -768,19 +1019,21 @@ class ProjectTab(QWidget):
                 QMessageBox.StandardButton.No,
             )
             if ret != QMessageBox.StandardButton.Yes:
-                return
+                return stopped
 
         for module, pid in external.items():
             if self.service_panel:
                 self.service_panel.update_state(module, STATE_STOPPING)
             if kill_pid(pid):
                 self._module_external_pids.pop(module, None)
+                stopped += 1
                 if self.service_panel:
                     self.service_panel.update_state(module, STATE_IDLE)
             else:
                 self.log.append_line("stderr", f"[停止失败] 无法结束 {module} (PID {pid})")
         # 刷新一次，把真实状态同步回面板
         self._refresh_status_row()
+        return stopped
 
     def clear_all_logs(self) -> None:
         """清空当前项目内所有控制台日志，不影响正在运行的进程。"""
@@ -822,6 +1075,11 @@ class ProjectTab(QWidget):
             f"[提示] {module} 还未启动；点击其右侧的 ▶ 按钮或"
             f" Ctrl+Shift+P →「▶ 启动 {module}」",
         )
+
+    def focus_runtime_unit(self, unit_id: str) -> None:
+        """供聚合项目树定位运行单元；详情仍复用完整 ProjectTab。"""
+        if self.project_meta.runtime_unit(unit_id) is not None:
+            self._focus_module_log(unit_id)
 
     def _on_module_output(self, module: str, stream: str, line: str) -> None:
         self.service_controller.record_service_output(module, line)
@@ -921,7 +1179,7 @@ class ProjectTab(QWidget):
         这是 GUI、CLI、退出检查共用的状态入口。旧的 running_service_items()
         保留给调用方兼容，但内部不再手写散落 dict。
         """
-        if refresh_external and self._is_multi_module:
+        if refresh_external and self._is_multi_module and self.project_meta.spring_boot_modules:
             try:
                 self._detect_and_apply_external()
             except Exception:
@@ -937,6 +1195,15 @@ class ProjectTab(QWidget):
 
         checked_at = int(time.time())
         states: list[ServiceState] = []
+        single_unit = (
+            self.project_meta.runtime_units[0]
+            if not self._is_multi_module and self.project_meta.runtime_units else None
+        )
+        single_module = single_unit.id if single_unit is not None else self.project_meta.name
+        single_port = (
+            single_unit.expected_port if single_unit is not None
+            else self.project_meta.default_port
+        )
 
         if self.project_meta.project_type == "nginx" and nginx_status is not None and nginx_status.running:
             port = nginx_status.ports[0] if nginx_status.ports else None
@@ -946,7 +1213,7 @@ class ProjectTab(QWidget):
                 pid = int(self.runner._proc.processId())
             states.append(ServiceState(
                 project=self.project_meta.name,
-                module=self.project_meta.name,
+                module=single_module,
                 kind=KIND_PROJECT,
                 state=SERVICE_RUNNING_MANAGED if managed else SERVICE_RUNNING_EXTERNAL,
                 source=SOURCE_MANAGED_RUNNER if managed else SOURCE_EXTERNAL_DETECTOR,
@@ -961,13 +1228,13 @@ class ProjectTab(QWidget):
         elif self.runner.state() == "starting":
             states.append(ServiceState(
                 project=self.project_meta.name,
-                module=self.project_meta.name,
+                module=single_module,
                 kind=KIND_PROJECT,
                 state=SERVICE_STARTING,
                 source=SOURCE_MANAGED_RUNNER,
                 pid=self.runner.process_id(),
-                port=self.project_meta.default_port,
-                expected_port=self.project_meta.default_port,
+                port=single_port,
+                expected_port=single_port,
                 log_attached=True,
                 checked_at=checked_at,
                 reason="正在启动",
@@ -978,13 +1245,13 @@ class ProjectTab(QWidget):
                 pid = int(self.runner._proc.processId())
             states.append(ServiceState(
                 project=self.project_meta.name,
-                module=self.project_meta.name,
+                module=single_module,
                 kind=KIND_PROJECT,
                 state=SERVICE_RUNNING_MANAGED,
                 source=SOURCE_MANAGED_RUNNER,
                 pid=pid if pid and pid > 0 else None,
-                port=self.project_meta.default_port,
-                expected_port=self.project_meta.default_port,
+                port=single_port,
+                expected_port=single_port,
                 log_attached=True,
                 checked_at=checked_at,
                 reason="当前 mini-ide 启动，日志上下文完整",
@@ -992,31 +1259,33 @@ class ProjectTab(QWidget):
         elif self.runner.state() == "stopping":
             states.append(ServiceState(
                 project=self.project_meta.name,
-                module=self.project_meta.name,
+                module=single_module,
                 kind=KIND_PROJECT,
                 state=SERVICE_STOPPING,
                 source=SOURCE_MANAGED_RUNNER,
-                port=self.project_meta.default_port,
-                expected_port=self.project_meta.default_port,
+                port=single_port,
+                expected_port=single_port,
                 log_attached=True,
                 checked_at=checked_at,
                 reason="正在停止",
             ))
-        elif not self.project_meta.spring_boot_modules:
+        elif not self._is_multi_module:
             states.append(ServiceState(
                 project=self.project_meta.name,
-                module=self.project_meta.name,
+                module=single_module,
                 kind=KIND_PROJECT,
                 state=SERVICE_STOPPED,
                 source=SOURCE_NONE,
-                port=self.project_meta.default_port,
-                expected_port=self.project_meta.default_port,
+                port=single_port,
+                expected_port=single_port,
                 log_attached=False,
                 checked_at=checked_at,
                 reason="未检测到运行进程",
             ))
 
-        for mod_name, _path, expected_port, _cls in self.project_meta.spring_boot_modules:
+        for unit in self.project_meta.runtime_units if self._is_multi_module else ():
+            mod_name = unit.id
+            expected_port = unit.expected_port
             runner = self.module_runners.get(mod_name)
             port = self._module_ports.get(mod_name) or expected_port
             if runner and runner.state() == "starting":
@@ -1134,21 +1403,28 @@ class ProjectTab(QWidget):
         """停止当前项目内所有运行服务/脚本，返回发起停止的数量。"""
         before = self.running_service_items(refresh_external=include_external)
         count = 0
-        if self.service_controller.runner_busy(self.runner):
-            self.runner.stop()
-            count += 1
+        single_unit = (
+            self.project_meta.runtime_units[0]
+            if not self._is_multi_module and self.project_meta.runtime_units else None
+        )
+        detached_configured = False
+        if single_unit is not None and single_unit.stop_command and single_unit.expected_port:
+            from src.core.process_runner import is_port_listening
+
+            detached_configured = is_port_listening(single_unit.expected_port)
+        if self.service_controller.runner_busy(self.runner) or detached_configured:
+            count += int(self._stop())
         if include_external and self.project_meta.project_type == "nginx":
             status = self._nginx_status
             if status is not None and status.running and self._stop_nginx_external():
                 count += 1
         if self._is_multi_module:
             if include_external:
-                self._stop_all_modules(silent=silent)
+                count += self._stop_all_modules(silent=silent)
             else:
-                for runner in list(self.module_runners.values()):
+                for module, runner in list(self.module_runners.items()):
                     if self.service_controller.runner_busy(runner):
-                        runner.stop()
-                        count += 1
+                        count += int(self._stop_module(module, silent=silent))
         for runner in list(self._script_runners.values()):
             if self.service_controller.runner_busy(runner):
                 runner.stop()
@@ -1178,17 +1454,22 @@ class ProjectTab(QWidget):
                 active = True
             if any(runner_busy(r) for r in self.module_runners.values()):
                 active = True
-            for mod_name, _path, expected_port, _cls in self.project_meta.spring_boot_modules:
+            if any(runner_busy(r) for r in self._runtime_stop_runners.values()):
+                active = True
+            for unit in self.project_meta.runtime_units:
+                mod_name = unit.id
+                expected_port = unit.expected_port
                 port = self._module_ports.get(mod_name) or expected_port
                 if port and is_port_listening(port):
                     active = True
                     break
             if any(runner_busy(r) for r in self._script_runners.values()):
                 active = True
-            try:
-                self._detect_and_apply_external()
-            except Exception:
-                log.exception("等待停止时刷新外部进程感知失败")
+            if self.project_meta.spring_boot_modules:
+                try:
+                    self._detect_and_apply_external()
+                except Exception:
+                    log.exception("等待停止时刷新外部进程感知失败")
             if self._module_external_pids:
                 active = True
             if self.project_meta.project_type == "nginx":
@@ -1458,9 +1739,13 @@ class ProjectTab(QWidget):
     def _refresh_status_row(self) -> None:
         if self._is_multi_module:
             # 多模块：顶部只显示 "N/M 运行中"；每行运行时长更新到 ServicePanel
-            external = self._detect_external_modules()
+            external = (
+                self._detect_external_modules()
+                if self.project_meta.spring_boot_modules else {}
+            )
             running = 0
-            for mod_name, _path, _port, _cls in self.project_meta.spring_boot_modules:
+            for unit in self.project_meta.runtime_units:
+                mod_name = unit.id
                 r = self.module_runners.get(mod_name)
                 if r and r.state() == "starting":
                     self._module_external_pids.pop(mod_name, None)
@@ -1509,7 +1794,7 @@ class ProjectTab(QWidget):
                         if not r or r.state() == "idle":
                             self._module_ports.pop(mod_name, None)
                         self.service_panel.update_state(mod_name, STATE_IDLE)
-            total = len(self.project_meta.spring_boot_modules)
+            total = len(self.project_meta.runtime_units)
             self.lbl_elapsed.setText(f"已运行 {running}/{total}" if running else "")
         elif self.project_meta.project_type == "nginx":
             try:
@@ -1734,7 +2019,7 @@ class ProjectTab(QWidget):
                 if ret != QMessageBox.StandardButton.Yes:
                     return
                 self._closing_modules.add(module)
-                runner.stop()
+                self._stop_module(module)
                 # 不立即 removeTab，等 _on_module_finished 触发清理。
                 # 兜底：进程 10 秒还没退出就强制清理 tab（子进程可能卡在 SIGTERM，
                 # 或 QProcess.finished 信号丢失；UI 不能永远留个关不掉的 tab）。
@@ -2197,10 +2482,11 @@ class ProjectTab(QWidget):
             # 多模块：模块启停走 _start_module / _stop_module；编译 / Clean 仍走 self.runner
             commands.append((
                 "▶  全部启动",
-                f"并行启动所有 {len(self.project_meta.spring_boot_modules)} 个模块",
+                f"启动全部 {len(self.project_meta.runtime_units)} 个运行单元",
                 self._start_all_modules,
             ))
-            for mod_name, _path, _port, _cls in self.project_meta.spring_boot_modules:
+            for unit in self.project_meta.runtime_units:
+                mod_name = unit.id
                 r = self.module_runners.get(mod_name)
                 if r and self.service_controller.runner_busy(r):
                     commands.append((

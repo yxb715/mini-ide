@@ -91,6 +91,7 @@ class AggregateComponent:
     name: str = ""
     shared: bool = False
     overrides: dict[str, Any] = field(default_factory=dict)
+    runtime: dict[str, Any] = field(default_factory=dict)
     workspace_copy_files: tuple[str, ...] = ()
 
     @classmethod
@@ -109,6 +110,11 @@ class AggregateComponent:
         if not isinstance(overrides, dict):
             raise AggregateConfigError(
                 f"component {component_id} overrides must be an object"
+            )
+        runtime = raw.get("runtime", {})
+        if not isinstance(runtime, dict):
+            raise AggregateConfigError(
+                f"component {component_id} runtime must be an object"
             )
         component_root = resolve_path_within(
             aggregate_root, path, label=f"component {component_id} path",
@@ -142,6 +148,7 @@ class AggregateComponent:
             name=str(raw.get("name", "") or "").strip(),
             shared=bool(raw.get("shared", False)),
             overrides=dict(overrides),
+            runtime=dict(runtime),
             workspace_copy_files=tuple(normalized_copy_files),
         )
 
@@ -158,6 +165,8 @@ class AggregateComponent:
             data["shared"] = True
         if self.overrides:
             data["overrides"] = dict(self.overrides)
+        if self.runtime:
+            data["runtime"] = dict(self.runtime)
         if self.workspace_copy_files:
             data["workspaceCopyFiles"] = list(self.workspace_copy_files)
         return data

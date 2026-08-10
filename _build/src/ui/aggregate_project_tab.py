@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QDialog, QHBoxLayout,
     QHeaderView, QLabel, QMessageBox, QPushButton, QSplitter, QStackedWidget,
     QStyle, QTabWidget, QTableWidget, QTableWidgetItem, QToolButton,
-    QVBoxLayout, QWidget,
+    QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 from src.core.aggregate_workspace import (
@@ -44,6 +44,8 @@ from src.ui.theme import (
 )
 
 action_log = logging.getLogger("mini-ide.action")
+PROJECT_KIND_ROLE = int(Qt.ItemDataRole.UserRole) + 1
+RUNTIME_ID_ROLE = int(Qt.ItemDataRole.UserRole) + 2
 
 
 class _PrepareProjectsWorker(QThread):
@@ -58,7 +60,9 @@ class _PrepareProjectsWorker(QThread):
         results = []
         for item in self.items:
             try:
-                meta = detect_project(item["path"])
+                meta = detect_project(
+                    item["path"], runtime_config=item.get("runtime"),
+                )
                 branch = item.get("branch", "")
                 if not branch and not item.get("shared"):
                     branch = current_branch(item["path"])
@@ -214,9 +218,11 @@ class AggregateProjectTab(QWidget):
             health_check_path="",
         )
         self._project_tabs: dict[str, ProjectTab] = {}
-        self._project_rows: dict[str, int] = {}
+        self._project_nodes: dict[str, QTreeWidgetItem] = {}
+        self._runtime_nodes: dict[tuple[str, str], QTreeWidgetItem] = {}
         self._metadata: dict[str, dict] = {}
         self._existing_tabs = existing_tabs or {}
+        self._configured_existing_tabs: dict[str, ProjectTab] = {}
         self._workspace_summaries = ()
         self._pending_workspace_path = ""
         self._prepare_worker: _PrepareProjectsWorker | None = None
@@ -292,26 +298,36 @@ class AggregateProjectTab(QWidget):
         progress_row.addWidget(self.project_cc_button)
         layout.addLayout(progress_row)
 
-        splitter = QSplitter(Qt.Orientation.Vertical)
-        splitter.setChildrenCollapsible(False)
-        self.project_table = QTableWidget(0, 6)
-        self.project_table.setHorizontalHeaderLabels(
-            ["项目", "类型", "分支/来源", "状态", "端口", "操作"]
-        )
-        self.project_table.setSelectionBehavior(
-            QAbstractItemView.SelectionBehavior.SelectRows
-        )
-        self.project_table.setSelectionMode(
+        self.project_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.project_splitter.setChildrenCollapsible(False)
+        self.project_splitter.setHandleWidth(3)
+
+        sidebar = QWidget()
+        sidebar.setMinimumWidth(240)
+        sidebar.setMaximumWidth(420)
+        sidebar_layout = QVBoxLayout(sidebar)
+        sidebar_layout.setContentsMargins(GAP_NONE, GAP_NONE, GAP_MD, GAP_NONE)
+        sidebar_layout.setSpacing(GAP_SM)
+        self.project_tree_label = QLabel("项目")
+        self.project_tree_label.setProperty("role", "subtitle")
+        sidebar_layout.addWidget(self.project_tree_label)
+        self.project_tree = QTreeWidget()
+        self.project_tree.setColumnCount(3)
+        self.project_tree.setHeaderLabels(["项目", "状态", ""])
+        self.project_tree.setRootIsDecorated(True)
+        self.project_tree.setUniformRowHeights(True)
+        self.project_tree.setIndentation(16)
+        self.project_tree.setSelectionMode(
             QAbstractItemView.SelectionMode.SingleSelection
         )
-        self.project_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.project_table.verticalHeader().setVisible(False)
-        self.project_table.verticalHeader().setDefaultSectionSize(H_TABLE_ROW)
-        header = self.project_table.horizontalHeader()
-        header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        self.project_table.itemSelectionChanged.connect(self._show_selected_project)
-        splitter.addWidget(self.project_table)
+        self.project_tree.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        tree_header = self.project_tree.header()
+        tree_header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        tree_header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        tree_header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.project_tree.itemSelectionChanged.connect(self._show_selected_project)
+        sidebar_layout.addWidget(self.project_tree, 1)
+        self.project_splitter.addWidget(sidebar)
 
         detail = QWidget()
         detail_layout = QVBoxLayout(detail)
@@ -325,10 +341,21 @@ class AggregateProjectTab(QWidget):
         self.placeholder.setStyleSheet(f"color: {FG_DIM};")
         self.detail_stack.addWidget(self.placeholder)
         detail_layout.addWidget(self.detail_stack)
-        splitter.addWidget(detail)
-        splitter.setStretchFactor(0, 0)
-        splitter.setStretchFactor(1, 1)
-        layout.addWidget(splitter, 1)
+        self.project_splitter.addWidget(detail)
+        self.project_splitter.setStretchFactor(0, 0)
+        self.project_splitter.setStretchFactor(1, 1)
+        try:
+            sidebar_width = int(self.config.aggregate_sidebar_width)
+        except (TypeError, ValueError):
+            sidebar_width = 320
+        sidebar_width = max(240, min(420, sidebar_width))
+        self.project_splitter.setSizes([sidebar_width, 1000])
+        self._sidebar_save_timer = QTimer(self)
+        self._sidebar_save_timer.setSingleShot(True)
+        self._sidebar_save_timer.setInterval(350)
+        self._sidebar_save_timer.timeout.connect(self._save_sidebar_width)
+        self.project_splitter.splitterMoved.connect(self._sidebar_moved)
+        layout.addWidget(self.project_splitter, 1)
         return page
 
     def _build_workspaces_page(self) -> QWidget:
@@ -423,6 +450,7 @@ class AggregateProjectTab(QWidget):
                     ),
                     "shared": not is_worktree,
                     "branch": workspace_item.task_branch if is_worktree else "源目录",
+                    "runtime": definition.runtime,
                 })
             return tuple(items)
         return tuple({
@@ -431,6 +459,7 @@ class AggregateProjectTab(QWidget):
             "path": str(item.absolute_path(self.aggregate_project.root_path)),
             "shared": item.shared,
             "branch": "共享目录" if item.shared else "",
+            "runtime": item.runtime,
         } for item in self.aggregate_project.components)
 
     def _start_prepare(self) -> None:
@@ -439,8 +468,9 @@ class AggregateProjectTab(QWidget):
         self.project_progress.setText("正在识别项目...")
         pending = []
         for item in self._project_items():
-            existing = self._existing_tabs.get(normalized_path_key(item["path"]))
-            if existing is not None:
+            path_key = normalized_path_key(item["path"])
+            existing = self._existing_tabs.get(path_key)
+            if existing is not None and not item.get("runtime"):
                 self._install_project({
                     **item,
                     "meta": existing.project_meta,
@@ -449,6 +479,8 @@ class AggregateProjectTab(QWidget):
                 }, existing)
             else:
                 pending.append(item)
+                if existing is not None:
+                    self._configured_existing_tabs[path_key] = existing
         self._existing_tabs = {}
         if not pending:
             self._prepare_worker = None
@@ -467,6 +499,20 @@ class AggregateProjectTab(QWidget):
             return
         self._prepare_worker = None
         for item in results:
+            existing = self._configured_existing_tabs.pop(
+                normalized_path_key(item["path"]), None,
+            )
+            if existing is not None:
+                if not existing.request_close(
+                    confirm_running=False, stop_running=True, quiet=True,
+                ):
+                    self._install_project({
+                        **item,
+                        "meta": existing.project_meta,
+                        "error": "旧项目仍在运行，无法应用聚合运行配置",
+                    }, existing)
+                    continue
+                existing.deleteLater()
             self._install_project(item)
         ready = len(self._project_tabs)
         errors = sum(1 for item in self._metadata.values() if item.get("error"))
@@ -474,31 +520,28 @@ class AggregateProjectTab(QWidget):
         if errors:
             text += f"，{errors} 个错误"
         self.project_progress.setText(text)
-        if self.project_table.rowCount() and not self.project_table.selectionModel().hasSelection():
-            self.project_table.selectRow(0)
+        self.project_tree_label.setText(f"项目 {self.project_tree.topLevelItemCount()}")
+        if self.project_tree.topLevelItemCount() and not self.project_tree.selectedItems():
+            self.project_tree.setCurrentItem(self.project_tree.topLevelItem(0))
         self.refresh_project_states()
 
     def _install_project(self, item: dict, existing: ProjectTab | None = None) -> None:
         project_id = item["id"]
         self._metadata[project_id] = item
-        row = self.project_table.rowCount()
-        self.project_table.insertRow(row)
-        self._project_rows[project_id] = row
         meta = item.get("meta")
-        values = [
+        node = QTreeWidgetItem([
             item.get("name") or project_id,
-            meta.display_type if meta else "识别失败",
-            item.get("branch") or ("共享目录" if item.get("shared") else "-"),
             "配置错误" if item.get("error") else "已停止",
-            str(meta.default_port) if meta and meta.default_port else "-",
-        ]
-        for column, value in enumerate(values):
-            table_item = QTableWidgetItem(value)
-            if item.get("error"):
-                table_item.setToolTip(item["error"])
-            if column == 0:
-                table_item.setData(Qt.ItemDataRole.UserRole, project_id)
-            self.project_table.setItem(row, column, table_item)
+            "",
+        ])
+        node.setData(0, Qt.ItemDataRole.UserRole, project_id)
+        node.setData(0, PROJECT_KIND_ROLE, "project")
+        node.setToolTip(0, item.get("error", "") or (
+            f"{meta.display_type if meta else '识别失败'} · "
+            f"{item.get('branch') or ('共享目录' if item.get('shared') else '-') }"
+        ))
+        self.project_tree.addTopLevelItem(node)
+        self._project_nodes[project_id] = node
         if meta is None:
             return
         tab = existing
@@ -511,32 +554,73 @@ class AggregateProjectTab(QWidget):
         tab.component_id = project_id
         self._project_tabs[project_id] = tab
         self.detail_stack.addWidget(tab)
+        self.project_tree.setItemWidget(
+            node, 2, self._tree_action_widget(project_id, None, node.text(0)),
+        )
+        for unit in meta.runtime_units:
+            child = QTreeWidgetItem([
+                unit.name,
+                f"已停止  :{unit.expected_port}" if unit.expected_port else "已停止",
+                "",
+            ])
+            child.setData(0, Qt.ItemDataRole.UserRole, project_id)
+            child.setData(0, PROJECT_KIND_ROLE, "runtime")
+            child.setData(0, RUNTIME_ID_ROLE, unit.id)
+            node.addChild(child)
+            self._runtime_nodes[(project_id, unit.id)] = child
+            self.project_tree.setItemWidget(
+                child, 2, self._tree_action_widget(project_id, unit.id, unit.name),
+            )
+        node.setExpanded(False)
 
-        action_widget = QWidget()
-        actions = QHBoxLayout(action_widget)
+    def _tree_action_widget(
+        self, project_id: str, runtime_id: str | None, label: str,
+    ) -> QWidget:
+        widget = QWidget()
+        actions = QHBoxLayout(widget)
         actions.setContentsMargins(GAP_NONE, GAP_NONE, GAP_NONE, GAP_NONE)
-        actions.setSpacing(GAP_SM)
+        actions.setSpacing(2)
         start = QToolButton()
         start.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
-        start.setToolTip(f"启动 {values[0]}")
-        start.clicked.connect(lambda _checked=False, pid=project_id: self.start_component(pid))
+        start.setToolTip(f"启动 {label}")
+        start.clicked.connect(
+            lambda _checked=False, pid=project_id, rid=runtime_id:
+            self.start_runtime(pid, rid)
+        )
         actions.addWidget(start)
         stop = QToolButton()
         stop.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaStop))
-        stop.setToolTip(f"停止 {values[0]}")
-        stop.clicked.connect(lambda _checked=False, pid=project_id: self.stop_component(pid))
+        stop.setToolTip(f"停止 {label}")
+        stop.clicked.connect(
+            lambda _checked=False, pid=project_id, rid=runtime_id:
+            self.stop_runtime(pid, rid)
+        )
         actions.addWidget(stop)
-        self.project_table.setCellWidget(row, 5, action_widget)
+        return widget
 
     def _show_selected_project(self) -> None:
-        rows = self.project_table.selectionModel().selectedRows()
-        if not rows:
+        items = self.project_tree.selectedItems()
+        if not items:
             return
-        item = self.project_table.item(rows[0].row(), 0)
-        project_id = item.data(Qt.ItemDataRole.UserRole) if item else ""
+        item = items[0]
+        project_id = item.data(0, Qt.ItemDataRole.UserRole) or ""
         tab = self._project_tabs.get(project_id)
         if tab is not None:
             self.detail_stack.setCurrentWidget(tab)
+            project_node = self._project_nodes.get(project_id)
+            for index in range(self.project_tree.topLevelItemCount()):
+                candidate = self.project_tree.topLevelItem(index)
+                candidate.setExpanded(candidate is project_node and candidate.childCount() > 1)
+            if item.data(0, PROJECT_KIND_ROLE) == "runtime":
+                tab.focus_runtime_unit(item.data(0, RUNTIME_ID_ROLE) or "")
+
+    def _sidebar_moved(self, position: int, _index: int) -> None:
+        self._sidebar_save_timer.start()
+
+    def _save_sidebar_width(self) -> None:
+        width = self.project_splitter.sizes()[0] if self.project_splitter.sizes() else 320
+        self.config.aggregate_sidebar_width = max(240, min(420, int(width)))
+        self.config.save()
 
     def show_projects(self) -> None:
         self.view_tabs.setCurrentWidget(self.projects_page)
@@ -588,9 +672,11 @@ class AggregateProjectTab(QWidget):
             self.detail_stack.removeWidget(tab)
             tab.deleteLater()
         self._project_tabs.clear()
-        self._project_rows.clear()
+        self._project_nodes.clear()
+        self._runtime_nodes.clear()
         self._metadata.clear()
-        self.project_table.setRowCount(0)
+        self.project_tree.clear()
+        self.project_tree_label.setText("项目")
         self.detail_stack.setCurrentWidget(self.placeholder)
         self.workspace = workspace
         self._set_context_label()
@@ -1127,9 +1213,11 @@ class AggregateProjectTab(QWidget):
             self.detail_stack.removeWidget(tab)
             tab.deleteLater()
         self._project_tabs.clear()
-        self._project_rows.clear()
+        self._project_nodes.clear()
+        self._runtime_nodes.clear()
         self._metadata.clear()
-        self.project_table.setRowCount(0)
+        self.project_tree.clear()
+        self.project_tree_label.setText("项目")
         self.detail_stack.setCurrentWidget(self.placeholder)
         self._start_prepare()
 
@@ -1144,6 +1232,16 @@ class AggregateProjectTab(QWidget):
         self.refresh_project_states()
         return result
 
+    def start_runtime(self, component_id: str, runtime_id: str | None) -> dict:
+        if runtime_id is None:
+            return self.start_component(component_id)
+        tab = self._project_tabs.get(component_id)
+        if tab is None:
+            return {"ok": False, "error": f"project not available: {component_id}"}
+        result = tab.service_controller.start(runtime_id)
+        self.refresh_project_states()
+        return result
+
     def stop_component(self, component_id: str) -> dict:
         tab = self._project_tabs.get(component_id)
         if tab is None:
@@ -1154,10 +1252,23 @@ class AggregateProjectTab(QWidget):
         self.refresh_project_states()
         return result
 
+    def stop_runtime(self, component_id: str, runtime_id: str | None) -> dict:
+        if runtime_id is None:
+            return self.stop_component(component_id)
+        tab = self._project_tabs.get(component_id)
+        if tab is None:
+            return {"ok": False, "error": f"project not available: {component_id}"}
+        states = tab.service_states(refresh_external=True)
+        if not any(item.module == runtime_id and item.is_active for item in states):
+            return {"ok": True, "already_stopped": True}
+        result = tab.service_controller.stop(runtime_id)
+        self.refresh_project_states()
+        return result
+
     def refresh_project_states(self) -> None:
         for project_id, tab in self._project_tabs.items():
-            row = self._project_rows.get(project_id)
-            if row is None:
+            node = self._project_nodes.get(project_id)
+            if node is None:
                 continue
             try:
                 states = [
@@ -1166,34 +1277,60 @@ class AggregateProjectTab(QWidget):
                 ]
             except Exception:
                 states = []
-            active = [item for item in states if item.is_active]
             unknown = [item for item in states if item.state == STATE_UNKNOWN]
             external = [item for item in states if item.state == STATE_RUNNING_EXTERNAL]
             changing = [
                 item for item in states if item.state in (STATE_STARTING, STATE_STOPPING)
             ]
+            running_count = sum(1 for item in states if item.is_running)
+            runtime_units = getattr(tab.project_meta, "runtime_units", ())
+            total = len(runtime_units) or len(states)
             if unknown:
                 status, color = "状态不确定", COLOR_ERROR
             elif changing:
                 status, color = "处理中", COLOR_WARN
-            elif external:
+            elif total and running_count == total and external:
                 status, color = "外部运行", COLOR_WARN
-            elif active:
+            elif total and running_count == total:
                 status, color = "运行中", COLOR_SUCCESS
+            elif running_count:
+                status, color = f"{running_count}/{total} 运行中", COLOR_SUCCESS
             else:
                 status, color = "已停止", FG_DIM
-            status_item = self.project_table.item(row, 3)
-            if status_item:
-                status_item.setText(status)
-                status_item.setForeground(QColor(color))
-                status_item.setToolTip("\n".join(item.reason for item in states if item.reason))
-            ports = sorted({
-                item.port or item.expected_port
-                for item in states if item.port or item.expected_port
-            })
-            port_item = self.project_table.item(row, 4)
-            if port_item:
-                port_item.setText(", ".join(str(item) for item in ports) or "-")
+            node.setText(1, status)
+            node.setForeground(1, QColor(color))
+            node.setToolTip(1, "\n".join(item.reason for item in states if item.reason))
+
+            state_by_unit = {item.module: item for item in states}
+            if len(runtime_units) == 1 and len(states) == 1:
+                state_by_unit.setdefault(runtime_units[0].id, states[0])
+            for unit in runtime_units:
+                child = self._runtime_nodes.get((project_id, unit.id))
+                if child is None:
+                    continue
+                state = state_by_unit.get(unit.id)
+                port = (
+                    (state.port or state.expected_port) if state is not None
+                    else unit.expected_port
+                )
+                port_text = f"  :{port}" if port else ""
+                if state is None:
+                    child_status, child_color = "状态不确定", COLOR_ERROR
+                elif state.state == STATE_UNKNOWN:
+                    child_status, child_color = "状态不确定", COLOR_ERROR
+                elif state.state == STATE_STARTING:
+                    child_status, child_color = "启动中", COLOR_WARN
+                elif state.state == STATE_STOPPING:
+                    child_status, child_color = "停止中", COLOR_WARN
+                elif state.state == STATE_RUNNING_EXTERNAL:
+                    child_status, child_color = "外部运行", COLOR_WARN
+                elif state.is_running:
+                    child_status, child_color = "运行中", COLOR_SUCCESS
+                else:
+                    child_status, child_color = "已停止", FG_DIM
+                child.setText(1, f"{child_status}{port_text}")
+                child.setForeground(1, QColor(child_color))
+                child.setToolTip(1, state.reason if state is not None else "")
 
     def service_states(self, refresh_external: bool = True):
         states = []

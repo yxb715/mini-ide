@@ -87,6 +87,8 @@ class AppConfig:
     # "打开项目" 对话框默认定位到的目录。空字符串：fallback 到最近项目父目录或家目录。
     # 不写死具体路径——每台机器首次启动时由 load() 自动探测（见 _default_project_dir_guess）。
     default_project_dir: str = ""
+    # 聚合项目页左侧项目树宽度；用户拖动分隔条后跨会话保留。
+    aggregate_sidebar_width: int = 320
 
     @classmethod
     def load(cls) -> "AppConfig":

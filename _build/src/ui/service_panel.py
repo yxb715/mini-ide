@@ -1,4 +1,4 @@
-"""左侧服务面板（多模块 Spring Boot 专用）
+"""左侧运行单元面板。
 
 每行：模块名 端口 启停按钮
 （运行/未启动等状态只用右侧按钮的图标表达，不再显示文字，也不再有左侧独立状态图标）
@@ -51,9 +51,13 @@ class _ServiceRow(QFrame):
     startRequested = Signal(str)
     stopRequested = Signal(str)
 
-    def __init__(self, module_name: str, default_port: int | None = None, parent=None):
+    def __init__(
+        self, module_name: str, default_port: int | None = None,
+        display_name: str | None = None, parent=None,
+    ):
         super().__init__(parent)
         self.module_name = module_name
+        self.display_name = display_name or module_name
         self.default_port = default_port
         self._state = STATE_IDLE
 
@@ -68,7 +72,9 @@ class _ServiceRow(QFrame):
         lay.setContentsMargins(10, 5, 6, 5)
         lay.setSpacing(8)
 
-        self.lbl_name = QLabel(module_name)
+        self.lbl_name = QLabel(self.display_name)
+        if self.display_name != module_name:
+            self.lbl_name.setToolTip(module_name)
         self.lbl_name.setStyleSheet(f"color:{FG_PRIMARY}; font-size:{FONT_PT_UI}pt;")
         lay.addWidget(self.lbl_name, 1)
 
@@ -113,21 +119,21 @@ class _ServiceRow(QFrame):
             self.lbl_info.setText(port_str)
             self.lbl_info.setStyleSheet(f"color:{FG_SECONDARY}; font-size:{FONT_PT_UI_SM}pt;")
             self.btn.setText("▶")
-            self.btn.setToolTip(f"启动 {self.module_name}")
+            self.btn.setToolTip(f"启动 {self.display_name}")
             self.btn.setEnabled(True)
             self.btn.setStyleSheet(_row_btn_qss(BORDER_SUBTLE, FG_DIM))
         elif state == STATE_STARTING:
             self.lbl_info.setText(f"启动中 {port_str}".strip())
             self.lbl_info.setStyleSheet(f"color:{COLOR_WARN}; font-size:{FONT_PT_UI_SM}pt;")
             self.btn.setText("◐")
-            self.btn.setToolTip(f"{self.module_name} 正在启动")
+            self.btn.setToolTip(f"{self.display_name} 正在启动")
             self.btn.setEnabled(False)
             self.btn.setStyleSheet(_row_btn_qss(COLOR_WARN, COLOR_WARN))
         elif state == STATE_RUNNING:
             self.lbl_info.setText(f"运行 {port_str}".strip())
             self.lbl_info.setStyleSheet(f"color:{COLOR_SUCCESS}; font-size:{FONT_PT_UI_SM}pt;")
             self.btn.setText("⏹")
-            tip = f"{self.module_name} 由当前 mini-ide 启动，日志上下文完整。"
+            tip = f"{self.display_name} 由当前 mini-ide 启动，日志上下文完整。"
             if effective_port:
                 tip += f"\n端口：{effective_port}"
             self.btn.setToolTip(tip + "\n点击停止")
@@ -137,7 +143,7 @@ class _ServiceRow(QFrame):
             self.lbl_info.setText(f"外部 {port_str}".strip())
             self.lbl_info.setStyleSheet(f"color:{COLOR_WARN}; font-size:{FONT_PT_UI_SM}pt;")
             self.btn.setText("⏹")
-            tip = f"{self.module_name} 正在 mini-ide 之外运行，当前 IDE 没有启动日志上下文。"
+            tip = f"{self.display_name} 正在 mini-ide 之外运行，当前 IDE 没有启动日志上下文。"
             if ports:
                 tip += f"\n端口：{', '.join(str(p) for p in ports)}"
             elif effective_port:
@@ -153,7 +159,7 @@ class _ServiceRow(QFrame):
             self.lbl_info.setText(f"停止中 {port_str}".strip())
             self.lbl_info.setStyleSheet(f"color:{COLOR_WARN}; font-size:{FONT_PT_UI_SM}pt;")
             self.btn.setText("◐")
-            self.btn.setToolTip(f"{self.module_name} 正在停止")
+            self.btn.setToolTip(f"{self.display_name} 正在停止")
             self.btn.setEnabled(False)
             self.btn.setStyleSheet(_row_btn_qss(COLOR_WARN, COLOR_WARN))
 
@@ -171,8 +177,10 @@ class ServicePanel(QWidget):
     stopAllRequested = Signal()
     clearLogsRequested = Signal()
 
-    def __init__(self, modules: list[tuple[str, int | None]], parent=None):
-        """modules: [(module_name, default_port_or_None)]"""
+    def __init__(
+        self, modules: list[tuple], parent=None, *, title: str = "服务",
+    ):
+        """modules: [(id, port)] 或 [(id, display_name, port)]。"""
         super().__init__(parent)
         self.setStyleSheet(f"QWidget {{ background:{BG_L1}; }}")
 
@@ -188,9 +196,9 @@ class ServicePanel(QWidget):
         h_lay.setContentsMargins(10, 6, 6, 6)
         h_lay.setSpacing(6)
 
-        title = QLabel(f"🧩  服务 ({len(modules)})")
-        title.setStyleSheet(f"color:{FG_PRIMARY}; font-size:{FONT_PT_UI}pt;")
-        h_lay.addWidget(title)
+        title_label = QLabel(f"🧩  {title} ({len(modules)})")
+        title_label.setStyleSheet(f"color:{FG_PRIMARY}; font-size:{FONT_PT_UI}pt;")
+        h_lay.addWidget(title_label)
         h_lay.addStretch(1)
 
         self.btn_clear_logs = QPushButton("清空日志")
@@ -241,8 +249,15 @@ class ServicePanel(QWidget):
         rlay.setSpacing(0)
 
         self._rows: dict[str, _ServiceRow] = {}
-        for name, port in modules:
-            row = _ServiceRow(name, default_port=port, parent=rows_wrap)
+        for item in modules:
+            if len(item) == 3:
+                name, display_name, port = item
+            else:
+                name, port = item
+                display_name = name
+            row = _ServiceRow(
+                name, default_port=port, display_name=display_name, parent=rows_wrap,
+            )
             row.focusRequested.connect(self.focusRequested.emit)
             row.startRequested.connect(self.startRequested.emit)
             row.stopRequested.connect(self.stopRequested.emit)

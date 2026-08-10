@@ -55,6 +55,7 @@ def _project_snapshot(tab) -> dict:
         "package_manager": tab.project_meta.package_manager,
         "default_port": tab.project_meta.default_port,
         "health_check_path": tab.project_meta.health_check_path,
+        "runtime_units": [unit.to_dict() for unit in tab.project_meta.runtime_units],
         "modules": modules,
         "scripts": scripts,
         "running": [s.to_running_item() for s in states if s.is_active],
@@ -104,6 +105,9 @@ def _environment_snapshot(tab) -> dict:
                 "id": component_id,
                 "path": component_tab.project_meta.path,
                 "type": component_tab.project_meta.project_type,
+                "runtime_units": [
+                    unit.to_dict() for unit in component_tab.project_meta.runtime_units
+                ],
                 "modules": [
                     state.to_cli_module()
                     for state in component_tab.service_states(refresh_external=False)
@@ -714,6 +718,8 @@ def _dispatch(cmd: dict, window: "MainWindow") -> dict:
 
     if action == "list-modules":
         return _cmd_list_modules(tab)
+    elif action == "list-runtimes":
+        return _cmd_list_runtimes(tab)
     elif action == "close":
         return _cmd_close_project(window, tab)
     elif action == "start":
@@ -1111,12 +1117,13 @@ def _cmd_quit(window: "MainWindow") -> dict:
 def _cmd_list_projects(window: "MainWindow") -> list:
     projects = []
     for w in _project_target_tabs(window):
-        modules = [m[0] for m in w.project_meta.spring_boot_modules]
+        modules = [unit.id for unit in w.project_meta.runtime_units]
         projects.append({
             "name": w.project_meta.name,
             "path": w.project_meta.path,
             "type": w.project_meta.project_type,
             "modules": modules,
+            "runtime_units": [unit.to_dict() for unit in w.project_meta.runtime_units],
         })
     return projects
 
@@ -1128,6 +1135,20 @@ def _cmd_list_modules(tab) -> list:
     # 对 CLI 来说，脚本运行不是“模块”，避免 list-modules 混入右键脚本进程。
     modules = [s.to_cli_module() for s in states if s.kind != "script"]
     return modules
+
+
+def _cmd_list_runtimes(tab) -> list:
+    states = {
+        state.module: state.to_cli_module()
+        for state in tab.service_controller.states(refresh_external=True)
+        if state.kind != "script"
+    }
+    result = []
+    for unit in tab.project_meta.runtime_units:
+        item = unit.to_dict()
+        item["state"] = states.get(unit.id, {"name": unit.id, "state": "stopped"})
+        result.append(item)
+    return result
 
 
 def _cmd_start(tab, module: str | None) -> dict:
@@ -1158,7 +1179,8 @@ def _cmd_log(
 
     if all_modules and tab._is_multi_module:
         logs: dict[str, list[str]] = {}
-        for mod_name, _path, _port, _cls in tab.project_meta.spring_boot_modules:
+        for unit in tab.project_meta.runtime_units:
+            mod_name = unit.id
             lines = _iter_log_lines(tab.module_logs.get(mod_name), tail)
             if errors:
                 lines = [line for line in lines if _looks_error_line(line)]
@@ -1288,7 +1310,8 @@ def _cmd_health_async(
             else:
                 details = []
                 all_ok = True
-                for mod_name, _path, _port, _cls in tab.project_meta.spring_boot_modules:
+                for unit in tab.project_meta.runtime_units:
+                    mod_name = unit.id
                     ok, detail = tab.service_controller.module_health_ok(
                         mod_name, _generation(mod_name),
                     )
@@ -1316,7 +1339,7 @@ def _cmd_health_async(
                     return
             return
 
-        target = tab.project_meta.name
+        target = tab.service_controller.target_modules(None)[0]
         ok, detail = tab.service_controller.single_project_health_ok(
             _generation(target),
         )

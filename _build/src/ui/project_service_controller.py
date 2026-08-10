@@ -21,14 +21,22 @@ class ProjectServiceController:
         self._compile_reserved = False
 
     def validate_module(self, module: str | None) -> dict | None:
-        if module and self.tab._is_multi_module:
+        if module:
             names = self.module_names()
-            if module not in names:
+            aliases = names + (
+                [self.tab.project_meta.name] if not self.tab._is_multi_module else []
+            )
+            if module not in aliases:
                 return {"ok": False, "error": f"module not found: {module}"}
         return None
 
     def module_names(self) -> list[str]:
-        return [m[0] for m in self.tab.project_meta.spring_boot_modules]
+        units = getattr(self.tab.project_meta, "runtime_units", ())
+        if units:
+            return [unit.id for unit in units]
+        return [item[0] for item in getattr(
+            self.tab.project_meta, "spring_boot_modules", (),
+        )]
 
     def log_widget(self, module: str | None):
         if self.tab._is_multi_module and module:
@@ -63,10 +71,11 @@ class ProjectServiceController:
             for name, runner in tab.module_runners.items():
                 if self.runner_busy(runner):
                     running.append(name)
-            try:
-                tab._detect_and_apply_external()
-            except Exception:
-                pass
+            if tab.project_meta.spring_boot_modules:
+                try:
+                    tab._detect_and_apply_external()
+                except Exception:
+                    pass
             running.extend(tab._module_external_pids.keys())
             # 外部感知依赖 3 秒端口快照；编译门闩不能容忍这段缓存空窗，
             # 再对每个已知端口做一次同步直连确认。
@@ -141,7 +150,12 @@ class ProjectServiceController:
     # ---- 本轮启动代次 ----
 
     def launch_target(self, module: str | None) -> str:
-        return module or self.tab.project_meta.name
+        if module:
+            return module
+        units = getattr(self.tab.project_meta, "runtime_units", ())
+        if not self.tab._is_multi_module and units:
+            return units[0].id
+        return self.tab.project_meta.name
 
     def begin_launch(self, module: str | None) -> int:
         return self._launches.begin(self.launch_target(module))
@@ -175,6 +189,10 @@ class ProjectServiceController:
                 return {"ok": False, "error": "already running"}
             return {"ok": bool(tab._start_nginx())}
 
+        invalid = self.validate_module(module)
+        if invalid:
+            return invalid
+
         conflict = self.service_start_error()
         if conflict:
             return conflict
@@ -187,7 +205,8 @@ class ProjectServiceController:
                 runner = tab.module_runners.get(module)
                 if runner and self.runner_busy(runner):
                     return {"ok": False, "error": "already running"}
-                tab._detect_and_apply_external()
+                if tab.project_meta.spring_boot_modules:
+                    tab._detect_and_apply_external()
                 ok = bool(tab._start_module(module, silent=True))
                 return {"ok": True} if ok else {"ok": False, "error": "failed to start module"}
             ok = bool(tab._start_all_modules(silent=True))
@@ -210,12 +229,17 @@ class ProjectServiceController:
                 return {"ok": False, "error": "not running"}
             return {"ok": bool(tab._stop_nginx_external())}
 
+        invalid = self.validate_module(module)
+        if invalid:
+            return invalid
+
         if tab._is_multi_module:
-            try:
-                tab._detect_and_apply_external()
-            except Exception:
-                # 调用方会记录异常日志；这里保持命令可继续执行。
-                pass
+            if tab.project_meta.spring_boot_modules:
+                try:
+                    tab._detect_and_apply_external()
+                except Exception:
+                    # 调用方会记录异常日志；这里保持命令可继续执行。
+                    pass
             if module:
                 invalid = self.validate_module(module)
                 if invalid:
@@ -223,24 +247,24 @@ class ProjectServiceController:
                 runner = tab.module_runners.get(module)
                 running = runner and self.runner_busy(runner)
                 external = module in tab._module_external_pids
-                if not running and not external:
-                    return {"ok": False, "error": "not running"}
                 port = self.module_port(module)
-                if running:
-                    runner.stop()
-                    if not self.wait_module_stopped(module, 10000, port):
-                        return {"ok": False, "error": "stop timeout"}
-                if module in tab._module_external_pids:
-                    if not tab._takeover_external(module):
-                        return {"ok": False, "error": "stop timeout"}
-                    if not self.wait_module_stopped(module, 8000, port):
-                        return {"ok": False, "error": "stop timeout"}
+                unit = tab.project_meta.runtime_unit(module)
+                detached = bool(
+                    unit and unit.stop_command and port
+                    and self._port_is_listening(port)
+                )
+                if not running and not external and not detached:
+                    return {"ok": False, "error": "not running"}
+                if not tab._stop_module(module, silent=True):
+                    return {"ok": False, "error": "failed to stop module"}
+                if not self.wait_module_stopped(module, 12000, port):
+                    return {"ok": False, "error": "stop timeout"}
                 tab._refresh_status_row()
                 return {"ok": True}
 
             ports = {
-                mod_name: self.module_port(mod_name)
-                for mod_name, _path, _port, _cls in tab.project_meta.spring_boot_modules
+                name: self.module_port(name)
+                for name in self.module_names()
             }
             if self.runner_busy(tab.runner):
                 tab._stop()
@@ -251,24 +275,22 @@ class ProjectServiceController:
                 if self.runner_busy(runner):
                     if not self.wait_runner_stop(runner, 10000):
                         return {"ok": False, "error": "stop timeout"}
-            try:
-                tab._detect_and_apply_external()
-                for mod_name in list(tab._module_external_pids):
-                    if not tab._takeover_external(mod_name):
-                        return {"ok": False, "error": "stop timeout"}
-            except Exception:
-                pass
             for mod_name, port in ports.items():
-                if not self.wait_module_stopped(mod_name, 8000, port):
+                if not self.wait_module_stopped(mod_name, 12000, port):
                     return {"ok": False, "error": "stop timeout"}
             tab._refresh_status_row()
             return {"ok": True}
 
-        if not self.runner_busy(tab.runner):
+        unit = tab.project_meta.runtime_units[0] if tab.project_meta.runtime_units else None
+        port = unit.expected_port if unit is not None else tab.project_meta.default_port
+        detached = bool(
+            unit and unit.stop_command and port and self._port_is_listening(port)
+        )
+        if not self.runner_busy(tab.runner) and not detached:
             return {"ok": False, "error": "not running"}
-        port = tab.project_meta.default_port
-        tab._stop()
-        if not self.wait_project_stopped(10000, port):
+        if not tab._stop():
+            return {"ok": False, "error": "failed to stop project"}
+        if not self.wait_project_stopped(12000, port):
             return {"ok": False, "error": "stop timeout"}
         return {"ok": True}
 
@@ -281,6 +303,10 @@ class ProjectServiceController:
                 tab._stop_nginx_external()
             return {"ok": bool(tab._start_nginx())}
 
+        invalid = self.validate_module(module)
+        if invalid:
+            return invalid
+
         conflict = self.service_start_error()
         if conflict:
             return conflict
@@ -292,38 +318,33 @@ class ProjectServiceController:
                     return invalid
                 runner = tab.module_runners.get(module)
                 port = self.module_port(module)
-                if runner and self.runner_busy(runner):
-                    runner.stop()
+                if tab.project_meta.spring_boot_modules:
+                    tab._detect_and_apply_external()
+                unit = tab.project_meta.runtime_unit(module)
+                active = bool(runner and self.runner_busy(runner))
+                active = active or module in tab._module_external_pids
+                active = active or bool(
+                    unit and unit.stop_command and port
+                    and self._port_is_listening(port)
+                )
+                if active:
+                    if not tab._stop_module(module, silent=True):
+                        return {"ok": False, "error": "failed to stop module"}
                     if not self.wait_module_stopped(module, 15000, port):
-                        return {"ok": False, "error": "stop timeout"}
-                tab._detect_and_apply_external()
-                if module in tab._module_external_pids:
-                    if not tab._takeover_external(module):
-                        return {"ok": False, "error": "stop timeout"}
-                    if not self.wait_module_stopped(module, 8000, port):
                         return {"ok": False, "error": "stop timeout"}
                 ok = bool(tab._start_module(module, silent=True))
                 return {"ok": True} if ok else {"ok": False, "error": "failed to restart module"}
 
             ports = {
-                mod_name: self.module_port(mod_name)
-                for mod_name, _path, _port, _cls in tab.project_meta.spring_boot_modules
+                name: self.module_port(name)
+                for name in self.module_names()
             }
-            for runner in list(tab.module_runners.values()):
-                if self.runner_busy(runner):
-                    runner.stop()
+            tab._stop_all_modules(silent=True)
             deadline = time.time() + 15
             for runner in list(tab.module_runners.values()):
                 remaining = max(0, int((deadline - time.time()) * 1000))
                 if remaining <= 0 or not self.wait_runner_stop(runner, remaining):
                     return {"ok": False, "error": "stop timeout"}
-            try:
-                tab._detect_and_apply_external()
-                for mod_name in list(tab._module_external_pids):
-                    if not tab._takeover_external(mod_name):
-                        return {"ok": False, "error": "stop timeout"}
-            except Exception:
-                pass
             for mod_name, port in ports.items():
                 remaining = max(0, int((deadline - time.time()) * 1000))
                 if remaining <= 0 or not self.wait_module_stopped(mod_name, remaining, port):
@@ -331,9 +352,15 @@ class ProjectServiceController:
             ok = bool(tab._start_all_modules(silent=True))
             return {"ok": True} if ok else {"ok": False, "error": "failed to restart one or more modules"}
 
-        port = tab.project_meta.default_port
-        if self.runner_busy(tab.runner):
-            tab.runner.stop()
+        unit = tab.project_meta.runtime_units[0] if tab.project_meta.runtime_units else None
+        port = unit.expected_port if unit is not None else tab.project_meta.default_port
+        active = self.runner_busy(tab.runner)
+        active = active or bool(
+            unit and unit.stop_command and port and self._port_is_listening(port)
+        )
+        if active:
+            if not tab._stop():
+                return {"ok": False, "error": "failed to stop project"}
             if not self.wait_project_stopped(15000, port):
                 return {"ok": False, "error": "stop timeout"}
         primary = next((p for p in tab.project_meta.profiles if p.primary), None)
@@ -361,9 +388,15 @@ class ProjectServiceController:
     def module_port(self, module: str) -> int | None:
         if module in self.tab._module_ports:
             return self.tab._module_ports.get(module)
-        for mod_name, _path, expected_port, _cls in self.tab.project_meta.spring_boot_modules:
-            if mod_name == module:
-                return expected_port
+        resolver = getattr(self.tab.project_meta, "runtime_unit", None)
+        unit = resolver(module) if callable(resolver) else None
+        if unit is not None:
+            return unit.expected_port
+        for name, _path, port, _main_class in getattr(
+            self.tab.project_meta, "spring_boot_modules", (),
+        ):
+            if name == module:
+                return port
         return None
 
     def wait_module_stopped(
@@ -379,10 +412,14 @@ class ProjectServiceController:
         while time.time() < deadline:
             runner = tab.module_runners.get(module)
             active = bool(runner and self.runner_busy(runner))
-            try:
-                tab._detect_and_apply_external()
-            except Exception:
-                pass
+            stop_runner = tab._runtime_stop_runners.get(module)
+            if stop_runner is not None and self.runner_busy(stop_runner):
+                active = True
+            if tab.project_meta.spring_boot_modules:
+                try:
+                    tab._detect_and_apply_external()
+                except Exception:
+                    pass
             if module in tab._module_external_pids:
                 active = True
             if port and is_port_listening(port):
@@ -399,6 +436,8 @@ class ProjectServiceController:
         deadline = time.time() + timeout_ms / 1000.0
         while time.time() < deadline:
             active = self.runner_busy(tab.runner)
+            if any(self.runner_busy(r) for r in tab._runtime_stop_runners.values()):
+                active = True
             if port and is_port_listening(port):
                 active = True
             if not active:
@@ -406,11 +445,19 @@ class ProjectServiceController:
             QCoreApplication.processEvents(QEventLoop.ProcessEventsFlag.AllEvents, 100)
         return False
 
+    @staticmethod
+    def _port_is_listening(port: int) -> bool:
+        from src.core.process_runner import is_port_listening
+
+        return is_port_listening(port)
+
     def target_modules(self, module: str | None) -> list[str]:
         if self.tab._is_multi_module:
             names = self.module_names()
             return [module] if module else names
-        return [self.tab.project_meta.name]
+        units = getattr(self.tab.project_meta, "runtime_units", ())
+        unit = units[0] if units else None
+        return [unit.id if unit is not None else self.tab.project_meta.name]
 
     def active_modules(self, module: str | None) -> list[str]:
         active = []
@@ -510,7 +557,7 @@ class ProjectServiceController:
                 return True, {"source": "nginx", "pid": status.master_pid, "ports": status.ports}
             return False, {"source": "pending"}
 
-        target = tab.project_meta.name
+        target = self.launch_target(None)
         if self._launches.is_superseded(target, generation):
             return False, {
                 "source": "superseded",
@@ -560,17 +607,11 @@ class ProjectServiceController:
     def _module_port_holder_since(self, module: str, port: int | None, launch) -> int | None:
         if not port:
             return None
-        try:
-            detected = self.tab._detect_external_modules()
-        except Exception:
-            return None
-        item = detected.get(module)
-        if not item:
-            return None
-        pid, detected_port = item
-        if detected_port != port:
-            return None
-        return self._new_holder_pid([{"pid": pid}], launch)
+        from src.core.process_runner import find_port_holder
+
+        # 运行单元已经声明了端口，不应再经过 Spring 专用的命令行匹配器。
+        # 本轮启动代次仍由 _new_holder_pid 校验，旧监听进程不能冒充启动成功。
+        return self._new_holder_pid(find_port_holder(port), launch)
 
     @staticmethod
     def _new_holder_pid(holders: list[dict], launch) -> int | None:

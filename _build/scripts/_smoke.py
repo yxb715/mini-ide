@@ -16,6 +16,7 @@ sys.path.insert(0, str(ROOT))
 modules = [
     "src.core.config",
     "src.core.project_detector",
+    "src.core.runtime_units",
     "src.core.process_runner",
     "src.core.launch_tracker",
     "src.core.file_actions",
@@ -152,6 +153,8 @@ def cli_parse_check() -> list[str]:
         (["mini-ide.exe", "--open", r"E:\demo"], {"cmd": "open", "path": r"E:\demo"}),
         (["mini-ide.exe", "--close", "server"], {"cmd": "close", "project": "server"}),
         (["mini-ide.exe", "--list-workspaces"], {"cmd": "list-workspaces"}),
+        (["mini-ide.exe", "--list-runtimes", "webapp-lerna"],
+         {"cmd": "list-runtimes", "project": "webapp-lerna"}),
         (["mini-ide.exe", "--open-workspace", "race", "dev"], {"cmd": "open-workspace", "target": "race dev"}),
         (["mini-ide.exe", "--close-workspace"], {"cmd": "close-workspace"}),
         (["mini-ide.exe", "--list-aggregates"], {"cmd": "list-aggregates"}),
@@ -648,7 +651,15 @@ def development_workspace_lifecycle_check() -> list[str]:
                     "id": "server", "path": "server", "type": "java",
                     "workspaceCopyFiles": [".env"],
                 },
-                {"id": "webapp", "path": "webapp", "type": "frontend"},
+                {
+                    "id": "webapp", "path": "webapp", "type": "frontend",
+                    "runtime": {"units": [
+                        {"id": "teacher", "name": "教师端", "cwd": ".",
+                         "start": ["tool", "teacher"], "expectedPort": 8881},
+                        {"id": "student", "name": "学生端", "cwd": ".",
+                         "start": ["tool", "student"], "expectedPort": 8882},
+                    ]},
+                },
                 {"id": "nginx", "path": "nginx", "type": "nginx", "shared": True},
             ],
             "profiles": [{
@@ -919,12 +930,16 @@ def aggregate_runtime_ui_check() -> list[str]:
     import time
     from types import SimpleNamespace
 
+    from PySide6.QtCore import Qt
     from PySide6.QtWidgets import QApplication, QTableWidgetItem
 
     from src.core.aggregate_workspace import AggregateProject
     from src.core.cli_server import _find_project_tab
-    from src.core.config import AppConfig
+    from src.core.config import AppConfig, ProjectEntry
+    from src.core.path_utils import normalized_path_key
+    from src.core.project_detector import detect_project
     from src.ui.aggregate_project_tab import AggregateProjectTab
+    from src.ui.project_tab import ProjectTab
 
     failed: list[str] = []
     app = QApplication.instance() or QApplication([])
@@ -940,11 +955,28 @@ def aggregate_runtime_ui_check() -> list[str]:
             "workspaceDirectory": "workspace",
             "components": [
                 {"id": "server", "path": "server", "type": "java"},
-                {"id": "webapp", "path": "webapp", "type": "frontend"},
+                {
+                    "id": "webapp", "path": "webapp", "type": "frontend",
+                    "runtime": {"units": [
+                        {"id": "teacher", "name": "教师端", "cwd": ".",
+                         "start": ["tool", "teacher"], "expectedPort": 8881},
+                        {"id": "student", "name": "学生端", "cwd": ".",
+                         "start": ["tool", "student"], "expectedPort": 8882},
+                    ]},
+                },
             ],
             "profiles": [],
         })
-        tab = AggregateProjectTab(project, AppConfig())
+        old_meta = detect_project(str(root / "webapp"))
+        old_webapp_tab = ProjectTab(
+            old_meta, ProjectEntry(path=old_meta.path), AppConfig(),
+        )
+        tab = AggregateProjectTab(
+            project, AppConfig(),
+            existing_tabs={
+                normalized_path_key(root / "webapp"): old_webapp_tab,
+            },
+        )
         deadline = time.time() + 5
         while tab._prepare_worker is not None and time.time() < deadline:
             worker = tab._prepare_worker
@@ -954,18 +986,39 @@ def aggregate_runtime_ui_check() -> list[str]:
         app.processEvents()
         if tab.project_meta.project_type != "aggregate":
             failed.append("aggregate root must open as aggregate environment, not generic project")
-        if tab.project_table.rowCount() != 2 or set(tab.component_tabs) != {"server", "webapp"}:
+        if tab.project_tree.topLevelItemCount() != 2 or set(tab.component_tabs) != {"server", "webapp"}:
             failed.append("aggregate tab must keep all projects inside one top-level workbench")
-        original_rows = tab.project_table.rowCount()
+        configured_webapp = tab.component_tabs.get("webapp")
+        if configured_webapp is old_webapp_tab:
+            failed.append("configured aggregate component must not reuse stale project metadata")
+        elif configured_webapp is not None and [
+            unit.id for unit in configured_webapp.project_meta.runtime_units
+        ] != ["teacher", "student"]:
+            failed.append("aggregate runtime config must override reused tab detection")
+        original_rows = tab.project_tree.topLevelItemCount()
         original_components = set(tab.component_tabs)
         tab._projects_prepared(
             [dict(tab._metadata["server"])], tab._prepare_generation - 1,
         )
         if (
-            tab.project_table.rowCount() != original_rows
+            tab.project_tree.topLevelItemCount() != original_rows
             or set(tab.component_tabs) != original_components
         ):
             failed.append("stale project discovery must not append rows after switching environments")
+        webapp_node = tab._project_nodes.get("webapp")
+        if webapp_node is None or webapp_node.childCount() != 2:
+            failed.append("aggregate project tree must keep runtime units under their project")
+        else:
+            if tab.project_tree.itemWidget(webapp_node, 2) is None:
+                failed.append("project rows must expose fixed start/stop actions")
+            if tab.project_tree.itemWidget(webapp_node.child(0), 2) is None:
+                failed.append("runtime rows must expose fixed start/stop actions")
+            tab.project_tree.setCurrentItem(webapp_node)
+            app.processEvents()
+            if not webapp_node.isExpanded():
+                failed.append("selecting a multi-runtime project must expand its runtime units")
+        if tab.project_splitter.orientation() != Qt.Orientation.Horizontal:
+            failed.append("aggregate projects must use a horizontal sidebar/detail layout")
         if tab.view_tabs.count() != 2 or tab.view_tabs.tabText(1) != "需求工作区":
             failed.append("aggregate tab must contain its own workspace panel")
         if tab.detail_stack.count() != 3:
@@ -1547,6 +1600,51 @@ def launch_and_operation_guard_check() -> list[str]:
     if start_conflict is None or start_conflict.get("code") != "build_in_progress":
         failed.append("start/restart must be blocked while project build runner is active")
 
+    import os
+    from src.core import process_runner
+    from src.core.runtime_units import RuntimeUnit
+
+    api_unit = RuntimeUnit(
+        id="api", name="api", kind="python", cwd=str(ROOT),
+        start_profile="api:start", profile_names=("api:start",),
+        expected_port=9000,
+    )
+
+    class HealthRunner(FakeRunner):
+        def process_id(self):
+            return os.getpid()
+
+    class HealthTab:
+        _is_multi_module = True
+        project_meta = SimpleNamespace(
+            project_type="python", name="health-demo", runtime_units=[api_unit],
+            spring_boot_modules=[],
+            runtime_unit=lambda unit_id: api_unit if unit_id == "api" else None,
+        )
+        runner = FakeRunner()
+        module_runners = {"api": HealthRunner("running")}
+        _module_ports: dict[str, int] = {}
+        _module_external_pids: dict[str, int] = {}
+
+        def _detect_external_modules(self):
+            raise AssertionError("non-Spring port health must not use Spring detection")
+
+    health_controller = ProjectServiceController(HealthTab())
+    generation = health_controller.begin_launch("api")
+    health_controller.launch_started(
+        "api", generation, health_controller.tab.module_runners["api"],
+    )
+    original_find_port_holder = process_runner.find_port_holder
+    process_runner.find_port_holder = lambda port: (
+        [{"pid": os.getpid()}] if port == 9000 else []
+    )
+    try:
+        healthy, detail = health_controller.module_health_ok("api", generation)
+    finally:
+        process_runner.find_port_holder = original_find_port_holder
+    if not healthy or detail.get("source") != "port":
+        failed.append(f"declared non-Spring port must satisfy health: {detail!r}")
+
     if failed:
         for msg in failed:
             print(f"[FAIL] launch_guard: {msg}", flush=True)
@@ -1895,6 +1993,413 @@ def aggregate_scan_isolation_check() -> list[str]:
     return failed
 
 
+def runtime_stop_execution_check() -> list[str]:
+    """验证显式 stop 会执行，并且失败时只兜底托管 runner。"""
+    from PySide6.QtWidgets import QApplication
+
+    from src.core.runtime_units import RuntimeUnit
+    from src.ui import project_tab as project_tab_module
+    from src.ui.project_tab import ProjectTab
+
+    failed: list[str] = []
+    _app = QApplication.instance() or QApplication([])
+
+    class FakeSignal:
+        def __init__(self):
+            self.callbacks = []
+
+        def connect(self, callback):
+            self.callbacks.append(callback)
+
+        def emit(self, *args):
+            for callback in list(self.callbacks):
+                callback(*args)
+
+    class FakeStopRunner:
+        instances = []
+
+        def __init__(self, _parent=None):
+            self.outputLine = FakeSignal()
+            self.finished = FakeSignal()
+            self._state = "idle"
+            self.command = []
+            self.cwd = ""
+            self.deleted = False
+            self.__class__.instances.append(self)
+
+        def start(self, command, ctx):
+            self.command = list(command)
+            self.cwd = ctx.cwd
+            self._state = "running"
+            return True
+
+        def state(self):
+            return self._state
+
+        def is_running(self):
+            return self._state == "running"
+
+        def stop_cleanup_pending(self):
+            return False
+
+        def deleteLater(self):
+            self.deleted = True
+
+    class ManagedRunner:
+        def __init__(self):
+            self._state = "running"
+            self.stopped = False
+
+        def state(self):
+            return self._state
+
+        def stop_cleanup_pending(self):
+            return False
+
+        def stop(self):
+            self.stopped = True
+            self._state = "stopping"
+
+    class FakeLog:
+        def __init__(self):
+            self.lines = []
+
+        def append_line(self, stream, line):
+            self.lines.append((stream, line))
+
+    class FakeController:
+        @staticmethod
+        def runner_busy(runner):
+            return runner.state() != "idle"
+
+    root = ROOT / "runtime-stop-cwd"
+    unit = RuntimeUnit(
+        id="worker", name="worker", kind="python", cwd=str(root),
+        start_profile="worker:start", profile_names=("worker:start",),
+        stop_command=("tool", "stop-worker"),
+    )
+    managed = ManagedRunner()
+    log = FakeLog()
+    class RuntimeStopTab:
+        _append_runtime_stop_output = ProjectTab._append_runtime_stop_output
+        _timeout_runtime_stop_command = ProjectTab._timeout_runtime_stop_command
+        _on_runtime_stop_command_finished = ProjectTab._on_runtime_stop_command_finished
+
+        def __init__(self):
+            self._runtime_stop_runners = {}
+            self.service_controller = FakeController()
+            self.module_logs = {"worker": log}
+            self.log = log
+            self.service_panel = None
+
+        def _update_main_button(self, _state):
+            pass
+
+    fake_tab = RuntimeStopTab()
+    original_runner = project_tab_module.ProcessRunner
+    project_tab_module.ProcessRunner = FakeStopRunner
+    try:
+        started = ProjectTab._start_runtime_stop(fake_tab, unit, managed, "worker")
+        stop_runner = FakeStopRunner.instances[-1]
+        if not started or stop_runner.command != ["tool", "stop-worker"]:
+            failed.append("configured stop argv must be executed by an independent runner")
+        if stop_runner.cwd != str(root):
+            failed.append(f"configured stop must use runtime cwd: {stop_runner.cwd!r}")
+        stop_runner._state = "idle"
+        stop_runner.finished.emit(7)
+        if not managed.stopped:
+            failed.append("failed stop command must fall back to the managed runner")
+    finally:
+        project_tab_module.ProcessRunner = original_runner
+
+    if failed:
+        for msg in failed:
+            print(f"[FAIL] runtime_stop: {msg}", flush=True)
+    else:
+        print("[OK]   configured runtime stop execution", flush=True)
+    return failed
+
+
+def runtime_unit_check() -> list[str]:
+    """验证单体、Spring、Lerna 和显式运行配置使用同一模型。"""
+    import json
+    import tempfile
+
+    from src.core.project_detector import detect_project
+    from src.core.runtime_units import RuntimeUnit, runtime_start_groups
+
+    failed: list[str] = []
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+
+        single = root / "single-vue"
+        single.mkdir()
+        (single / "package.json").write_text(json.dumps({
+            "name": "single-vue",
+            "scripts": {"dev": "vite"},
+            "dependencies": {"vue": "3.0.0"},
+        }), encoding="utf-8")
+        (single / "vite.config.js").write_text(
+            "export default {\n  server: {\n    port: 8881\n  }\n}\n",
+            encoding="utf-8",
+        )
+        single_meta = detect_project(str(single))
+        if len(single_meta.runtime_units) != 1:
+            failed.append("single project must expose one default runtime unit")
+        elif single_meta.runtime_units[0].expected_port != 8881:
+            failed.append("frontend server.port must flow into the default runtime unit")
+
+        spring = root / "spring-suite"
+        spring.mkdir()
+        (spring / "build.gradle").write_text(
+            "plugins { id 'org.springframework.boot' version '3.2.0' }\n",
+            encoding="utf-8",
+        )
+        (spring / "settings.gradle").write_text(
+            "rootProject.name = 'spring-suite'\ninclude 'gateway', 'auth'\n",
+            encoding="utf-8",
+        )
+        for name, port in (("gateway", 8080), ("auth", 8081)):
+            module = spring / name
+            java_dir = module / "src" / "main" / "java" / "com" / "example"
+            resources = module / "src" / "main" / "resources"
+            java_dir.mkdir(parents=True)
+            resources.mkdir(parents=True)
+            (java_dir / f"{name.title()}Application.java").write_text(
+                "package com.example;\n@SpringBootApplication\n"
+                f"public class {name.title()}Application {{}}\n",
+                encoding="utf-8",
+            )
+            (resources / "application.yml").write_text(
+                "spring:\n  data:\n    redis:\n      port: 6379\n"
+                f"server:\n  port: {port}\n",
+                encoding="utf-8",
+            )
+        spring_meta = detect_project(str(spring))
+        spring_ids = [unit.id for unit in spring_meta.runtime_units]
+        legacy_ids = [item[0] for item in spring_meta.spring_boot_modules]
+        if spring_ids != ["gateway", "auth"] or spring_ids != legacy_ids:
+            failed.append(f"Spring runtime IDs must preserve legacy module IDs: {spring_ids}")
+        elif [unit.expected_port for unit in spring_meta.runtime_units] != [8080, 8081]:
+            failed.append("Spring ports must ignore nested Redis/Mongo port values")
+
+        single_spring = root / "single-spring"
+        application = single_spring / "application"
+        java_dir = application / "src" / "main" / "java" / "com" / "example"
+        resources = application / "src" / "main" / "resources"
+        java_dir.mkdir(parents=True)
+        resources.mkdir(parents=True)
+        (single_spring / "build.gradle").write_text(
+            "plugins { id 'org.springframework.boot' version '3.2.0' }\n",
+            encoding="utf-8",
+        )
+        (single_spring / "settings.gradle").write_text(
+            "rootProject.name = 'single-spring'\ninclude 'application'\n",
+            encoding="utf-8",
+        )
+        (java_dir / "Application.java").write_text(
+            "package com.example;\n@SpringBootApplication\npublic class Application {}\n",
+            encoding="utf-8",
+        )
+        (resources / "application.yml").write_text(
+            "server:\n  port: 8989\n", encoding="utf-8",
+        )
+        single_spring_meta = detect_project(str(single_spring))
+        if [unit.id for unit in single_spring_meta.runtime_units] != ["application"]:
+            failed.append("single Spring submodule must preserve its legacy runtime ID")
+        if [item[0] for item in single_spring_meta.spring_boot_modules] != ["application"]:
+            failed.append("single Spring legacy module metadata must stay aligned")
+
+        workspace = root / "webapp-lerna"
+        packages = workspace / "packages"
+        for name in ("teacher", "student", "shared"):
+            (packages / name).mkdir(parents=True)
+        (workspace / "package.json").write_text(json.dumps({
+            "name": "webapp-lerna",
+            "workspaces": ["packages/*"],
+            "scripts": {
+                "dev-teacher": "lerna run dev --scope=teacher",
+                "build-teacher": "lerna run build --scope=teacher",
+            },
+        }), encoding="utf-8")
+        (workspace / "lerna.json").write_text(json.dumps({
+            "packages": ["packages/*"], "useWorkspaces": True,
+        }), encoding="utf-8")
+        for name, scripts in (
+            ("teacher", {"dev": "vite", "build": "vite build"}),
+            ("student", {"dev": "vite"}),
+            ("shared", {"build": "vite build"}),
+        ):
+            (packages / name / "package.json").write_text(json.dumps({
+                "name": name, "scripts": scripts,
+            }), encoding="utf-8")
+        (packages / "teacher" / "vite.config.js").write_text(
+            "export default {\n  server: {\n    port: 8881\n  }\n}\n",
+            encoding="utf-8",
+        )
+        (packages / "student" / "vite.config.js").write_text(
+            "export default {\n  server: {\n    port: 8882\n  }\n}\n",
+            encoding="utf-8",
+        )
+        workspace_meta = detect_project(str(workspace))
+        workspace_ids = [unit.id for unit in workspace_meta.runtime_units]
+        if workspace_meta.project_type != "frontend-workspace":
+            failed.append("Lerna workspace must use the frontend-workspace adapter")
+        if workspace_ids != ["student", "teacher"]:
+            failed.append(f"workspace runnable packages mismatch: {workspace_ids}")
+        if "shared" in workspace_ids:
+            failed.append("workspace library without dev script must not become a runtime unit")
+        ports = {unit.id: unit.expected_port for unit in workspace_meta.runtime_units}
+        if ports != {"student": 8882, "teacher": 8881}:
+            failed.append(f"workspace runtime ports mismatch: {ports}")
+
+        pnpm_workspace = root / "pnpm-suite"
+        pnpm_app = pnpm_workspace / "apps" / "portal"
+        pnpm_app.mkdir(parents=True)
+        (pnpm_workspace / "package.json").write_text(json.dumps({
+            "name": "pnpm-suite", "scripts": {},
+        }), encoding="utf-8")
+        (pnpm_workspace / "pnpm-lock.yaml").write_text("lockfileVersion: 9\n", encoding="utf-8")
+        (pnpm_workspace / "pnpm-workspace.yaml").write_text(
+            "packages:\n  - 'apps/*'\n", encoding="utf-8",
+        )
+        (pnpm_app / "package.json").write_text(json.dumps({
+            "name": "portal", "scripts": {"dev": "vite"},
+        }), encoding="utf-8")
+        pnpm_meta = detect_project(str(pnpm_workspace))
+        if [unit.id for unit in pnpm_meta.runtime_units] != ["portal"]:
+            failed.append("pnpm-workspace.yaml packages must become runtime units")
+
+        configured = root / "configured"
+        (configured / "api").mkdir(parents=True)
+        (configured / "worker").mkdir()
+        runtime_config = {
+            "units": [
+                {"id": "api", "cwd": "api", "start": ["tool", "api"],
+                 "expectedPort": 9000, "profiles": {
+                     "build": ["tool", "build-api"],
+                     "test": ["tool", "test-api"],
+                     "compile": ["tool", "compile-api"],
+                 }},
+                {"id": "worker", "cwd": "worker", "start": ["tool", "worker"],
+                 "dependsOn": ["api"], "stop": ["tool", "stop-worker"]},
+            ],
+        }
+        configured_meta = detect_project(str(configured), runtime_config=runtime_config)
+        groups = runtime_start_groups(configured_meta.runtime_units)
+        if [[unit.id for unit in group] for group in groups] != [["api"], ["worker"]]:
+            failed.append("configured runtime dependency order is unstable")
+        if configured_meta.runtime_units[1].stop_command != ("tool", "stop-worker"):
+            failed.append("configured stop argv must remain structured")
+        api_unit = configured_meta.runtime_unit("api")
+        api_profiles = {
+            profile.name: profile for profile in configured_meta.profiles
+            if profile.name in api_unit.profile_names
+        }
+        if len(api_profiles) != 4:
+            failed.append(f"configured runtime profiles are incomplete: {list(api_profiles)}")
+        for profile_name in api_profiles:
+            owner = configured_meta.runtime_for_profile(profile_name)
+            if owner is not api_unit:
+                failed.append(f"profile owner lookup failed: {profile_name}")
+
+        from types import SimpleNamespace
+        from src.ui.project_tab import ProjectTab
+
+        class ProfileRunner:
+            def __init__(self):
+                self.contexts = []
+
+            def start(self, _command, context):
+                self.contexts.append(context)
+                return True
+
+        class ProfileLog:
+            def begin_run(self, _name):
+                pass
+
+            def append_line(self, _stream, _line):
+                pass
+
+            def end_run(self):
+                pass
+
+        class ProfileController:
+            def profile_start_error(self, _profile):
+                return None
+
+            def begin_launch(self, _module):
+                return 1
+
+            def launch_started(self, _module, _generation, _runner):
+                pass
+
+            def launch_failed(self, _module, _generation):
+                pass
+
+        profile_runner = ProfileRunner()
+        profile_tab = SimpleNamespace(
+            project_meta=configured_meta,
+            service_controller=ProfileController(),
+            log=ProfileLog(), runner=profile_runner, _current_profile=None,
+        )
+        for profile in api_profiles.values():
+            if not ProjectTab._start_profile(profile_tab, profile, enforce_guard=False):
+                failed.append(f"configured profile failed to start: {profile.name}")
+        expected_api_cwd = (configured / "api").resolve()
+        if any(Path(context.cwd).resolve() != expected_api_cwd for context in profile_runner.contexts):
+            failed.append("every runtime profile must use its unit cwd")
+
+        invalid_configs = (
+            ({"units": [
+                {"id": "api", "start": ["tool"]},
+                {"id": "API", "start": ["tool"]},
+            ]}, "duplicate runtime unit ID"),
+            ({"units": [
+                {"id": "api", "start": ["tool"], "dependsOn": ["missing"]},
+            ]}, "unknown runtime dependency"),
+            ({"units": [
+                {"id": "a", "start": ["tool"], "dependsOn": ["b"]},
+                {"id": "b", "start": ["tool"], "dependsOn": ["a"]},
+            ]}, "runtime dependency cycle"),
+            ({"units": [
+                {"id": "escape", "cwd": "..", "start": ["tool"]},
+            ]}, "runtime cwd boundary"),
+        )
+        for config, label in invalid_configs:
+            try:
+                detect_project(str(configured), runtime_config=config)
+            except ValueError:
+                pass
+            else:
+                failed.append(f"{label} must fail during detection")
+
+    real_workspace = ROOT.parents[2] / "xxpt" / "webapp-lerna"
+    if real_workspace.is_dir():
+        real_meta = detect_project(str(real_workspace))
+        real_units = {
+            unit.id: unit.expected_port for unit in real_meta.runtime_units
+        }
+        expected = {"m-stu": 8890, "pc-stu": 5174, "pc-teacher": 8881}
+        if real_units != expected:
+            failed.append(f"real xxpt/webapp-lerna runtimes mismatch: {real_units}")
+
+    real_single_spring = ROOT.parents[2] / "framework-admin"
+    if real_single_spring.is_dir():
+        real_spring_meta = detect_project(str(real_single_spring))
+        if [unit.id for unit in real_spring_meta.runtime_units] != ["application"]:
+            failed.append(
+                "real framework-admin must keep legacy runtime ID 'application'"
+            )
+
+    if failed:
+        for msg in failed:
+            print(f"[FAIL] runtime_units: {msg}", flush=True)
+    else:
+        print("[OK]   runtime unit detection and configuration", flush=True)
+    return failed
+
+
 def git_context_check() -> list[str]:
     """验证 Git AI 上下文的标签、排序和摘要格式。"""
     from src.core.git_context import build_ai_text, sort_changed_files, status_label, summary_from_changes
@@ -1968,6 +2473,7 @@ def hex_scan() -> list[tuple[str, int, str]]:
 if __name__ == "__main__":
     failed = import_check()
     model_failed = service_state_check()
+    runtime_unit_failed = runtime_unit_check()
     cli_failed = cli_parse_check()
     preflight_failed = preflight_isolation_check()
     cli_encoding_failed = cli_output_encoding_check()
@@ -1975,6 +2481,7 @@ if __name__ == "__main__":
     git_executable_failed = git_executable_resolution_check()
     cli_match_failed = cli_project_match_check()
     launch_guard_failed = launch_and_operation_guard_check()
+    runtime_stop_failed = runtime_stop_execution_check()
     compile_wait_failed = compile_wait_check()
     workspace_cli_thread_failed = workspace_cli_thread_check()
     cli_reliability_failed = cli_response_and_packaging_check()
@@ -2005,10 +2512,12 @@ if __name__ == "__main__":
             print(f"[HEX]  {rel}:{ln}: {safe}")
 
     total_fail = (
-        len(failed) + len(model_failed) + len(cli_failed) + len(preflight_failed)
+        len(failed) + len(model_failed) + len(runtime_unit_failed)
+        + len(cli_failed) + len(preflight_failed)
         + len(cli_encoding_failed) + len(launcher_failed)
         + len(git_executable_failed)
         + len(cli_match_failed) + len(launch_guard_failed)
+        + len(runtime_stop_failed)
         + len(compile_wait_failed) + len(workspace_cli_thread_failed)
         + len(cli_reliability_failed)
         + len(file_failed) + len(preview_failed)
