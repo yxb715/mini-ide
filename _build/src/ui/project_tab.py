@@ -33,6 +33,7 @@ from src.core.service_state import (
     ServiceState, running_items,
 )
 from src.ui.file_tree import FileTree
+from src.ui.content_search import ContentSearchDialog
 from src.ui.git_viewer import GitViewer
 from src.ui.log_widget import LogWidget
 from src.ui.project_service_controller import ProjectServiceController
@@ -2147,7 +2148,7 @@ class ProjectTab(QWidget):
     def _register_shortcuts(self) -> None:
         # 快捷键已上移到 MainWindow 统一注册（窗口级，焦点在哪都生效，
         # 多 tab 不冲突），由 MainWindow 路由到当前可见 tab 的下列 public 方法：
-        #   Ctrl+Shift+N → open_file_picker
+        #   Ctrl+Shift+N → open_file_picker      Ctrl+Shift+F → open_content_search
         #   Ctrl+E       → open_recent_files      Ctrl+Shift+P → open_command_palette
         #   Ctrl+\\       → open_endpoint_picker   Ctrl+Shift+R → restart_project
         #   Ctrl+W       → close_current_file_tab
@@ -2170,6 +2171,12 @@ class ProjectTab(QWidget):
             on_pick=lambda p: self._show_preview(p, 0, 0),
             parent=self,
         )
+        dlg.show()
+
+    def open_content_search(self) -> None:
+        """Ctrl+Shift+F：在当前项目内搜索文件内容。"""
+        dlg = ContentSearchDialog(self.project_meta.path, parent=self)
+        dlg.open_requested.connect(lambda p, l, c: self._show_preview(p, l, c))
         dlg.show()
 
     def open_recent_files(self) -> None:
@@ -2226,6 +2233,7 @@ class ProjectTab(QWidget):
             commands.append(("↻  重启项目", "Ctrl+Shift+R", self._restart))
 
         commands.append(("🔍  搜索文件名", "Ctrl+Shift+N", self.open_file_picker))
+        commands.append(("🔎  搜索文件内容", "Ctrl+Shift+F", self.open_content_search))
         commands.append(("🎯  接口地址跳转", "Ctrl+\\  定位 Controller 方法", self.open_endpoint_picker))
         commands.append(("⏱  最近打开的文件", "Ctrl+E", self.open_recent_files))
         commands.append(("📁  打开项目目录", "用资源管理器", lambda: open_folder(self.project_meta.path)))

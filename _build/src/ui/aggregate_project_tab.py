@@ -47,11 +47,12 @@ action_log = logging.getLogger("mini-ide.action")
 
 
 class _PrepareProjectsWorker(QThread):
-    done = Signal(object)
+    done = Signal(object, int)
 
-    def __init__(self, items: tuple[dict, ...], parent=None):
+    def __init__(self, items: tuple[dict, ...], generation: int, parent=None):
         super().__init__(parent)
         self.items = items
+        self.generation = generation
 
     def run(self) -> None:
         results = []
@@ -64,7 +65,7 @@ class _PrepareProjectsWorker(QThread):
                 results.append({**item, "meta": meta, "branch": branch, "error": ""})
             except Exception as exc:
                 results.append({**item, "meta": None, "branch": "", "error": str(exc)})
-        self.done.emit(results)
+        self.done.emit(results, self.generation)
 
 
 class _SaveProjectWorker(QThread):
@@ -219,6 +220,7 @@ class AggregateProjectTab(QWidget):
         self._workspace_summaries = ()
         self._pending_workspace_path = ""
         self._prepare_worker: _PrepareProjectsWorker | None = None
+        self._prepare_generation = 0
         self._save_worker: _SaveProjectWorker | None = None
         self._workspace_worker: _WorkspaceSnapshotWorker | None = None
         self._create_worker: _CreateWorkspaceWorker | None = None
@@ -355,6 +357,7 @@ class AggregateProjectTab(QWidget):
         self.sync_button.clicked.connect(self._sync_selected_workspace)
         actions.addWidget(self.sync_button)
         self.merge_button = QPushButton("合并代码")
+        self.merge_button.setToolTip("自动提交工作区改动，再快进合并到源目录基准分支")
         self.merge_button.clicked.connect(self._merge_selected_workspace)
         actions.addWidget(self.merge_button)
         self.delete_button = QPushButton("删除")
@@ -431,6 +434,8 @@ class AggregateProjectTab(QWidget):
         } for item in self.aggregate_project.components)
 
     def _start_prepare(self) -> None:
+        self._prepare_generation += 1
+        generation = self._prepare_generation
         self.project_progress.setText("正在识别项目...")
         pending = []
         for item in self._project_items():
@@ -446,17 +451,21 @@ class AggregateProjectTab(QWidget):
                 pending.append(item)
         self._existing_tabs = {}
         if not pending:
-            self._projects_prepared([])
+            self._prepare_worker = None
+            self._projects_prepared([], generation)
             return
-        worker = _PrepareProjectsWorker(tuple(pending), QApplication.instance())
+        worker = _PrepareProjectsWorker(
+            tuple(pending), generation, QApplication.instance(),
+        )
         self._prepare_worker = worker
         worker.done.connect(self._projects_prepared)
         worker.finished.connect(worker.deleteLater)
         worker.start()
 
-    def _projects_prepared(self, results: list[dict]) -> None:
-        if self._prepare_worker is not None and self.sender() is self._prepare_worker:
-            self._prepare_worker = None
+    def _projects_prepared(self, results: list[dict], generation: int) -> None:
+        if generation != self._prepare_generation:
+            return
+        self._prepare_worker = None
         for item in results:
             self._install_project(item)
         ready = len(self._project_tabs)
@@ -937,7 +946,11 @@ class AggregateProjectTab(QWidget):
             f"- {item.id}: {item.task_branch} -> {item.base_branch}"
             for item in editable
         )
-        lines.append("\n源目录和工作区必须无未提交改动，分支分叉时不会自动合并。确认继续？")
+        commit_message = summary.workspace.name.strip() or summary.workspace.id
+        lines.append(
+            f"\n将先自动提交各工作区的全部改动，提交信息为“{commit_message}”，"
+            "再合并到基准分支。源目录必须无未提交改动，分支分叉时不会自动合并。确认继续？"
+        )
         answer = QMessageBox.question(
             self,
             "确认合并代码",
@@ -947,7 +960,7 @@ class AggregateProjectTab(QWidget):
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
-        self.workspace_status.setText("正在检查并合并代码...")
+        self.workspace_status.setText("正在提交并合并代码...")
         worker = _MergeWorkspaceWorker(summary.workspace, QApplication.instance())
         self._merge_worker = worker
         self._update_workspace_buttons()
@@ -1249,6 +1262,11 @@ class AggregateProjectTab(QWidget):
         tab = self._current_project_tab()
         if tab:
             tab.open_file_picker()
+
+    def open_content_search(self) -> None:
+        tab = self._current_project_tab()
+        if tab:
+            tab.open_content_search()
 
     def open_recent_files(self) -> None:
         tab = self._current_project_tab()

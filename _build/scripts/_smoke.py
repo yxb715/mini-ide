@@ -50,6 +50,7 @@ modules = [
     "src.core.file_index",
     "src.core.controller_index",
     "src.ui.quick_open",
+    "src.ui.content_search",
     "src.core.git_ops",
     "src.ui.git_viewer",
     "src.ui.main_window",
@@ -825,27 +826,44 @@ def development_workspace_lifecycle_check() -> list[str]:
             )
 
             merge_dirty = worktree / "MERGE_DIRTY.txt"
-            merge_dirty.write_text("block merge\n", encoding="utf-8")
-            dirty_merge = service.merge_development_workspace(workspace)
-            if dirty_merge.ok or "工作区有未提交" not in dirty_merge.error:
-                failed.append("workspace merge must block dirty task Worktrees")
-            merge_dirty.unlink()
-            delete_plan = service.inspect_workspace_delete(workspace)
-            if delete_plan.can_delete or not any("未合并" in item for item in delete_plan.blockers):
-                failed.append("unmerged and unpushed task branch must block deletion")
-
+            merge_dirty.write_text("auto commit\n", encoding="utf-8")
             if not (repo_one / "LOCAL_ONLY.txt").is_file():
                 failed.append("workspace creation and Review must preserve source dirty files")
             base_head = git("-C", str(repo_one), "rev-parse", "HEAD")
+            task_head = git("-C", str(worktree), "rev-parse", "HEAD")
             blocked_merge = service.merge_development_workspace(workspace)
             if blocked_merge.ok or "源目录有未提交" not in blocked_merge.error:
                 failed.append("workspace merge must block a dirty source checkout")
             if git("-C", str(repo_one), "rev-parse", "HEAD") != base_head:
                 failed.append("blocked workspace merge must not move the base branch")
+            if git("-C", str(worktree), "rev-parse", "HEAD") != task_head:
+                failed.append("source preflight failure must not commit task changes")
             (repo_one / "LOCAL_ONLY.txt").unlink()
+
+            original_run_git = service._run_git
+
+            def fail_auto_commit(cwd, args, timeout=30):
+                if args[:2] == ["commit", "-m"]:
+                    return 1, "", "injected commit failure"
+                return original_run_git(cwd, args, timeout)
+
+            service._run_git = fail_auto_commit
+            try:
+                commit_failed = service.merge_development_workspace(workspace)
+            finally:
+                service._run_git = original_run_git
+            if commit_failed.ok or "自动提交失败" not in commit_failed.error:
+                failed.append("auto-commit failure must stop workspace merge")
+            if git("-C", str(repo_one), "rev-parse", "HEAD") != base_head:
+                failed.append("auto-commit failure must not move the base branch")
+
             merge_result = service.merge_development_workspace(workspace)
             if not merge_result.ok or not all(item.merged for item in merge_result.components):
-                failed.append(f"clean workspace should fast-forward merge: {merge_result.error}")
+                failed.append(f"dirty workspace should auto-commit and merge: {merge_result.error}")
+            elif git("-C", str(worktree), "log", "-1", "--format=%s") != workspace.name:
+                failed.append("workspace merge should use the workspace name as commit message")
+            elif git("-C", str(worktree), "status", "--porcelain"):
+                failed.append("auto-committed Worktree should be clean")
             merged_workspace = load_development_workspace(
                 workspace.root_path, aggregate_project=project,
             )
@@ -938,6 +956,16 @@ def aggregate_runtime_ui_check() -> list[str]:
             failed.append("aggregate root must open as aggregate environment, not generic project")
         if tab.project_table.rowCount() != 2 or set(tab.component_tabs) != {"server", "webapp"}:
             failed.append("aggregate tab must keep all projects inside one top-level workbench")
+        original_rows = tab.project_table.rowCount()
+        original_components = set(tab.component_tabs)
+        tab._projects_prepared(
+            [dict(tab._metadata["server"])], tab._prepare_generation - 1,
+        )
+        if (
+            tab.project_table.rowCount() != original_rows
+            or set(tab.component_tabs) != original_components
+        ):
+            failed.append("stale project discovery must not append rows after switching environments")
         if tab.view_tabs.count() != 2 or tab.view_tabs.tabText(1) != "需求工作区":
             failed.append("aggregate tab must contain its own workspace panel")
         if tab.detail_stack.count() != 3:
@@ -1761,6 +1789,7 @@ def aggregate_scan_isolation_check() -> list[str]:
     from src.core.file_index import _IndexWorker, _should_ignore
     from src.core.path_utils import normalized_path_key
     from src.core.workspace_manager import ensure_workspace_candidates
+    from src.ui.content_search import SearchWorker
 
     failed: list[str] = []
     with tempfile.TemporaryDirectory() as tmp:
@@ -1814,6 +1843,29 @@ def aggregate_scan_isolation_check() -> list[str]:
         indexed_paths = {item.abs_path for item in indexed}
         if str(source_file) not in indexed_paths or str(duplicate_file) in indexed_paths:
             failed.append("file index must include source components and exclude Worktrees")
+
+        walked_matches: list = []
+        collected: list[str] = []
+        walk_search = SearchWorker(
+            root=str(root), query="needle", case_sensitive=False,
+            whole_word=False, use_regex=False, include_exts=[],
+        )
+        walk_search.match_found.connect(lambda batch: walked_matches.extend(batch))
+        walk_search.files_collected.connect(lambda files: collected.extend(files))
+        walk_search.run()
+        if len(walked_matches) != 1 or str(duplicate_file) in collected:
+            failed.append("walk search must not read or cache files under workspaceDirectory")
+
+        cached_matches: list = []
+        cached_search = SearchWorker(
+            root=str(root), query="needle", case_sensitive=False,
+            whole_word=False, use_regex=False, include_exts=[],
+            file_list=[str(source_file), str(duplicate_file)],
+        )
+        cached_search.match_found.connect(lambda batch: cached_matches.extend(batch))
+        cached_search.run()
+        if len(cached_matches) != 1 or cached_matches[0].abs_path != str(source_file):
+            failed.append("cached search must discard stale workspaceDirectory entries")
 
         endpoints: list = []
         controller_worker = _ControllerWorker(str(root))

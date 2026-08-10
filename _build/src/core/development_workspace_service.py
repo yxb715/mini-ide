@@ -593,11 +593,18 @@ def review_development_workspace(
     return review
 
 
-def _merge_preflight_error(item: WorkspaceComponent) -> str:
+def _merge_preflight_error(
+    item: WorkspaceComponent,
+    *,
+    allow_worktree_changes: bool = False,
+) -> str:
     code, status, err = _run_git(item.worktree_path, ["status", "--porcelain"], 15)
     if code != 0:
         return err or "无法读取工作区状态"
-    if _unexpected_worktree_status(status, item.workspace_copy_files):
+    worktree_changes = _unexpected_worktree_status(
+        status, item.workspace_copy_files,
+    )
+    if not allow_worktree_changes and worktree_changes:
         return "工作区有未提交或未跟踪文件"
     code, branch, err = _run_git(
         item.worktree_path, ["branch", "--show-current"], 10,
@@ -635,8 +642,48 @@ def _merge_preflight_error(item: WorkspaceComponent) -> str:
         15,
     )
     if already_merged == 0:
+        if allow_worktree_changes and worktree_changes:
+            return "基准分支已有新提交，请先同步源分支"
         return ""
     return err or merged_err or "基准分支与任务分支已分叉，不能快进合并"
+
+
+def _commit_worktree_changes(
+    item: WorkspaceComponent,
+    message: str,
+) -> str:
+    """提交任务 Worktree 的全部改动；受管理的复制文件仍按现有规则排除。"""
+    code, status, err = _run_git(item.worktree_path, ["status", "--porcelain"], 15)
+    if code != 0:
+        return err or "无法读取工作区状态"
+    if not _unexpected_worktree_status(status, item.workspace_copy_files):
+        return ""
+
+    managed = {
+        path.replace("\\", "/").casefold(): path
+        for path in item.workspace_copy_files
+    }
+    managed_untracked = [
+        managed[line[3:].replace("\\", "/").casefold()]
+        for line in status.splitlines()
+        if line.startswith("?? ")
+        and line[3:].replace("\\", "/").casefold() in managed
+    ]
+    code, out, err = _run_git(item.worktree_path, ["add", "--all", "--", "."], 60)
+    if code != 0:
+        return err or out or "自动暂存改动失败"
+    for relative in managed_untracked:
+        code, out, err = _run_git(
+            item.worktree_path, ["reset", "--", relative], 30,
+        )
+        if code != 0:
+            return err or out or f"排除工作区复制文件失败：{relative}"
+    code, out, err = _run_git(
+        item.worktree_path, ["commit", "-m", message], 120,
+    )
+    if code != 0:
+        return err or out or "自动提交改动失败"
+    return ""
 
 
 def merge_development_workspace(
@@ -652,6 +699,50 @@ def merge_development_workspace(
         if not editable:
             return WorkspaceMergeResult(False, workspace, (), "工作区没有可合并的项目")
 
+        # 先校验源目录、分支和分叉关系；源目录不满足条件时不应先提交任务改动。
+        checked = tuple(
+            WorkspaceMergeComponent(
+                item.id, item.base_branch, item.task_branch, False,
+                _merge_preflight_error(
+                    item, allow_worktree_changes=True,
+                ),
+            )
+            for item in editable
+        )
+        blockers = [f"{item.id}：{item.error}" for item in checked if item.error]
+        if blockers:
+            return WorkspaceMergeResult(False, workspace, checked, "；".join(blockers))
+
+        commit_message = workspace.name.strip() or workspace.id
+        committed: list[WorkspaceMergeComponent] = []
+        for index, item in enumerate(editable):
+            commit_error = _commit_worktree_changes(item, commit_message)
+            if commit_error:
+                failed = WorkspaceMergeComponent(
+                    item.id, item.base_branch, item.task_branch, False,
+                    f"自动提交失败：{commit_error}",
+                )
+                committed.extend(
+                    WorkspaceMergeComponent(
+                        previous.id, previous.base_branch, previous.task_branch,
+                        False, "已自动提交，尚未合并",
+                    )
+                    for previous in editable[:index]
+                )
+                committed.append(failed)
+                committed.extend(
+                    WorkspaceMergeComponent(
+                        pending.id, pending.base_branch, pending.task_branch,
+                        False, "前序项目自动提交失败，未执行",
+                    )
+                    for pending in editable[index + 1:]
+                )
+                return WorkspaceMergeResult(
+                    False, workspace, tuple(committed),
+                    f"{item.id}：自动提交失败：{commit_error}",
+                )
+
+        # 提交钩子可能产生额外改动，提交后再次执行完整预检。
         checked = tuple(
             WorkspaceMergeComponent(
                 item.id, item.base_branch, item.task_branch, False,
