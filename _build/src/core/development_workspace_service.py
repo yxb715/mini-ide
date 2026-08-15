@@ -19,6 +19,7 @@ from src.core.path_utils import (
     canonical_path, is_path_within, normalized_path_key, resolve_path_within,
 )
 from src.util.git_executable import resolve_git_executable
+from src.util.pinyin import to_pinyin
 
 
 CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
@@ -136,6 +137,24 @@ class WorkspaceMergeResult:
 
 
 @dataclass(frozen=True)
+class WorkspaceCommitPushComponent:
+    id: str
+    task_branch: str
+    committed: bool = False
+    pushed: bool = False
+    commit_id: str = ""
+    error: str = ""
+
+
+@dataclass(frozen=True)
+class WorkspaceCommitPushResult:
+    ok: bool
+    workspace: DevelopmentWorkspace
+    components: tuple[WorkspaceCommitPushComponent, ...]
+    error: str = ""
+
+
+@dataclass(frozen=True)
 class WorkspaceDeleteComponent:
     id: str
     dirty: bool
@@ -186,9 +205,14 @@ def workspace_id_from_name(name: str) -> str:
     raw = str(name or "").strip()
     if not raw or any(char in raw for char in ("/", "\\")):
         raise WorkspaceOperationError("任务名不能为空，也不能包含路径分隔符")
-    value = _TASK_SAFE_RE.sub("-", raw).strip("-._")
+    pinyin, unsupported = to_pinyin(raw)
+    if unsupported:
+        raise WorkspaceOperationError(
+            "任务名包含无法转为拼音的汉字：" + "、".join(dict.fromkeys(unsupported))
+        )
+    value = _TASK_SAFE_RE.sub("-", pinyin).strip("-._").lower()
     if not value:
-        value = datetime.now().strftime("task-%Y%m%d-%H%M%S")
+        raise WorkspaceOperationError("任务名无法生成有效的拼音目录名")
     return validate_stable_id(value[:128], "workspace id")
 
 
@@ -365,7 +389,7 @@ def _task_agents_text(plan: WorkspaceCreationPlan) -> str:
         "## mini-ide 约束\n\n"
         "- 服务启动、停止、健康检查、日志、诊断和编译必须走 mini-ide CLI 或 GUI。\n"
         "- 工作区创建、Review 和删除必须走 mini-ide；不要手工移动或递归删除 Worktree。\n"
-        "- Codex 和 cc 的工作目录必须保持为当前任务根目录。\n"
+        "- codex 和 cc 的工作目录必须保持为当前任务根目录。\n"
     )
 
 
@@ -684,6 +708,95 @@ def _commit_worktree_changes(
     if code != 0:
         return err or out or "自动提交改动失败"
     return ""
+
+
+def commit_and_push_development_workspace(
+    workspace: DevelopmentWorkspace,
+    message: str = "",
+) -> WorkspaceCommitPushResult:
+    """提交并推送任务 Worktree；不强推，失败后停止后续项目。"""
+    operation_key = normalized_path_key(workspace.root_path)
+    with _OPERATION_LOCK:
+        if operation_key in _ACTIVE_OPERATIONS:
+            return WorkspaceCommitPushResult(
+                False, workspace, (), "工作区正在执行其它操作",
+            )
+        _ACTIVE_OPERATIONS.add(operation_key)
+    try:
+        editable = [item for item in workspace.components if item.mode == "worktree"]
+        if not editable:
+            return WorkspaceCommitPushResult(False, workspace, (), "工作区没有可提交的项目")
+        commit_message = str(message or "").strip() or workspace.name.strip() or workspace.id
+        results: list[WorkspaceCommitPushComponent] = []
+        for index, item in enumerate(editable):
+            code, branch, err = _run_git(
+                item.worktree_path, ["branch", "--show-current"], 10,
+            )
+            if code != 0:
+                error = err or "无法读取任务分支"
+            elif branch != item.task_branch:
+                error = f"工作区当前分支不是 {item.task_branch}"
+            else:
+                error = ""
+            if not error:
+                code, remote, err = _run_git(
+                    item.worktree_path, ["remote", "get-url", "origin"], 10,
+                )
+                if code != 0 or not remote:
+                    error = err or "未配置 origin 远程仓库"
+            committed = False
+            pushed = False
+            commit_id = ""
+            if not error:
+                before_code, before_head, _before_err = _run_git(
+                    item.worktree_path, ["rev-parse", "HEAD"], 10,
+                )
+                commit_error = _commit_worktree_changes(item, commit_message)
+                if commit_error:
+                    error = f"提交失败：{commit_error}"
+                else:
+                    code, commit_id, _err = _run_git(
+                        item.worktree_path, ["rev-parse", "HEAD"], 10,
+                    )
+                    if code != 0:
+                        commit_id = ""
+                    committed = bool(
+                        before_code == 0 and code == 0 and commit_id != before_head
+                    )
+            if not error:
+                code, out, err = _run_git(
+                    item.worktree_path,
+                    ["push", "--set-upstream", "origin", item.task_branch],
+                    300,
+                )
+                if code != 0:
+                    error = err or out or "推送失败"
+                else:
+                    pushed = True
+            results.append(WorkspaceCommitPushComponent(
+                id=item.id,
+                task_branch=item.task_branch,
+                committed=committed,
+                pushed=pushed,
+                commit_id=commit_id,
+                error=error,
+            ))
+            if error:
+                results.extend(
+                    WorkspaceCommitPushComponent(
+                        id=pending.id,
+                        task_branch=pending.task_branch,
+                        error="前序项目提交或推送失败，未执行",
+                    )
+                    for pending in editable[index + 1:]
+                )
+                return WorkspaceCommitPushResult(
+                    False, workspace, tuple(results), f"{item.id}：{error}",
+                )
+        return WorkspaceCommitPushResult(True, workspace, tuple(results))
+    finally:
+        with _OPERATION_LOCK:
+            _ACTIVE_OPERATIONS.discard(operation_key)
 
 
 def merge_development_workspace(

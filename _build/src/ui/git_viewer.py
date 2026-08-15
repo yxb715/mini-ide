@@ -67,7 +67,7 @@ class DiffHighlighter(QSyntaxHighlighter):
     @staticmethod
     def _mk(color: str, bold: bool = False, italic: bool = False) -> QTextCharFormat:
         fmt = QTextCharFormat()
-        fmt.setForeground(QColor(color))
+        fmt.setForeground(QColor(str(color)))
         if bold:
             fmt.setFontWeight(QFont.Weight.DemiBold)
         if italic:
@@ -160,12 +160,23 @@ class GitViewer(QDialog):
         f.setFamilies(["Cascadia Mono", "Consolas"])
         f.setPointSize(FONT_PT_DIFF)
         self.diff_view.setFont(f)
-        DiffHighlighter(self.diff_view.document())
+        self.diff_highlighter = DiffHighlighter(self.diff_view.document())
         split.addWidget(self.diff_view)
 
         split.setSizes([280, 900])
         lay.addWidget(split)
         return w
+
+    def refresh_theme(self) -> None:
+        self.lbl_summary.setStyleSheet(f"color:{FG_SECONDARY};")
+        self._update_header(self._current_branch, self._current_files)
+        for index in range(self.changes_list.count()):
+            item = self.changes_list.item(index)
+            changed = item.data(Qt.ItemDataRole.UserRole)
+            if changed is not None:
+                item.setForeground(QColor(str(self._status_color(changed))))
+        self.diff_highlighter = DiffHighlighter(self.diff_view.document())
+        self.diff_highlighter.rehighlight()
 
     def _status_label(self, f: git_ops.ChangedFile) -> str:
         return git_context.status_label(f)
@@ -233,7 +244,7 @@ class GitViewer(QDialog):
             item = QListWidgetItem(f"[{label}]  {f.path}{stat_text}")
             item.setData(Qt.ItemDataRole.UserRole, f)
             item.setToolTip(f"{f.status}  {f.path}")
-            item.setForeground(QColor(self._status_color(f)))
+            item.setForeground(QColor(str(self._status_color(f))))
             self.changes_list.addItem(item)
             if f.path == current_path:
                 target_row = self.changes_list.count() - 1

@@ -7,7 +7,7 @@ from pathlib import Path
 import psutil
 from PySide6.QtCore import QThread, QTimer, Signal
 from PySide6.QtGui import (
-    QAction, QCloseEvent, QDragEnterEvent, QDropEvent, QIcon,
+    QAction, QActionGroup, QCloseEvent, QDragEnterEvent, QDropEvent, QIcon,
     QKeySequence, QShortcut,
 )
 from PySide6.QtWidgets import (
@@ -81,7 +81,7 @@ class MainWindow(QMainWindow):
         self.config = config
         self._quit_requested = False
         self.setWindowTitle("mini-ide")
-        self.resize(1400, 860)
+        self.resize(1480, 900)
         self.setMinimumSize(960, 600)
         self.setAcceptDrops(True)
 
@@ -103,6 +103,8 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self.empty)
 
         self.tabs = QTabWidget()
+        self.tabs.setObjectName("main_tabs")
+        self.tabs.setDocumentMode(True)
         self.tabs.setTabsClosable(True)
         self.tabs.setMovable(True)
         self.tabs.tabCloseRequested.connect(self._close_tab)
@@ -145,7 +147,6 @@ class MainWindow(QMainWindow):
             ("Ctrl+Shift+N", "open_file_picker"),
             ("Ctrl+Shift+F", "open_content_search"),
             ("Ctrl+E", "open_recent_files"),
-            ("Ctrl+Shift+P", "open_command_palette"),
             ("Ctrl+\\", "open_endpoint_picker"),
             ("Ctrl+Shift+R", "restart_project"),
             ("Ctrl+W", "close_current_file_tab"),
@@ -180,6 +181,24 @@ class MainWindow(QMainWindow):
         quit_act.triggered.connect(self._request_quit)
         self.file_menu.addAction(quit_act)
 
+        view_menu = mb.addMenu("视图(&V)")
+        theme_menu = view_menu.addMenu("主题")
+        self.theme_action_group = QActionGroup(self)
+        self.theme_action_group.setExclusive(True)
+        self.theme_actions: dict[str, QAction] = {}
+        from src.ui.theme import THEME_NAMES, normalize_theme_name
+        selected_theme = normalize_theme_name(self.config.theme)
+        for theme_id, label in THEME_NAMES.items():
+            action = QAction(label, self)
+            action.setCheckable(True)
+            action.setChecked(theme_id == selected_theme)
+            action.triggered.connect(
+                lambda checked=False, name=theme_id: checked and self._switch_theme(name)
+            )
+            self.theme_action_group.addAction(action)
+            theme_menu.addAction(action)
+            self.theme_actions[theme_id] = action
+
         help_menu = mb.addMenu("帮助(&H)")
         open_log_act = QAction("打开 mini-ide 日志", self)
         open_log_act.triggered.connect(self._open_app_log)
@@ -191,6 +210,35 @@ class MainWindow(QMainWindow):
         about = QAction("关于", self)
         about.triggered.connect(self._about)
         help_menu.addAction(about)
+
+    def _switch_theme(self, theme_name: str) -> None:
+        from src.ui.theme import apply_theme
+
+        app = QApplication.instance()
+        if app is None or theme_name == self.config.theme:
+            return
+        self.config.theme = apply_theme(app, theme_name)
+        action = self.theme_actions.get(self.config.theme)
+        if action is not None:
+            action.setChecked(True)
+        self.config.save()
+        self._theme_refresh_queue = list(app.allWidgets())
+        QTimer.singleShot(0, self._refresh_theme_batch)
+        log.info("切换主题: %s", self.config.theme)
+
+    def _refresh_theme_batch(self) -> None:
+        from src.ui.theme import apply_search_style
+
+        queue = getattr(self, "_theme_refresh_queue", [])
+        batch, self._theme_refresh_queue = queue[:80], queue[80:]
+        for widget in batch:
+            if widget.property("role") == "search":
+                apply_search_style(widget)
+            refresh = getattr(widget, "refresh_theme", None)
+            if callable(refresh):
+                refresh()
+        if self._theme_refresh_queue:
+            QTimer.singleShot(0, self._refresh_theme_batch)
 
     def _setup_tray(self) -> None:
         """创建托盘入口；窗口关闭后仍由托盘菜单负责唤回或退出。"""
@@ -254,8 +302,11 @@ class MainWindow(QMainWindow):
 
     def _build_statusbar(self) -> None:
         sb = self.statusBar()
+        sb.setSizeGripEnabled(False)
         self.lbl_project = QLabel("")
+        self.lbl_project.setProperty("role", "hint")
         self.lbl_mem = QLabel("")
+        self.lbl_mem.setProperty("role", "hint")
         sb.addWidget(self.lbl_project, 1)
         sb.addPermanentWidget(self.lbl_mem)
 

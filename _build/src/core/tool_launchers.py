@@ -87,7 +87,7 @@ def open_in_agentdesk_args(target_dir: Path, provider: str = "") -> list[str]:
 
 
 def open_in_codex_args(target_dir: Path) -> list[str]:
-    """Open the Codex entry in AgentDesk."""
+    """Open the codex entry in AgentDesk."""
     return open_in_agentdesk_args(target_dir, "codex")
 
 

@@ -21,7 +21,8 @@ from src.core.aggregate_workspace import (
     load_aggregate_project, load_development_workspace,
 )
 from src.core.development_workspace_service import (
-    build_workspace_creation_plan, create_development_workspace,
+    build_workspace_creation_plan, commit_and_push_development_workspace,
+    create_development_workspace,
     inspect_workspace_delete, review_development_workspace,
     sync_development_workspace,
 )
@@ -453,6 +454,32 @@ class _WorkspaceCommandWorker(QObject):
                     ],
                 })
                 return
+            if action == "workspace-commit-push":
+                result = commit_and_push_development_workspace(
+                    workspace, self.command.get("message", ""),
+                )
+                self.done.emit({
+                    "ok": result.ok,
+                    "error": result.error,
+                    "workspace": {
+                        "id": result.workspace.id,
+                        "name": result.workspace.name,
+                        "path": result.workspace.root_path,
+                        "status": result.workspace.status,
+                    },
+                    "projects": [
+                        {
+                            "id": item.id,
+                            "task_branch": item.task_branch,
+                            "committed": item.committed,
+                            "pushed": item.pushed,
+                            "commit_id": item.commit_id,
+                            "error": item.error,
+                        }
+                        for item in result.components
+                    ],
+                })
+                return
             if action == "workspace-sync":
                 result = sync_development_workspace(
                     workspace,
@@ -691,8 +718,8 @@ def _dispatch(cmd: dict, window: "MainWindow") -> dict:
         return _cmd_open_aggregate(window, cmd.get("target", ""))
 
     if action in (
-        "create-development-workspace", "workspace-review", "workspace-sync",
-        "workspace-delete-check",
+        "create-development-workspace", "workspace-review",
+        "workspace-commit-push", "workspace-sync", "workspace-delete-check",
     ):
         return {"ok": False, "error": f"{action} command uses async handler"}
 
@@ -757,7 +784,8 @@ def handle_async_cli_request(
     action = cmd.get("cmd")
     if action in (
         "list-workspaces", "open-workspace", "create-development-workspace",
-        "workspace-review", "workspace-sync", "workspace-delete-check",
+        "workspace-review", "workspace-commit-push", "workspace-sync",
+        "workspace-delete-check",
     ):
         _run_workspace_command_async(cmd, window, sock)
         return True

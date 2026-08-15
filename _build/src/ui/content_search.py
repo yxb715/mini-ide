@@ -286,8 +286,8 @@ class _HighlightDelegate(QStyledItemDelegate):
 
         # 高亮命中段
         fmt = QTextCharFormat()
-        fmt.setBackground(QColor(HIGHLIGHT_MATCH_BG))
-        fmt.setForeground(QColor(HIGHLIGHT_MATCH_FG))
+        fmt.setBackground(QColor(str(HIGHLIGHT_MATCH_BG)))
+        fmt.setForeground(QColor(str(HIGHLIGHT_MATCH_FG)))
         fmt.setFontWeight(700)
         cursor = QTextCursor(doc)
         try:
@@ -308,9 +308,9 @@ class _HighlightDelegate(QStyledItemDelegate):
         ctx = QAbstractTextDocumentLayout.PaintContext()
         # 默认（非高亮段）文字色：选中态用 FG_BRIGHT，正常态用 FG_PRIMARY
         if option.state & QStyle.StateFlag.State_Selected:
-            ctx.palette.setColor(QPalette.ColorRole.Text, QColor(FG_BRIGHT))
+            ctx.palette.setColor(QPalette.ColorRole.Text, QColor(str(FG_BRIGHT)))
         else:
-            ctx.palette.setColor(QPalette.ColorRole.Text, QColor(FG_PRIMARY))
+            ctx.palette.setColor(QPalette.ColorRole.Text, QColor(str(FG_PRIMARY)))
         doc.documentLayout().draw(painter, ctx)
         painter.restore()
 
@@ -413,12 +413,27 @@ class ContentSearchDialog(QDialog):
         # 默认 branch 三角箭头颜色取自 palette.Text，深底上的黑三角几乎看不见；
         # 把 Text role 改成 FG_SECONDARY，三角同步变浅蓝灰，可见度大幅提升
         tree_pal = self.tree.palette()
-        tree_pal.setColor(QPalette.ColorRole.Text, QColor(FG_SECONDARY))
+        tree_pal.setColor(QPalette.ColorRole.Text, QColor(str(FG_SECONDARY)))
         self.tree.setPalette(tree_pal)
         # 第二列装高亮 delegate（命中行内容里的 query 关键词色块标记）
         self._delegate = _HighlightDelegate(self.tree)
         self.tree.setItemDelegateForColumn(1, self._delegate)
         root_lay.addWidget(self.tree, 1)
+
+    def refresh_theme(self) -> None:
+        self.status.setStyleSheet(f"color:{FG_SECONDARY};")
+        palette = self.tree.palette()
+        palette.setColor(QPalette.ColorRole.Text, QColor(str(FG_SECONDARY)))
+        self.tree.setPalette(palette)
+        for index in range(self.tree.topLevelItemCount()):
+            parent = self.tree.topLevelItem(index)
+            parent.setForeground(0, QColor(str(FG_PRIMARY)))
+            parent.setForeground(1, QColor(str(FG_SECONDARY)))
+            for child_index in range(parent.childCount()):
+                child = parent.child(child_index)
+                child.setForeground(0, QColor(str(FG_DIM)))
+                child.setForeground(1, QColor(str(FG_PRIMARY)))
+        self.tree.viewport().update()
 
     # ---- 搜索控制 ----
 
@@ -515,8 +530,8 @@ class ContentSearchDialog(QDialog):
                 bold.setBold(True)
                 bold.setPointSize(bold.pointSize() + 1)   # 比子节点大一号，分组感强
                 parent.setFont(0, bold)
-                parent.setForeground(0, QColor(FG_PRIMARY))
-                parent.setForeground(1, QColor(FG_SECONDARY))
+                parent.setForeground(0, QColor(str(FG_PRIMARY)))
+                parent.setForeground(1, QColor(str(FG_SECONDARY)))
                 parent.setToolTip(0, m.abs_path)
                 parent.setToolTip(1, m.rel_path)
                 self.tree.addTopLevelItem(parent)
@@ -527,8 +542,8 @@ class ContentSearchDialog(QDialog):
             # 子节点：行号在第一列（"L 538"），命中行内容在第二列；行号弱色，内容主色
             child = QTreeWidgetItem([f"   L {m.line_no}", m.line_text])
             child.setData(0, Qt.ItemDataRole.UserRole, (m.abs_path, m.line_no, m.col_start))
-            child.setForeground(0, QColor(FG_DIM))
-            child.setForeground(1, QColor(FG_PRIMARY))
+            child.setForeground(0, QColor(str(FG_DIM)))
+            child.setForeground(1, QColor(str(FG_PRIMARY)))
             parent.addChild(child)
             self._file_counts[m.rel_path] += 1
             # 第二列同时显示「目录 · N 处命中」（命中数动态更新）

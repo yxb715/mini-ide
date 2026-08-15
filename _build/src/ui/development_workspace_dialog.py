@@ -54,7 +54,7 @@ class DevelopmentWorkspaceDialog(QDialog):
         form.setHorizontalSpacing(GAP_LG)
         form.setVerticalSpacing(GAP_SM)
         self.task_name = QLineEdit()
-        self.task_name.setPlaceholderText("例如 certificate")
+        self.task_name.setPlaceholderText("例如 直播系统对接")
         self.description = QPlainTextEdit()
         self.description.setPlaceholderText("任务目标和范围")
         form.addRow("任务名：", self.task_name)

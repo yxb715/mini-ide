@@ -100,6 +100,7 @@ class LogWidget(QWidget):
         root.setSpacing(0)
 
         self.toolbar = QWidget()
+        self.toolbar.setObjectName("compact_toolbar")
         tb = QHBoxLayout(self.toolbar)
         tb.setContentsMargins(6, 4, 6, 4)
         tb.setSpacing(6)
@@ -144,6 +145,7 @@ class LogWidget(QWidget):
 
         # 搜索栏
         self.search_bar = QWidget()
+        self.search_bar.setObjectName("compact_toolbar")
         sb = QHBoxLayout(self.search_bar)
         sb.setContentsMargins(6, 4, 6, 4)
         self.search_input = QLineEdit()
@@ -171,7 +173,7 @@ class LogWidget(QWidget):
     def _apply_formats(self) -> None:
         def mk(color: str, bold: bool = False, italic: bool = False) -> QTextCharFormat:
             fmt = QTextCharFormat()
-            fmt.setForeground(QColor(color))
+            fmt.setForeground(QColor(str(color)))
             if bold:
                 f = QFont(); f.setBold(True)
                 fmt.setFontWeight(QFont.Weight.Bold)
@@ -194,8 +196,30 @@ class LogWidget(QWidget):
             "plain":        mk(FG_PRIMARY),
         }
         self._fmt_link = QTextCharFormat()
-        self._fmt_link.setForeground(QColor(COLOR_LINK))
+        self._fmt_link.setForeground(QColor(str(COLOR_LINK)))
         self._fmt_link.setUnderlineStyle(QTextCharFormat.UnderlineStyle.SingleUnderline)
+
+    def refresh_theme(self) -> None:
+        self._apply_formats()
+        document = self.edit.document()
+        block = document.firstBlock()
+        while block.isValid():
+            index = block.blockNumber()
+            meta = self._lines[index] if index < len(self._lines) else None
+            cursor = QTextCursor(block)
+            cursor.select(QTextCursor.SelectionType.BlockUnderCursor)
+            cursor.setCharFormat(self._fmt.get(meta.kind if meta else "plain", self._fmt["plain"]))
+            if meta:
+                for jump in meta.jumps:
+                    link_cursor = QTextCursor(document)
+                    link_cursor.setPosition(block.position() + jump.start)
+                    link_cursor.setPosition(
+                        block.position() + jump.end,
+                        QTextCursor.MoveMode.KeepAnchor,
+                    )
+                    link_cursor.setCharFormat(self._fmt_link)
+            block = block.next()
+        self._update_counts(None)
 
     # ---- 对外 API ----
 

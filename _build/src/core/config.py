@@ -81,6 +81,8 @@ class AppConfig:
     #   auto：先试外部，失败回落内置
     file_open_mode: str = "preview"
     show_memory_usage: bool = True
+    # GitHub Dark / GitHub Light；由“视图 → 主题”即时切换。
+    theme: str = "github-dark"
     # 每个 Tab 保留的最大日志行数（超过会自动淘汰最旧）。
     # 10000 行 ≈ 1MB 显存；降低能省内存，但看历史日志范围变短。
     max_log_blocks: int = 10000
@@ -88,7 +90,7 @@ class AppConfig:
     # 不写死具体路径——每台机器首次启动时由 load() 自动探测（见 _default_project_dir_guess）。
     default_project_dir: str = ""
     # 聚合项目页左侧项目树宽度；用户拖动分隔条后跨会话保留。
-    aggregate_sidebar_width: int = 320
+    aggregate_sidebar_width: int = 280
 
     @classmethod
     def load(cls) -> "AppConfig":

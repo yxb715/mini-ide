@@ -12,8 +12,8 @@ from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QDialog, QHBoxLayout,
     QHeaderView, QLabel, QMessageBox, QPushButton, QSplitter, QStackedWidget,
-    QStyle, QTabWidget, QTableWidget, QTableWidgetItem, QToolButton,
-    QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
+    QStyle, QTabWidget, QToolButton, QTreeWidget, QTreeWidgetItem,
+    QVBoxLayout, QWidget, QFrame, QScrollArea, QSizePolicy,
 )
 
 from src.core.aggregate_workspace import (
@@ -22,7 +22,8 @@ from src.core.aggregate_workspace import (
 from src.core.aggregate_workspace_manager import build_workspace_dashboard_snapshot
 from src.core.config import AppConfig, ProjectEntry
 from src.core.development_workspace_service import (
-    create_development_workspace, delete_development_workspace,
+    commit_and_push_development_workspace, create_development_workspace,
+    delete_development_workspace,
     inspect_workspace_delete, merge_development_workspace,
     sync_development_workspace,
 )
@@ -40,12 +41,10 @@ from src.ui.development_workspace_dialog import DevelopmentWorkspaceDialog
 from src.ui.project_tab import ProjectTab
 from src.ui.theme import (
     COLOR_ERROR, COLOR_SUCCESS, COLOR_WARN, FG_DIM, GAP_LG, GAP_MD, GAP_NONE,
-    GAP_SM, H_TABLE_ROW,
+    GAP_SM,
 )
 
 action_log = logging.getLogger("mini-ide.action")
-PROJECT_KIND_ROLE = int(Qt.ItemDataRole.UserRole) + 1
-RUNTIME_ID_ROLE = int(Qt.ItemDataRole.UserRole) + 2
 
 
 class _PrepareProjectsWorker(QThread):
@@ -126,6 +125,23 @@ class _MergeWorkspaceWorker(QThread):
             self.done.emit(None, str(exc))
 
 
+class _CommitPushWorkspaceWorker(QThread):
+    done = Signal(object, str)
+
+    def __init__(self, workspace: DevelopmentWorkspace, message: str, parent=None):
+        super().__init__(parent)
+        self.workspace = workspace
+        self.message = message
+
+    def run(self) -> None:
+        try:
+            self.done.emit(
+                commit_and_push_development_workspace(self.workspace, self.message), "",
+            )
+        except Exception as exc:
+            self.done.emit(None, str(exc))
+
+
 class _SyncWorkspaceWorker(QThread):
     done = Signal(object, str)
 
@@ -187,6 +203,132 @@ class _DeleteWorkspaceWorker(QThread):
         self.done.emit(ok, kept, error)
 
 
+class _WorkspaceCard(QFrame):
+    selected = Signal(object)
+    activated = Signal(object)
+    action_requested = Signal(object, str)
+
+    def __init__(self, summary, current: bool, parent=None):
+        super().__init__(parent)
+        self.summary = summary
+        self.setObjectName("workspace_card")
+        self.setProperty("current", current)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(16, 14, 16, 14)
+        root.setSpacing(8)
+
+        head = QHBoxLayout()
+        head.setSpacing(8)
+        name = QLabel(summary.name)
+        name.setObjectName("workspace_card_title")
+        head.addWidget(name)
+        if current:
+            current_label = QLabel("当前工作区")
+            current_label.setObjectName("workspace_current")
+            head.addWidget(current_label)
+        head.addStretch(1)
+        if summary.error:
+            self._add_status(head, "配置错误", "error")
+        else:
+            self._add_status(
+                head,
+                f"{summary.git_change_count} 个未提交改动"
+                if summary.git_change_count else "工作区干净",
+                "warn" if summary.git_change_count else "ok",
+            )
+        root.addLayout(head)
+
+        divider = QFrame()
+        divider.setObjectName("workspace_card_divider")
+        divider.setFixedHeight(1)
+        root.addWidget(divider)
+
+        details = QVBoxLayout()
+        details.setSpacing(4)
+        project_row = QHBoxLayout()
+        project_row.setSpacing(7)
+        label = QLabel("修改项目")
+        label.setObjectName("workspace_card_label")
+        label.setFixedWidth(64)
+        project_row.addWidget(label)
+        for project_id in summary.component_ids:
+            chip = QLabel(project_id)
+            chip.setObjectName("workspace_project_chip")
+            project_row.addWidget(chip)
+        project_row.addStretch(1)
+        details.addLayout(project_row)
+
+        branch_row = QHBoxLayout()
+        branch_row.setSpacing(7)
+        branch_label = QLabel("任务分支")
+        branch_label.setObjectName("workspace_card_label")
+        branch_label.setFixedWidth(64)
+        branch_row.addWidget(branch_label)
+        branch = QLabel(
+            f'<a href="branches">{len(summary.task_branches)} 个任务分支 · 点击查看</a>'
+            if summary.task_branches else "无任务分支"
+        )
+        branch.setObjectName("workspace_branch_link")
+        branch.setTextInteractionFlags(Qt.TextInteractionFlag.LinksAccessibleByMouse)
+        branch.linkActivated.connect(lambda _link: self._show_branches())
+        branch_row.addWidget(branch)
+        created = QLabel(f"创建于 {summary.created_at or '-'}")
+        created.setObjectName("workspace_card_meta")
+        branch_row.addWidget(created)
+        branch_row.addStretch(1)
+        details.addLayout(branch_row)
+        root.addLayout(details)
+
+        actions = QHBoxLayout()
+        actions.addStretch(1)
+        self._add_button(actions, "进入工作区", "activate", primary=True)
+        self._add_button(actions, "提交并推送", "commit-push")
+        self._add_button(actions, "同步源分支", "sync")
+        self._add_button(actions, "合并代码", "merge")
+        self._add_button(actions, "在 codex 中打开", "codex")
+        self._add_button(actions, "在 cc 中打开", "cc")
+        self._add_button(actions, "删除工作区", "delete", danger=True)
+        root.addLayout(actions)
+
+    def _add_status(self, layout, text: str, tone: str) -> None:
+        status = QLabel(text)
+        status.setProperty("role", f"workspace-status-{tone}")
+        layout.addWidget(status)
+
+    def _show_branches(self) -> None:
+        QMessageBox.information(
+            self,
+            f"{self.summary.name} · 任务分支",
+            "\n".join(f"- {branch}" for branch in self.summary.task_branches),
+        )
+
+    def _add_button(
+        self,
+        layout,
+        text: str,
+        action: str,
+        primary: bool = False,
+        danger: bool = False,
+    ) -> None:
+        button = QPushButton(text)
+        if primary:
+            button.setProperty("role", "primary")
+        elif danger:
+            button.setProperty("role", "danger")
+        button.clicked.connect(lambda _checked=False, a=action: self.action_requested.emit(self.summary, a))
+        layout.addWidget(button)
+
+    def mousePressEvent(self, event) -> None:
+        self.selected.emit(self.summary)
+        super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        self.activated.emit(self.summary)
+        super().mouseDoubleClickEvent(event)
+
+
 class AggregateProjectTab(QWidget):
     """聚合目录、直属项目和该目录需求工作区的唯一顶层工作台。"""
 
@@ -219,11 +361,12 @@ class AggregateProjectTab(QWidget):
         )
         self._project_tabs: dict[str, ProjectTab] = {}
         self._project_nodes: dict[str, QTreeWidgetItem] = {}
-        self._runtime_nodes: dict[tuple[str, str], QTreeWidgetItem] = {}
         self._metadata: dict[str, dict] = {}
         self._existing_tabs = existing_tabs or {}
         self._configured_existing_tabs: dict[str, ProjectTab] = {}
         self._workspace_summaries = ()
+        self._workspace_cards: dict[str, _WorkspaceCard] = {}
+        self._selected_workspace = None
         self._pending_workspace_path = ""
         self._prepare_worker: _PrepareProjectsWorker | None = None
         self._prepare_generation = 0
@@ -231,14 +374,15 @@ class AggregateProjectTab(QWidget):
         self._workspace_worker: _WorkspaceSnapshotWorker | None = None
         self._create_worker: _CreateWorkspaceWorker | None = None
         self._merge_worker: _MergeWorkspaceWorker | None = None
+        self._commit_push_worker: _CommitPushWorkspaceWorker | None = None
         self._sync_worker: _SyncWorkspaceWorker | None = None
         self._pending_sync_fetch = False
         self._delete_preflight_worker: _DeletePreflightWorker | None = None
         self._delete_worker: _DeleteWorkspaceWorker | None = None
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(GAP_LG, GAP_LG, GAP_LG, GAP_LG)
-        root.setSpacing(GAP_MD)
+        root.setContentsMargins(GAP_MD, GAP_MD, GAP_MD, GAP_MD)
+        root.setSpacing(GAP_SM)
 
         header = QHBoxLayout()
         header.setSpacing(GAP_SM)
@@ -264,6 +408,8 @@ class AggregateProjectTab(QWidget):
         root.addLayout(header)
 
         self.view_tabs = QTabWidget()
+        self.view_tabs.setObjectName("aggregate_tabs")
+        self.view_tabs.setDocumentMode(True)
         self.projects_page = self._build_projects_page()
         self.workspaces_page = self._build_workspaces_page()
         self.view_tabs.addTab(self.projects_page, "项目")
@@ -281,18 +427,22 @@ class AggregateProjectTab(QWidget):
     def _build_projects_page(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(GAP_NONE, GAP_MD, GAP_NONE, GAP_NONE)
-        layout.setSpacing(GAP_MD)
+        layout.setContentsMargins(GAP_NONE, GAP_SM, GAP_NONE, GAP_NONE)
+        layout.setSpacing(GAP_SM)
         self.project_progress = QLabel("正在识别项目...")
-        self.project_progress.setProperty("role", "subtitle")
+        self.project_progress.setProperty("role", "hint")
         progress_row = QHBoxLayout()
         progress_row.setSpacing(GAP_SM)
         progress_row.addWidget(self.project_progress, 1)
         self.project_codex_button = QPushButton("codex")
+        self.project_codex_button.setObjectName("external_tool_button")
+        self.project_codex_button.setMinimumWidth(58)
         self.project_codex_button.setToolTip("在 AgentDesk 中打开当前代码环境")
         self.project_codex_button.clicked.connect(self._open_current_in_codex)
         progress_row.addWidget(self.project_codex_button)
         self.project_cc_button = QPushButton("cc")
+        self.project_cc_button.setObjectName("external_tool_button")
+        self.project_cc_button.setMinimumWidth(42)
         self.project_cc_button.setToolTip("在 AgentDesk 中打开当前代码环境")
         self.project_cc_button.clicked.connect(self._open_current_in_cc)
         progress_row.addWidget(self.project_cc_button)
@@ -302,21 +452,23 @@ class AggregateProjectTab(QWidget):
         self.project_splitter.setChildrenCollapsible(False)
         self.project_splitter.setHandleWidth(3)
 
-        sidebar = QWidget()
-        sidebar.setMinimumWidth(240)
-        sidebar.setMaximumWidth(420)
+        sidebar = QFrame()
+        sidebar.setObjectName("aggregate_project_sidebar")
+        sidebar.setMinimumWidth(220)
+        sidebar.setMaximumWidth(300)
         sidebar_layout = QVBoxLayout(sidebar)
-        sidebar_layout.setContentsMargins(GAP_NONE, GAP_NONE, GAP_MD, GAP_NONE)
+        sidebar_layout.setContentsMargins(GAP_MD, GAP_MD, GAP_MD, GAP_MD)
         sidebar_layout.setSpacing(GAP_SM)
         self.project_tree_label = QLabel("项目")
-        self.project_tree_label.setProperty("role", "subtitle")
+        self.project_tree_label.setProperty("role", "title")
         sidebar_layout.addWidget(self.project_tree_label)
         self.project_tree = QTreeWidget()
-        self.project_tree.setColumnCount(3)
-        self.project_tree.setHeaderLabels(["项目", "状态", ""])
-        self.project_tree.setRootIsDecorated(True)
+        self.project_tree.setObjectName("aggregate_project_tree")
+        self.project_tree.setColumnCount(2)
+        self.project_tree.setHeaderHidden(True)
+        self.project_tree.setRootIsDecorated(False)
         self.project_tree.setUniformRowHeights(True)
-        self.project_tree.setIndentation(16)
+        self.project_tree.setIndentation(0)
         self.project_tree.setSelectionMode(
             QAbstractItemView.SelectionMode.SingleSelection
         )
@@ -324,12 +476,12 @@ class AggregateProjectTab(QWidget):
         tree_header = self.project_tree.header()
         tree_header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         tree_header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        tree_header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         self.project_tree.itemSelectionChanged.connect(self._show_selected_project)
         sidebar_layout.addWidget(self.project_tree, 1)
         self.project_splitter.addWidget(sidebar)
 
-        detail = QWidget()
+        detail = QFrame()
+        detail.setObjectName("aggregate_project_detail")
         detail_layout = QVBoxLayout(detail)
         detail_layout.setContentsMargins(GAP_NONE, GAP_NONE, GAP_NONE, GAP_NONE)
         detail_layout.setSpacing(GAP_NONE)
@@ -347,8 +499,8 @@ class AggregateProjectTab(QWidget):
         try:
             sidebar_width = int(self.config.aggregate_sidebar_width)
         except (TypeError, ValueError):
-            sidebar_width = 320
-        sidebar_width = max(240, min(420, sidebar_width))
+            sidebar_width = 280
+        sidebar_width = max(220, min(300, sidebar_width))
         self.project_splitter.setSizes([sidebar_width, 1000])
         self._sidebar_save_timer = QTimer(self)
         self._sidebar_save_timer.setSingleShot(True)
@@ -367,29 +519,9 @@ class AggregateProjectTab(QWidget):
         actions = QHBoxLayout()
         actions.setSpacing(GAP_SM)
         self.new_workspace_button = QPushButton("新建需求工作区")
+        self.new_workspace_button.setProperty("role", "primary")
         self.new_workspace_button.clicked.connect(self._create_workspace)
         actions.addWidget(self.new_workspace_button)
-        self.codex_button = QPushButton("codex")
-        self.codex_button.setToolTip("在 AgentDesk 中打开选中的需求工作区")
-        self.codex_button.clicked.connect(self._open_selected_in_codex)
-        actions.addWidget(self.codex_button)
-        self.cc_button = QPushButton("cc")
-        self.cc_button.setToolTip("在 AgentDesk 中打开选中的需求工作区")
-        self.cc_button.clicked.connect(self._open_selected_in_cc)
-        actions.addWidget(self.cc_button)
-        self.sync_button = QPushButton("同步源分支")
-        self.sync_button.setToolTip(
-            "把源目录基准分支的新提交合并进当前任务分支，只改工作区，不动源目录"
-        )
-        self.sync_button.clicked.connect(self._sync_selected_workspace)
-        actions.addWidget(self.sync_button)
-        self.merge_button = QPushButton("合并代码")
-        self.merge_button.setToolTip("自动提交工作区改动，再快进合并到源目录基准分支")
-        self.merge_button.clicked.connect(self._merge_selected_workspace)
-        actions.addWidget(self.merge_button)
-        self.delete_button = QPushButton("删除")
-        self.delete_button.clicked.connect(self._delete_selected_workspace)
-        actions.addWidget(self.delete_button)
         actions.addStretch(1)
         self.refresh_workspace_button = QToolButton()
         self.refresh_workspace_button.setIcon(
@@ -403,27 +535,18 @@ class AggregateProjectTab(QWidget):
         self.workspace_status = QLabel("正在读取需求工作区...")
         self.workspace_status.setProperty("role", "subtitle")
         layout.addWidget(self.workspace_status)
-        self.workspace_table = QTableWidget(0, 7)
-        self.workspace_table.setHorizontalHeaderLabels(
-            ["需求", "修改项目", "任务分支", "改动", "落后", "状态", "创建时间"]
-        )
-        self.workspace_table.setSelectionBehavior(
-            QAbstractItemView.SelectionBehavior.SelectRows
-        )
-        self.workspace_table.setSelectionMode(
-            QAbstractItemView.SelectionMode.SingleSelection
-        )
-        self.workspace_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.workspace_table.verticalHeader().setVisible(False)
-        self.workspace_table.verticalHeader().setDefaultSectionSize(H_TABLE_ROW)
-        header = self.workspace_table.horizontalHeader()
-        header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        self.workspace_table.itemSelectionChanged.connect(self._update_workspace_buttons)
-        self.workspace_table.itemDoubleClicked.connect(
-            lambda _item: self._activate_selected_workspace()
-        )
-        layout.addWidget(self.workspace_table, 1)
+        self.workspace_scroll = QScrollArea()
+        self.workspace_scroll.setObjectName("workspace_scroll")
+        self.workspace_scroll.setWidgetResizable(True)
+        self.workspace_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.workspace_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.workspace_cards_host = QWidget()
+        self.workspace_cards_layout = QVBoxLayout(self.workspace_cards_host)
+        self.workspace_cards_layout.setContentsMargins(0, 2, 0, 2)
+        self.workspace_cards_layout.setSpacing(12)
+        self.workspace_cards_layout.addStretch(1)
+        self.workspace_scroll.setWidget(self.workspace_cards_host)
+        layout.addWidget(self.workspace_scroll, 1)
         self._update_workspace_buttons()
         return page
 
@@ -532,10 +655,8 @@ class AggregateProjectTab(QWidget):
         node = QTreeWidgetItem([
             item.get("name") or project_id,
             "配置错误" if item.get("error") else "已停止",
-            "",
         ])
         node.setData(0, Qt.ItemDataRole.UserRole, project_id)
-        node.setData(0, PROJECT_KIND_ROLE, "project")
         node.setToolTip(0, item.get("error", "") or (
             f"{meta.display_type if meta else '识别失败'} · "
             f"{item.get('branch') or ('共享目录' if item.get('shared') else '-') }"
@@ -544,6 +665,13 @@ class AggregateProjectTab(QWidget):
         self._project_nodes[project_id] = node
         if meta is None:
             return
+        runtime_count = len(meta.runtime_units)
+        runtime_text = f" · {runtime_count} 个运行单元" if runtime_count > 1 else ""
+        node.setToolTip(
+            0,
+            f"{meta.display_type}{runtime_text}\n"
+            f"{item.get('branch') or ('共享目录' if item.get('shared') else item['path'])}",
+        )
         tab = existing
         if tab is None:
             entry = self.config.find_project(item["path"]) or ProjectEntry(path=item["path"])
@@ -554,49 +682,6 @@ class AggregateProjectTab(QWidget):
         tab.component_id = project_id
         self._project_tabs[project_id] = tab
         self.detail_stack.addWidget(tab)
-        self.project_tree.setItemWidget(
-            node, 2, self._tree_action_widget(project_id, None, node.text(0)),
-        )
-        for unit in meta.runtime_units:
-            child = QTreeWidgetItem([
-                unit.name,
-                f"已停止  :{unit.expected_port}" if unit.expected_port else "已停止",
-                "",
-            ])
-            child.setData(0, Qt.ItemDataRole.UserRole, project_id)
-            child.setData(0, PROJECT_KIND_ROLE, "runtime")
-            child.setData(0, RUNTIME_ID_ROLE, unit.id)
-            node.addChild(child)
-            self._runtime_nodes[(project_id, unit.id)] = child
-            self.project_tree.setItemWidget(
-                child, 2, self._tree_action_widget(project_id, unit.id, unit.name),
-            )
-        node.setExpanded(False)
-
-    def _tree_action_widget(
-        self, project_id: str, runtime_id: str | None, label: str,
-    ) -> QWidget:
-        widget = QWidget()
-        actions = QHBoxLayout(widget)
-        actions.setContentsMargins(GAP_NONE, GAP_NONE, GAP_NONE, GAP_NONE)
-        actions.setSpacing(2)
-        start = QToolButton()
-        start.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
-        start.setToolTip(f"启动 {label}")
-        start.clicked.connect(
-            lambda _checked=False, pid=project_id, rid=runtime_id:
-            self.start_runtime(pid, rid)
-        )
-        actions.addWidget(start)
-        stop = QToolButton()
-        stop.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaStop))
-        stop.setToolTip(f"停止 {label}")
-        stop.clicked.connect(
-            lambda _checked=False, pid=project_id, rid=runtime_id:
-            self.stop_runtime(pid, rid)
-        )
-        actions.addWidget(stop)
-        return widget
 
     def _show_selected_project(self) -> None:
         items = self.project_tree.selectedItems()
@@ -607,19 +692,13 @@ class AggregateProjectTab(QWidget):
         tab = self._project_tabs.get(project_id)
         if tab is not None:
             self.detail_stack.setCurrentWidget(tab)
-            project_node = self._project_nodes.get(project_id)
-            for index in range(self.project_tree.topLevelItemCount()):
-                candidate = self.project_tree.topLevelItem(index)
-                candidate.setExpanded(candidate is project_node and candidate.childCount() > 1)
-            if item.data(0, PROJECT_KIND_ROLE) == "runtime":
-                tab.focus_runtime_unit(item.data(0, RUNTIME_ID_ROLE) or "")
 
     def _sidebar_moved(self, position: int, _index: int) -> None:
         self._sidebar_save_timer.start()
 
     def _save_sidebar_width(self) -> None:
-        width = self.project_splitter.sizes()[0] if self.project_splitter.sizes() else 320
-        self.config.aggregate_sidebar_width = max(240, min(420, int(width)))
+        width = self.project_splitter.sizes()[0] if self.project_splitter.sizes() else 280
+        self.config.aggregate_sidebar_width = max(220, min(300, int(width)))
         self.config.save()
 
     def show_projects(self) -> None:
@@ -627,6 +706,9 @@ class AggregateProjectTab(QWidget):
 
     def show_workspaces(self) -> None:
         self.view_tabs.setCurrentWidget(self.workspaces_page)
+
+    def refresh_theme(self) -> None:
+        self.refresh_project_states()
 
     def _set_context_label(self) -> None:
         if self.workspace is None:
@@ -673,7 +755,6 @@ class AggregateProjectTab(QWidget):
             tab.deleteLater()
         self._project_tabs.clear()
         self._project_nodes.clear()
-        self._runtime_nodes.clear()
         self._metadata.clear()
         self.project_tree.clear()
         self.project_tree_label.setText("项目")
@@ -686,28 +767,20 @@ class AggregateProjectTab(QWidget):
         return True
 
     def _selected_workspace_summary(self):
-        rows = self.workspace_table.selectionModel().selectedRows()
-        if not rows:
-            return None
-        item = self.workspace_table.item(rows[0].row(), 0)
-        return item.data(Qt.ItemDataRole.UserRole) if item else None
+        return self._selected_workspace
 
     def _workspace_busy(self) -> bool:
         return bool(
             self._workspace_worker or self._create_worker or self._merge_worker
-            or self._sync_worker or self._delete_preflight_worker
+            or self._commit_push_worker or self._sync_worker or self._delete_preflight_worker
             or self._delete_worker
         )
 
     def _update_workspace_buttons(self) -> None:
-        summary = self._selected_workspace_summary() if hasattr(self, "workspace_table") else None
-        valid = bool(summary and summary.workspace is not None)
+        summary = self._selected_workspace_summary()
         busy = self._workspace_busy()
-        for button in (
-            self.codex_button, self.cc_button, self.sync_button,
-            self.merge_button, self.delete_button,
-        ):
-            button.setEnabled(valid and not busy)
+        for card in self._workspace_cards.values():
+            card.setEnabled(not busy and card.summary.workspace is not None)
         self.new_workspace_button.setEnabled(not busy)
         self.refresh_workspace_button.setEnabled(not busy)
         self.exit_workspace_button.setEnabled(self.workspace is not None and not busy)
@@ -730,43 +803,24 @@ class AggregateProjectTab(QWidget):
             return
         self._workspace_worker = None
         self._workspace_summaries = tuple(summaries)
-        self.workspace_table.clearContents()
-        self.workspace_table.setRowCount(len(summaries))
-        status_labels = {
-            "created": "已创建",
-            "active": "开发中",
-            "reviewing": "评审中",
-            "merged": "已合并",
-            "invalid": "配置错误",
-        }
+        while self.workspace_cards_layout.count() > 1:
+            item = self.workspace_cards_layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
+        self._workspace_cards.clear()
+        self._selected_workspace = None
         selected_row = -1
         for row, summary in enumerate(summaries):
-            values = [
-                summary.name,
-                ", ".join(summary.component_ids) or "-",
-                ", ".join(summary.task_branches) or "-",
-                str(summary.git_change_count),
-                str(summary.behind_count),
-                status_labels.get(summary.status, summary.status),
-                summary.created_at,
-            ]
-            for column, value in enumerate(values):
-                item = QTableWidgetItem(value)
-                if summary.error:
-                    item.setToolTip(summary.error)
-                if column == 0:
-                    item.setData(Qt.ItemDataRole.UserRole, summary)
-                if column == 3 and summary.git_change_count:
-                    item.setForeground(QColor(COLOR_WARN))
-                elif column == 4 and summary.behind_count:
-                    item.setForeground(QColor(COLOR_WARN))
-                    item.setToolTip(
-                        f"任务分支落后源目录基准分支 {summary.behind_count} 个提交，"
-                        "建议先同步源分支"
-                    )
-                elif column == 5 and summary.error:
-                    item.setForeground(QColor(COLOR_ERROR))
-                self.workspace_table.setItem(row, column, item)
+            current = bool(self.workspace and normalized_path_key(self.workspace.root_path) == normalized_path_key(summary.root_path))
+            card = _WorkspaceCard(summary, current, self.workspace_cards_host)
+            if summary.error:
+                card.setToolTip(summary.error)
+            card.selected.connect(self._select_workspace_card)
+            card.activated.connect(self._activate_workspace_summary)
+            card.action_requested.connect(self._workspace_card_action)
+            self.workspace_cards_layout.insertWidget(self.workspace_cards_layout.count() - 1, card)
+            self._workspace_cards[normalized_path_key(summary.root_path)] = card
             if self._pending_workspace_path and normalized_path_key(summary.root_path) == normalized_path_key(
                 self._pending_workspace_path
             ):
@@ -776,11 +830,36 @@ class AggregateProjectTab(QWidget):
             self.workspace_status.setText(f"读取失败：{error}")
         else:
             self.workspace_status.setText(f"{len(summaries)} 个需求工作区")
-        if selected_row >= 0:
-            self.workspace_table.selectRow(selected_row)
-        elif summaries and not self.workspace_table.selectionModel().hasSelection():
-            self.workspace_table.selectRow(0)
+        if summaries:
+            self._select_workspace_card(summaries[selected_row if selected_row >= 0 else 0])
         self._update_workspace_buttons()
+
+    def _select_workspace_card(self, summary) -> None:
+        self._selected_workspace = summary
+        for key, card in self._workspace_cards.items():
+            card.setProperty("selected", card.summary is summary)
+            card.style().unpolish(card)
+            card.style().polish(card)
+        self._update_workspace_buttons()
+
+    def _activate_workspace_summary(self, summary) -> None:
+        self._select_workspace_card(summary)
+        self._activate_selected_workspace()
+
+    def _workspace_card_action(self, summary, action: str) -> None:
+        self._select_workspace_card(summary)
+        handlers = {
+            "activate": self._activate_selected_workspace,
+            "codex": self._open_selected_in_codex,
+            "cc": self._open_selected_in_cc,
+            "commit-push": self._commit_push_selected_workspace,
+            "sync": self._sync_selected_workspace,
+            "merge": self._merge_selected_workspace,
+            "delete": self._delete_selected_workspace,
+        }
+        handler = handlers.get(action)
+        if handler:
+            handler()
 
     def _activate_selected_workspace(self) -> None:
         summary = self._selected_workspace_summary()
@@ -1069,6 +1148,64 @@ class AggregateProjectTab(QWidget):
             QMessageBox.information(self, "合并完成", f"已合并：{projects}")
         self.refresh_workspaces()
 
+    def _commit_push_selected_workspace(self) -> None:
+        summary = self._selected_workspace_summary()
+        if not summary or summary.workspace is None or self._workspace_busy():
+            return
+        editable = [
+            item for item in summary.workspace.components if item.mode == "worktree"
+        ]
+        commit_message = summary.workspace.name.strip() or summary.workspace.id
+        lines = ["将提交并推送以下任务分支到 origin："]
+        lines.extend(f"- {item.id}: {item.task_branch}" for item in editable)
+        lines.append(
+            f"\n有改动时提交信息为“{commit_message}”；无改动但存在未推送提交时也会推送。"
+            "不执行强制推送。确认继续？"
+        )
+        answer = QMessageBox.question(
+            self, "确认提交并推送", "\n".join(lines),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        action_log.info(
+            "[GUI] 提交并推送工作区 aggregate=%s workspace=%s",
+            self.aggregate_project.name, summary.workspace.name,
+        )
+        self.workspace_status.setText("正在提交并推送任务分支...")
+        worker = _CommitPushWorkspaceWorker(
+            summary.workspace, commit_message, QApplication.instance(),
+        )
+        self._commit_push_worker = worker
+        self._update_workspace_buttons()
+        worker.done.connect(self._workspace_commit_push_ready)
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+
+    def _workspace_commit_push_ready(self, result, error: str) -> None:
+        if self.sender() is not self._commit_push_worker:
+            return
+        self._commit_push_worker = None
+        self._update_workspace_buttons()
+        if error or result is None:
+            message = error or "未知错误"
+            action_log.warning("[GUI] 提交并推送工作区失败 error=%s", message)
+            QMessageBox.warning(self, "提交并推送失败", message)
+        else:
+            pushed = [item.id for item in result.components if item.pushed]
+            blocks = [f"已推送：{'、'.join(pushed)}" if pushed else "没有成功推送的项目。"]
+            failed = [f"- {item.id}: {item.error}" for item in result.components if item.error]
+            if failed:
+                blocks.append("失败项目：\n" + "\n".join(failed))
+            if result.ok:
+                action_log.info("[GUI] 提交并推送工作区成功 projects=%s", "、".join(pushed))
+                QMessageBox.information(self, "提交并推送完成", "\n\n".join(blocks))
+            else:
+                action_log.warning("[GUI] 提交并推送工作区未完成 error=%s", result.error)
+                QMessageBox.warning(self, "提交并推送未完成", "\n\n".join(blocks))
+        self.refresh_workspaces()
+
     def _running_project_paths(self) -> tuple[str, ...]:
         paths = []
         for tab in self._project_tabs.values():
@@ -1214,7 +1351,6 @@ class AggregateProjectTab(QWidget):
             tab.deleteLater()
         self._project_tabs.clear()
         self._project_nodes.clear()
-        self._runtime_nodes.clear()
         self._metadata.clear()
         self.project_tree.clear()
         self.project_tree_label.setText("项目")
@@ -1283,8 +1419,7 @@ class AggregateProjectTab(QWidget):
                 item for item in states if item.state in (STATE_STARTING, STATE_STOPPING)
             ]
             running_count = sum(1 for item in states if item.is_running)
-            runtime_units = getattr(tab.project_meta, "runtime_units", ())
-            total = len(runtime_units) or len(states)
+            total = len(getattr(tab.project_meta, "runtime_units", ())) or len(states)
             if unknown:
                 status, color = "状态不确定", COLOR_ERROR
             elif changing:
@@ -1298,39 +1433,9 @@ class AggregateProjectTab(QWidget):
             else:
                 status, color = "已停止", FG_DIM
             node.setText(1, status)
-            node.setForeground(1, QColor(color))
+            node.setForeground(1, QColor(str(color)))
             node.setToolTip(1, "\n".join(item.reason for item in states if item.reason))
 
-            state_by_unit = {item.module: item for item in states}
-            if len(runtime_units) == 1 and len(states) == 1:
-                state_by_unit.setdefault(runtime_units[0].id, states[0])
-            for unit in runtime_units:
-                child = self._runtime_nodes.get((project_id, unit.id))
-                if child is None:
-                    continue
-                state = state_by_unit.get(unit.id)
-                port = (
-                    (state.port or state.expected_port) if state is not None
-                    else unit.expected_port
-                )
-                port_text = f"  :{port}" if port else ""
-                if state is None:
-                    child_status, child_color = "状态不确定", COLOR_ERROR
-                elif state.state == STATE_UNKNOWN:
-                    child_status, child_color = "状态不确定", COLOR_ERROR
-                elif state.state == STATE_STARTING:
-                    child_status, child_color = "启动中", COLOR_WARN
-                elif state.state == STATE_STOPPING:
-                    child_status, child_color = "停止中", COLOR_WARN
-                elif state.state == STATE_RUNNING_EXTERNAL:
-                    child_status, child_color = "外部运行", COLOR_WARN
-                elif state.is_running:
-                    child_status, child_color = "运行中", COLOR_SUCCESS
-                else:
-                    child_status, child_color = "已停止", FG_DIM
-                child.setText(1, f"{child_status}{port_text}")
-                child.setForeground(1, QColor(child_color))
-                child.setToolTip(1, state.reason if state is not None else "")
 
     def service_states(self, refresh_external: bool = True):
         states = []
@@ -1384,8 +1489,8 @@ class AggregateProjectTab(QWidget):
         self._refresh_timer.stop()
         for worker in (
             self._prepare_worker, self._save_worker, self._workspace_worker,
-            self._create_worker, self._merge_worker, self._delete_preflight_worker,
-            self._delete_worker,
+            self._create_worker, self._merge_worker, self._commit_push_worker,
+            self._sync_worker, self._delete_preflight_worker, self._delete_worker,
         ):
             if worker and worker.isRunning():
                 worker.wait(3000)
@@ -1409,11 +1514,6 @@ class AggregateProjectTab(QWidget):
         tab = self._current_project_tab()
         if tab:
             tab.open_recent_files()
-
-    def open_command_palette(self) -> None:
-        tab = self._current_project_tab()
-        if tab:
-            tab.open_command_palette()
 
     def open_endpoint_picker(self) -> None:
         tab = self._current_project_tab()

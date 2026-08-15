@@ -4,4 +4,4 @@
 立刻断掉。这一层在所有 widget 切到 theme 后会被删除。
 """
 from src.ui.theme import *  # noqa: F401,F403
-from src.ui.theme import apply_theme as apply_dark_theme  # noqa: F401
+from src.ui.theme import apply_dark_theme  # noqa: F401

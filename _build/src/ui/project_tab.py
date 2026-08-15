@@ -38,7 +38,7 @@ from src.ui.git_viewer import GitViewer
 from src.ui.log_widget import LogWidget
 from src.ui.project_service_controller import ProjectServiceController
 from src.ui.quick_open import (
-    PickerItem, show_command_palette, show_recent_files,
+    PickerItem, show_recent_files,
 )
 from src.ui.service_panel import (
     STATE_IDLE, STATE_RUNNING, STATE_RUNNING_EXTERNAL, STATE_STARTING,
@@ -46,7 +46,8 @@ from src.ui.service_panel import (
 )
 from src.ui.settings_panel import SettingsPanel
 from src.ui.theme import (
-    BG_L4, BORDER_SUBTLE, COLOR_SUCCESS, COLOR_WARN,
+    BG_BTN, BG_BTN_HOVER, BG_BTN_PRESSED, BG_L1, BG_L4,
+    BORDER_STRONG, BORDER_SUBTLE, COLOR_SUCCESS, COLOR_WARN,
     FG_DIM, FG_PRIMARY, FG_SECONDARY,
     FONT_PT_UI_SM, RADIUS_SM,
 )
@@ -72,13 +73,15 @@ log = logging.getLogger("mini-ide")
 action_log = logging.getLogger("mini-ide.action")  # 操作行为日志，统一写到同一日志文件
 
 
-# 状态栏分支/改动按钮的 base QSS（透明、hover 高亮 BG_L4）
+# 状态栏分支/改动按钮保持紧凑，但必须有明确按钮边界。
 def _status_btn_base_qss() -> str:
     return (
-        f"QToolButton {{ background:transparent; border:none;"
-        f" padding:2px 8px; font-size:{FONT_PT_UI_SM}pt; }}"
-        f"QToolButton:hover {{ background:{BG_L4};"
-        f" border-radius:{RADIUS_SM}px; }}"
+        f"QToolButton {{ background:{BG_BTN}; border:1px solid {BORDER_SUBTLE};"
+        f" border-radius:{RADIUS_SM}px; padding:3px 8px;"
+        f" min-height:20px; font-size:{FONT_PT_UI_SM}pt; }}"
+        f"QToolButton:hover {{ background:{BG_BTN_HOVER};"
+        f" border-color:{BORDER_STRONG}; border-radius:{RADIUS_SM}px; }}"
+        f"QToolButton:pressed {{ background:{BG_BTN_PRESSED}; }}"
         f"QToolButton::menu-indicator {{ image:none; width:0; }}"
     )
 
@@ -148,6 +151,7 @@ class ProjectTab(QWidget):
 
     def __init__(self, meta: ProjectMeta, entry: ProjectEntry, config: AppConfig, parent=None):
         super().__init__(parent)
+        self.setObjectName("project_workbench")
         self.project_meta = meta
         self.entry = entry
         self.config = config
@@ -324,7 +328,7 @@ class ProjectTab(QWidget):
         bar.setObjectName("top_toolbar")
         bar.setFrameShape(QFrame.Shape.NoFrame)
         bar.setStyleSheet(
-            f"#top_toolbar {{ border-bottom:1px solid {BORDER_SUBTLE}; }}"
+            f"#top_toolbar {{ background:{BG_L1}; border-bottom:1px solid {BORDER_SUBTLE}; }}"
         )
         lay = QHBoxLayout(bar)
         lay.setContentsMargins(10, 6, 10, 6)
@@ -340,8 +344,7 @@ class ProjectTab(QWidget):
 
         lay.addSpacing(20)
 
-        # 工具栏极简：只露主按钮（启动 ↔ 停止）
-        # 编译 / Clean / 重启 等次级命令统一进命令面板（Ctrl+Shift+P）
+        # 工具栏保留项目最常用的运行控制；其它动作通过各自明确入口操作。
         # 多模块项目：启停走左侧服务面板，主按钮隐藏
         self._profile_buttons: dict[str, QPushButton] = {}
         primary_profiles = [p for p in self.project_meta.profiles if p.primary]
@@ -412,13 +415,6 @@ class ProjectTab(QWidget):
         self.btn_changes.clicked.connect(self.open_git_viewer)
         self.btn_changes.setVisible(False)
         lay.addWidget(self.btn_changes)
-
-        # 工具栏极简：最右侧留命令面板入口；其它常用动作全部进 Ctrl+Shift+P
-        btn_cmd = QToolButton()
-        btn_cmd.setText("⌘")
-        btn_cmd.setToolTip("命令面板 (Ctrl+Shift+P)")
-        btn_cmd.clicked.connect(self.open_command_palette)
-        lay.addWidget(btn_cmd)
 
         return bar
 
@@ -1072,8 +1068,7 @@ class ProjectTab(QWidget):
         # 模块还没启动过：提示用户先启动
         self.log.append_line(
             "meta",
-            f"[提示] {module} 还未启动；点击其右侧的 ▶ 按钮或"
-            f" Ctrl+Shift+P →「▶ 启动 {module}」",
+                f"[提示] {module} 还未启动；点击其右侧的 ▶ 按钮。",
         )
 
     def focus_runtime_unit(self, unit_id: str) -> None:
@@ -2434,7 +2429,7 @@ class ProjectTab(QWidget):
         # 快捷键已上移到 MainWindow 统一注册（窗口级，焦点在哪都生效，
         # 多 tab 不冲突），由 MainWindow 路由到当前可见 tab 的下列 public 方法：
         #   Ctrl+Shift+N → open_file_picker      Ctrl+Shift+F → open_content_search
-        #   Ctrl+E       → open_recent_files      Ctrl+Shift+P → open_command_palette
+        #   Ctrl+E       → open_recent_files
         #   Ctrl+\\       → open_endpoint_picker   Ctrl+Shift+R → restart_project
         #   Ctrl+W       → close_current_file_tab
         # 这里留空，仅保留方法以兼容 __init__ 调用。
@@ -2473,61 +2468,6 @@ class ProjectTab(QWidget):
             on_pick=lambda p: self._show_preview(p, 0, 0),
             parent=self,
         )
-        dlg.show()
-
-    def open_command_palette(self) -> None:
-        commands: list[tuple[str, str, callable]] = []
-
-        if self._is_multi_module:
-            # 多模块：模块启停走 _start_module / _stop_module；编译 / Clean 仍走 self.runner
-            commands.append((
-                "▶  全部启动",
-                f"启动全部 {len(self.project_meta.runtime_units)} 个运行单元",
-                self._start_all_modules,
-            ))
-            for unit in self.project_meta.runtime_units:
-                mod_name = unit.id
-                r = self.module_runners.get(mod_name)
-                if r and self.service_controller.runner_busy(r):
-                    commands.append((
-                        f"⏹  停止 {mod_name}",
-                        "停止该模块进程",
-                        lambda m=mod_name: self._stop_module(m),
-                    ))
-                else:
-                    commands.append((
-                        f"▶  启动 {mod_name}",
-                        "",
-                        lambda m=mod_name: self._start_module(m),
-                    ))
-            for prof in self.project_meta.profiles:
-                if prof.kind in ("compile", "clean"):
-                    commands.append((
-                        f"{prof.icon}  {prof.label}",
-                        f"{' '.join(prof.command[:4])}  ...",
-                        lambda p=prof: self._run_profile(p),
-                    ))
-        else:
-            for prof in self.project_meta.profiles:
-                commands.append((
-                    f"{prof.icon}  {prof.label}",
-                    f"{' '.join(prof.command[:4])}  ...",
-                    lambda p=prof: self._run_profile(p),
-                ))
-            if self.service_controller.runner_busy(self.runner):
-                commands.append(("⏹  停止运行", "kill 当前进程树", self._stop))
-            commands.append(("↻  重启项目", "Ctrl+Shift+R", self._restart))
-
-        commands.append(("🔍  搜索文件名", "Ctrl+Shift+N", self.open_file_picker))
-        commands.append(("🔎  搜索文件内容", "Ctrl+Shift+F", self.open_content_search))
-        commands.append(("🎯  接口地址跳转", "Ctrl+\\  定位 Controller 方法", self.open_endpoint_picker))
-        commands.append(("⏱  最近打开的文件", "Ctrl+E", self.open_recent_files))
-        commands.append(("📁  打开项目目录", "用资源管理器", lambda: open_folder(self.project_meta.path)))
-        commands.append(("🧹  清空所有日志", "项目日志、服务日志、脚本日志", self.clear_all_logs))
-        commands.append(("🌿  Git 改动", "实时查看当前分支改动文件", self.open_git_viewer))
-        commands.append(("ℹ️  项目信息", "路径 / 类型 / 包管理 / 主类（只读）", self.open_project_info))
-
-        dlg = show_command_palette(commands, parent=self)
         dlg.show()
 
     def open_endpoint_picker(self) -> None:

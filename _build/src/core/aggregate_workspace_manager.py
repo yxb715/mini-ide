@@ -4,6 +4,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import re
+import subprocess
+import sys
 
 from src.core.aggregate_workspace import (
     AggregateProject, DevelopmentWorkspace, WORKSPACE_CONFIG_NAME,
@@ -16,6 +18,10 @@ from src.core.path_utils import (
     canonical_path, normalized_path_key, relative_path_within,
 )
 from src.core.project_detector import ProjectMeta, detect_project
+from src.util.git_executable import resolve_git_executable
+
+
+CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 
 
 @dataclass(frozen=True)
@@ -42,6 +48,8 @@ class DevelopmentWorkspaceSummary:
     status: str
     created_at: str
     behind_count: int = 0
+    pushed_count: int = 0
+    worktree_count: int = 0
     workspace: DevelopmentWorkspace | None = None
     error: str = ""
 
@@ -272,6 +280,20 @@ def _git_change_count(path: str | Path) -> int:
     return len(list_changed_files(str(root)))
 
 
+def _task_branch_pushed(repository: str, task_branch: str) -> bool:
+    try:
+        result = subprocess.run(
+            [
+                resolve_git_executable(), "branch", "-r", "--contains", task_branch,
+            ],
+            cwd=repository, capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=15, creationflags=CREATE_NO_WINDOW,
+        )
+        return result.returncode == 0 and bool(result.stdout.strip())
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def _aggregate_summary(root_path: str) -> AggregateProjectSummary:
     try:
         project = load_aggregate_project(root_path)
@@ -349,11 +371,23 @@ def _workspace_summaries(
             if component.mode == "worktree"
         )
         behind_counts = workspace_behind_counts(workspace)
+        worktree_components = tuple(
+            component for component in workspace.components
+            if component.mode == "worktree"
+        )
+        pushed_count = sum(
+            _task_branch_pushed(
+                component.source_repository_path, component.task_branch,
+            )
+            for component in worktree_components
+        )
         summaries.append(DevelopmentWorkspaceSummary(
             root_path=workspace.root_path,
             name=workspace.name,
             aggregate_name=project.name,
             behind_count=sum(behind_counts.values()),
+            pushed_count=pushed_count,
+            worktree_count=len(worktree_components),
             component_ids=tuple(component.id for component in workspace.components),
             task_branches=tuple(
                 component.task_branch

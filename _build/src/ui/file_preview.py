@@ -165,14 +165,14 @@ class CodeView(QPlainTextEdit):
 
     def _paint_line_numbers(self, event) -> None:
         painter = QPainter(self._ln_area)
-        painter.fillRect(event.rect(), QColor(BG_L2))
+        painter.fillRect(event.rect(), QColor(str(BG_L2)))
 
         block = self.firstVisibleBlock()
         number = block.blockNumber()
         top = self.blockBoundingGeometry(block).translated(self.contentOffset()).top()
         bottom = top + self.blockBoundingRect(block).height()
 
-        painter.setPen(QColor(FG_DIM))
+        painter.setPen(QColor(str(FG_DIM)))
         painter.setFont(self.font())
         h = self.fontMetrics().height()
 
@@ -180,7 +180,10 @@ class CodeView(QPlainTextEdit):
         while block.isValid() and top <= event.rect().bottom():
             if block.isVisible() and bottom >= event.rect().top():
                 text = str(number + 1)
-                painter.setPen(QColor(FG_SECONDARY) if number == current_block else QColor(FG_DIM))
+                painter.setPen(
+                    QColor(str(FG_SECONDARY)) if number == current_block
+                    else QColor(str(FG_DIM))
+                )
                 painter.drawText(0, int(top), self._ln_area.width() - 4, h,
                                  Qt.AlignmentFlag.AlignRight, text)
             block = block.next()
@@ -190,11 +193,16 @@ class CodeView(QPlainTextEdit):
 
     def _highlight_current_line(self) -> None:
         sel = QTextEdit.ExtraSelection()
-        sel.format.setBackground(QColor(BG_L4))
+        sel.format.setBackground(QColor(str(BG_L4)))
         sel.format.setProperty(QTextFormat.Property.FullWidthSelection, True)
         sel.cursor = self.textCursor()
         sel.cursor.clearSelection()
         self.setExtraSelections([sel])
+        self._ln_area.update()
+
+    def refresh_theme(self) -> None:
+        self._highlight_current_line()
+        self.viewport().update()
         self._ln_area.update()
 
     def goto_line(self, line: int, column: int = 0) -> None:
@@ -429,6 +437,11 @@ class FilePreviewPane(QWidget):
 
     def get_path(self) -> str:
         return self.path
+
+    def refresh_theme(self) -> None:
+        self.view.refresh_theme()
+        if self._highlighter is not None:
+            self._highlighter.refresh_theme()
 
     def is_dirty(self) -> bool:
         return self._dirty

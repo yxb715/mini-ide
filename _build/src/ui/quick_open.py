@@ -1,8 +1,7 @@
-"""快速导航三件套
+"""快速导航工具
 
 - Ctrl+Shift+N 文件名搜索（FilePicker）
 - Ctrl+E      最近打开的文件
-- Ctrl+Shift+P 命令面板（所有动作）
 
 都基于同一个 PickerDialog 基类：输入框 + 候选列表 + 上下箭头选择 + Enter 执行。
 """
@@ -277,22 +276,4 @@ def show_recent_files(recent_abs_paths: list[str], project_root: str,
         items.append(PickerItem(title=pp.name, subtitle=rel, data=p))
     dlg.set_static_items(items)
     dlg.picked.connect(on_pick)
-    return dlg
-
-
-def show_command_palette(commands: list[tuple[str, str, Callable[[], None]]],
-                         parent=None) -> PickerDialog:
-    """Ctrl+Shift+P: 所有命令
-
-    commands 每一项是 (title, subtitle, callback)
-    """
-    dlg = PickerDialog("命令   (Ctrl+Shift+P)", parent)
-    dlg.input.setPlaceholderText("输入关键字找命令")
-    items = [PickerItem(title=t, subtitle=s, data=cb) for t, s, cb in commands]
-    dlg.set_static_items(items)
-
-    def _run(cb):
-        if callable(cb):
-            cb()
-    dlg.picked.connect(_run)
     return dlg

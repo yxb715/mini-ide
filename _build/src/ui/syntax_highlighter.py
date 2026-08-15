@@ -32,7 +32,7 @@ except ImportError:
 MAX_HIGHLIGHT_BYTES = 500_000   # 超过 500KB 不高亮，性能优先
 
 
-# ---- 深色主题下的 token 颜色（One Dark 风格）----
+# ---- GitHub 代码高亮色板 ----
 
 _COLORS = {
     "default":     "#abb2bf",
@@ -80,11 +80,36 @@ _COLORS = {
     "error":       "#e06c75",
 }
 
+_LIGHT_COLORS = {
+    "default": "#24292f", "keyword": "#cf222e", "keyword.declaration": "#cf222e",
+    "keyword.namespace": "#cf222e", "keyword.constant": "#0550ae",
+    "keyword.type": "#953800", "name": "#24292f", "name.function": "#8250df",
+    "name.function.magic": "#8250df", "name.class": "#953800",
+    "name.builtin": "#0550ae", "name.builtin.pseudo": "#0550ae",
+    "name.decorator": "#8250df", "name.exception": "#953800",
+    "name.tag": "#116329", "name.attribute": "#0550ae",
+    "name.namespace": "#953800", "name.constant": "#0550ae",
+    "name.variable": "#24292f", "name.variable.instance": "#24292f",
+    "name.label": "#0550ae", "string": "#0a3069", "string.doc": "#6e7781",
+    "string.affix": "#0a3069", "string.interpol": "#0a3069",
+    "string.escape": "#0a3069", "string.regex": "#0a3069",
+    "string.symbol": "#0a3069", "number": "#0550ae", "operator": "#cf222e",
+    "operator.word": "#cf222e", "punctuation": "#24292f", "comment": "#6e7781",
+    "comment.preproc": "#cf222e", "comment.special": "#8250df",
+    "generic.heading": "#0550ae", "generic.subheading": "#0550ae",
+    "generic.deleted": "#cf222e", "generic.inserted": "#1a7f37",
+    "generic.emph": "#24292f", "generic.strong": "#24292f",
+    "literal": "#0550ae", "error": "#cf222e",
+}
+
 _ITALIC_TOKENS = {"comment", "comment.preproc", "comment.special", "generic.emph", "string.doc"}
 _BOLD_TOKENS = {"keyword", "name.class", "name.function", "generic.strong", "generic.heading"}
 
 
 def _fmt_for(token_type) -> QTextCharFormat:
+    from src.ui.theme import is_dark_theme
+
+    colors = _COLORS if is_dark_theme() else _LIGHT_COLORS
     # token.Keyword 这种点分标识统一化成小写字符串
     key = str(token_type).lower()
     # pygments token name: "Token.Keyword.Declaration" -> "keyword.declaration"
@@ -98,15 +123,15 @@ def _fmt_for(token_type) -> QTextCharFormat:
     parts = key.split(".")
     while parts:
         k = ".".join(parts)
-        if k in _COLORS and color is None:
-            color = _COLORS[k]
+        if k in colors and color is None:
+            color = colors[k]
         if k in _ITALIC_TOKENS:
             italic = True
         if k in _BOLD_TOKENS:
             bold = True
         parts.pop()
     if color is None:
-        color = _COLORS["default"]
+        color = colors["default"]
 
     fmt = QTextCharFormat()
     fmt.setForeground(QColor(color))
@@ -230,6 +255,10 @@ class PygmentsHighlighter(QSyntaxHighlighter):
 
     def set_lexer(self, lexer) -> None:
         self._lexer = lexer
+        self.retokenize()
+
+    def refresh_theme(self) -> None:
+        _FORMAT_CACHE.clear()
         self.retokenize()
 
     def retokenize(self) -> None:

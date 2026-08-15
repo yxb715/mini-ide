@@ -42,7 +42,7 @@ from PySide6.QtNetwork import QLocalServer, QLocalSocket
 
 from src.util import app_log
 from src.ui.main_window import MainWindow
-from src.ui.styles import apply_dark_theme
+from src.ui.theme import apply_theme
 from src.core.config import AppConfig
 
 
@@ -199,9 +199,8 @@ def main():
                 app.setWindowIcon(QIcon(str(icon_path)))
                 break
 
-        apply_dark_theme(app)
-
         config = AppConfig.load()
+        config.theme = apply_theme(app, config.theme)
         window = MainWindow(config)
         window.pending_initial_project = initial_project
 

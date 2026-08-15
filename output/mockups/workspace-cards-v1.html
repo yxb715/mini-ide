@@ -1,0 +1,357 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>需求工作区卡片效果图</title>
+  <style>
+    * { box-sizing: border-box; }
+    html, body { margin: 0; width: 100%; min-height: 100%; }
+    body {
+      font-family: "Microsoft YaHei UI", "Segoe UI", sans-serif;
+      background: #25292d;
+      color: #d7dce1;
+      font-size: 14px;
+      letter-spacing: 0;
+    }
+    button { font: inherit; letter-spacing: 0; }
+    .app {
+      width: 1600px;
+      min-height: 920px;
+      background: #303438;
+      display: grid;
+      grid-template-columns: 238px 1fr;
+    }
+    .sidebar {
+      background: #292d31;
+      border-right: 1px solid #41464b;
+      padding: 18px 12px;
+    }
+    .brand {
+      padding: 0 10px 17px;
+      color: #f0f3f5;
+      font-size: 17px;
+      font-weight: 650;
+      border-bottom: 1px solid #3c4146;
+    }
+    .context {
+      margin: 16px 8px 8px;
+      color: #969da5;
+      font-size: 12px;
+    }
+    .nav-item {
+      height: 38px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 0 12px;
+      color: #b9c0c7;
+      border-radius: 4px;
+    }
+    .nav-item.active {
+      background: #244f8f;
+      color: #ffffff;
+    }
+    .nav-icon {
+      width: 16px;
+      text-align: center;
+      color: #aeb6be;
+    }
+    .nav-item.active .nav-icon { color: #ffffff; }
+    .main {
+      min-width: 0;
+      padding: 20px 24px 30px;
+    }
+    .toolbar {
+      height: 46px;
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      border-bottom: 1px solid #464b50;
+      margin-bottom: 18px;
+    }
+    .title-row {
+      display: flex;
+      align-items: baseline;
+      gap: 10px;
+    }
+    h1 {
+      margin: 0;
+      color: #eef1f3;
+      font-size: 19px;
+      font-weight: 650;
+    }
+    .count { color: #929aa2; font-size: 13px; }
+    .toolbar-actions { display: flex; gap: 8px; }
+    .btn {
+      height: 32px;
+      border: 1px solid #5a6168;
+      border-radius: 4px;
+      padding: 0 13px;
+      color: #dce1e5;
+      background: #3a3f44;
+    }
+    .btn.primary {
+      background: #2868b7;
+      border-color: #3477c8;
+      color: #ffffff;
+    }
+    .btn.icon {
+      width: 32px;
+      padding: 0;
+      font-size: 17px;
+    }
+    .workspace-list {
+      display: grid;
+      gap: 12px;
+    }
+    .workspace {
+      border: 1px solid #4b5157;
+      border-left: 3px solid #65717d;
+      border-radius: 6px;
+      background: #353a3f;
+      padding: 15px 16px 14px;
+    }
+    .workspace.current {
+      border-color: #4b73a7;
+      border-left-color: #4d91e2;
+      background: #343b44;
+    }
+    .workspace-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      min-height: 32px;
+      gap: 20px;
+    }
+    .name-block {
+      display: flex;
+      align-items: center;
+      min-width: 0;
+      gap: 9px;
+    }
+    .workspace-name {
+      color: #f0f2f4;
+      font-size: 16px;
+      font-weight: 650;
+      white-space: nowrap;
+    }
+    .current-label {
+      color: #9bc8ff;
+      background: #294d76;
+      border: 1px solid #3d6f9f;
+      border-radius: 3px;
+      padding: 2px 7px;
+      font-size: 12px;
+      white-space: nowrap;
+    }
+    .status-line {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 16px;
+      min-width: 430px;
+      color: #c2c8cd;
+      font-size: 13px;
+    }
+    .status {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      white-space: nowrap;
+    }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: #7d8790; }
+    .dot.warn { background: #e8a33c; }
+    .dot.danger { background: #e06b67; }
+    .dot.ok { background: #55b982; }
+    .workspace-body {
+      display: grid;
+      grid-template-columns: minmax(420px, 1fr) auto;
+      gap: 22px;
+      align-items: end;
+      margin-top: 11px;
+      padding-top: 11px;
+      border-top: 1px solid #474d53;
+    }
+    .details { min-width: 0; }
+    .detail-row {
+      display: flex;
+      align-items: center;
+      min-height: 26px;
+      color: #bcc3c9;
+      min-width: 0;
+    }
+    .label {
+      width: 76px;
+      flex: 0 0 76px;
+      color: #8f979f;
+    }
+    .projects { display: flex; gap: 7px; flex-wrap: wrap; }
+    .project {
+      border: 1px solid #555d64;
+      border-radius: 3px;
+      background: #3e444a;
+      padding: 2px 7px;
+      color: #d2d7db;
+      font-size: 12px;
+    }
+    .branch-link { color: #83b6ef; }
+    .muted { color: #8f979f; }
+    .actions {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      justify-content: flex-end;
+      padding-bottom: 1px;
+    }
+    .actions .btn { height: 31px; padding: 0 11px; }
+    .actions .btn.more { width: 31px; padding: 0; font-size: 17px; }
+    .summary {
+      margin-top: 16px;
+      padding: 10px 12px;
+      border: 1px solid #484e54;
+      border-radius: 4px;
+      background: #30353a;
+      color: #9fa7ae;
+      font-size: 12px;
+      display: flex;
+      justify-content: space-between;
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="brand">xxpt</div>
+      <div class="context">聚合目录</div>
+      <div class="nav-item"><span class="nav-icon">▦</span><span>项目</span></div>
+      <div class="nav-item active"><span class="nav-icon">▣</span><span>需求工作区</span></div>
+    </aside>
+
+    <main class="main">
+      <header class="toolbar">
+        <div class="title-row">
+          <h1>需求工作区</h1>
+          <span class="count">3 个工作区</span>
+        </div>
+        <div class="toolbar-actions">
+          <button class="btn primary">新建需求工作区</button>
+          <button class="btn icon" title="刷新">↻</button>
+        </div>
+      </header>
+
+      <section class="workspace-list">
+        <article class="workspace current">
+          <div class="workspace-head">
+            <div class="name-block">
+              <span class="workspace-name">课程迁移</span>
+              <span class="current-label">当前工作区</span>
+            </div>
+            <div class="status-line">
+              <span class="status"><span class="dot warn"></span>29 个未提交改动</span>
+              <span class="status"><span class="dot danger"></span>尚未推送</span>
+              <span class="status"><span class="dot ok"></span>未落后</span>
+            </div>
+          </div>
+          <div class="workspace-body">
+            <div class="details">
+              <div class="detail-row">
+                <span class="label">修改项目</span>
+                <span class="projects">
+                  <span class="project">server</span><span class="project">webapp</span><span class="project">webapp-lerna</span>
+                </span>
+              </div>
+              <div class="detail-row">
+                <span class="label">任务分支</span>
+                <span class="branch-link">3 个任务分支 · 点击查看</span>
+                <span class="muted">　创建于 2026-08-12 15:01</span>
+              </div>
+            </div>
+            <div class="actions">
+              <button class="btn primary">提交并推送</button>
+              <button class="btn">同步源分支</button>
+              <button class="btn">合并代码</button>
+              <button class="btn more" title="更多操作">⋯</button>
+            </div>
+          </div>
+        </article>
+
+        <article class="workspace">
+          <div class="workspace-head">
+            <div class="name-block">
+              <span class="workspace-name">直播系统对接</span>
+            </div>
+            <div class="status-line">
+              <span class="status"><span class="dot warn"></span>36 个未提交改动</span>
+              <span class="status"><span class="dot ok"></span>远程已有备份</span>
+              <span class="status"><span class="dot ok"></span>未落后</span>
+            </div>
+          </div>
+          <div class="workspace-body">
+            <div class="details">
+              <div class="detail-row">
+                <span class="label">修改项目</span>
+                <span class="projects">
+                  <span class="project">server</span><span class="project">webapp</span><span class="project">webapp-lerna</span>
+                </span>
+              </div>
+              <div class="detail-row">
+                <span class="label">任务分支</span>
+                <span class="branch-link">3 个任务分支 · 点击查看</span>
+                <span class="muted">　创建于 2026-08-11 10:54</span>
+              </div>
+            </div>
+            <div class="actions">
+              <button class="btn primary">进入工作区</button>
+              <button class="btn">提交并推送</button>
+              <button class="btn">同步源分支</button>
+              <button class="btn">合并代码</button>
+              <button class="btn more" title="更多操作">⋯</button>
+            </div>
+          </div>
+        </article>
+
+        <article class="workspace">
+          <div class="workspace-head">
+            <div class="name-block">
+              <span class="workspace-name">课程批量导入优化</span>
+            </div>
+            <div class="status-line">
+              <span class="status"><span class="dot ok"></span>工作区干净</span>
+              <span class="status"><span class="dot ok"></span>已推送</span>
+              <span class="status"><span class="dot warn"></span>落后 2 个提交</span>
+            </div>
+          </div>
+          <div class="workspace-body">
+            <div class="details">
+              <div class="detail-row">
+                <span class="label">修改项目</span>
+                <span class="projects">
+                  <span class="project">server</span><span class="project">webapp</span>
+                </span>
+              </div>
+              <div class="detail-row">
+                <span class="label">任务分支</span>
+                <span class="branch-link">2 个任务分支 · 点击查看</span>
+                <span class="muted">　创建于 2026-08-10 09:26</span>
+              </div>
+            </div>
+            <div class="actions">
+              <button class="btn primary">进入工作区</button>
+              <button class="btn">提交并推送</button>
+              <button class="btn">同步源分支</button>
+              <button class="btn">合并代码</button>
+              <button class="btn more" title="更多操作">⋯</button>
+            </div>
+          </div>
+        </article>
+      </section>
+
+      <div class="summary">
+        <span>任务分支默认收起，点击“几个任务分支”后展开完整名称。</span>
+        <span>状态来自当前 Git 检查，不再使用“开发中 / 评审中”。</span>
+      </div>
+    </main>
+  </div>
+</body>
+</html>

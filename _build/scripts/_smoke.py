@@ -167,6 +167,10 @@ def cli_parse_check() -> list[str]:
           "description": "证书功能"}),
         (["mini-ide.exe", "--workspace-delete-check", "certificate"],
          {"cmd": "workspace-delete-check", "target": "certificate"}),
+        (["mini-ide.exe", "--workspace-commit-push", "certificate"],
+         {"cmd": "workspace-commit-push", "target": "certificate"}),
+        (["mini-ide.exe", "--workspace-commit-push", "certificate", "--message", "backup"],
+         {"cmd": "workspace-commit-push", "target": "certificate", "message": "backup"}),
         (["mini-ide.exe", "--workspace-sync", "certificate"],
          {"cmd": "workspace-sync", "target": "certificate"}),
         (["mini-ide.exe", "--workspace-sync", "certificate", "--fetch",
@@ -200,9 +204,17 @@ def cli_parse_check() -> list[str]:
         failed.append("workspace-sync must reject unknown flags")
     if _parse_args(["mini-ide.exe", "--workspace-sync"]) is not None:
         failed.append("workspace-sync must require a target")
+    if _parse_args(["mini-ide.exe", "--workspace-commit-push"]) is not None:
+        failed.append("workspace-commit-push must require a target")
+    if _parse_args([
+        "mini-ide.exe", "--workspace-commit-push", "certificate", "--message", "",
+    ]) is not None:
+        failed.append("workspace-commit-push must reject an empty message")
     if _parse_args(["mini-ide.exe", "--preflight-build", "server", "extra"]) is not None:
         failed.append("preflight-build must accept at most one project target")
-    for action in ("create-development-workspace", "workspace-sync"):
+    for action in (
+        "create-development-workspace", "workspace-commit-push", "workspace-sync",
+    ):
         if _response_timeout_ms({"cmd": action}) < 605000:
             failed.append(f"{action} should allow a complete workspace operation")
     if _parse_args(["mini-ide.exe", "--start-profile", "race"]) is not None:
@@ -361,7 +373,7 @@ def external_launcher_check() -> list[str]:
     if agentdesk_args != base:
         failed.append("AgentDesk launcher must separate Electron arguments and preserve the target directory")
     if codex_args != [*base, "--provider=codex"]:
-        failed.append("Codex entry must launch the Codex provider in AgentDesk")
+        failed.append("codex entry must launch the codex provider in AgentDesk")
     if cc_args != [*base, "--provider=claude"]:
         failed.append("cc entry must launch the Claude provider in AgentDesk")
     if tool_launchers.CREATE_NO_WINDOW != 0x08000000:
@@ -601,6 +613,7 @@ def aggregate_workspace_model_check() -> list[str]:
 
 def development_workspace_lifecycle_check() -> list[str]:
     """用真实临时 Git 仓库验证创建、失败回滚、Review 和保守删除。"""
+    from dataclasses import replace
     import subprocess
     import tempfile
 
@@ -627,6 +640,7 @@ def development_workspace_lifecycle_check() -> list[str]:
         repo_one = root / "server"
         repo_two = root / "webapp"
         shared = root / "nginx"
+        bare_remote = Path(tmp) / "server-origin.git"
         for repo in (repo_one, repo_two):
             repo.mkdir(parents=True)
             (repo / "README.md").write_text(f"{repo.name}\n", encoding="utf-8")
@@ -639,6 +653,8 @@ def development_workspace_lifecycle_check() -> list[str]:
         (repo_one / ".env").write_text("DEV_TAG=smoke\n", encoding="utf-8")
         git("-C", str(repo_one), "add", ".gitignore")
         git("-C", str(repo_one), "commit", "-m", "ignore local env")
+        git("init", "--bare", str(bare_remote))
+        git("-C", str(repo_one), "remote", "add", "origin", str(bare_remote))
         shared.mkdir(parents=True)
         project = AggregateProject.from_dict(root, {
             "schemaVersion": 1,
@@ -702,11 +718,27 @@ def development_workspace_lifecycle_check() -> list[str]:
                 f"refs/remotes/origin/{remote_task_branch}",
             )
 
+        if service.workspace_id_from_name("直播系统对接") != "zhiboxitongduijie":
+            failed.append("Chinese workspace name should become a readable pinyin id")
+        if service.workspace_id_from_name("Live 2.0") != "live-2.0":
+            failed.append("ASCII workspace name should remain readable and normalized")
+        try:
+            service.workspace_id_from_name("😀")
+            failed.append("workspace name without a usable id must be rejected")
+        except service.WorkspaceOperationError:
+            pass
+
         # 主工作目录有未提交内容不阻止从明确 HEAD 创建 Worktree。
         (repo_one / "LOCAL_ONLY.txt").write_text("dirty source\n", encoding="utf-8")
         plan = service.build_workspace_creation_plan(
-            project, "certificate", "证书任务", ["server"],
+            project, "证书任务", "证书任务", ["server"],
         )
+        if plan.workspace_id != "zhengshurenwu":
+            failed.append(f"workspace plan should use pinyin id: {plan.workspace_id}")
+        if plan.components[0].task_branch != "feature/zhengshurenwu-server":
+            failed.append(
+                f"task branch should use pinyin id: {plan.components[0].task_branch}"
+            )
         result = service.create_development_workspace(plan)
         if not result.ok or result.workspace is None:
             failed.append(f"workspace creation should succeed: {result.error}")
@@ -765,6 +797,69 @@ def development_workspace_lifecycle_check() -> list[str]:
                 )
             ):
                 failed.append("unrecorded verification results must be explicit")
+
+            push_calls = []
+            original_run_git = service._run_git
+
+            def fail_first_push(cwd, args, timeout=30):
+                if args and args[0] == "push":
+                    push_calls.append(str(cwd))
+                    return 1, "", "injected push failure"
+                return original_run_git(cwd, args, timeout)
+
+            two_component_workspace = replace(
+                workspace,
+                components=(
+                    workspace.components[0],
+                    replace(workspace.components[0], id="later"),
+                ),
+            )
+            service._run_git = fail_first_push
+            try:
+                stopped_push = service.commit_and_push_development_workspace(
+                    two_component_workspace,
+                )
+            finally:
+                service._run_git = original_run_git
+            if stopped_push.ok or len(push_calls) != 1:
+                failed.append("push failure must stop later workspace projects")
+            elif len(stopped_push.components) != 2 or "未执行" not in stopped_push.components[1].error:
+                failed.append("stopped workspace projects should report that they were not run")
+
+            # 已有本地提交、没有新改动时也应推送并建立 upstream。
+            pushed_result = service.commit_and_push_development_workspace(workspace)
+            if not pushed_result.ok or not pushed_result.components[0].pushed:
+                failed.append(
+                    "workspace commit and push should back up local commits: "
+                    f"{pushed_result.error}"
+                )
+            elif pushed_result.components[0].committed:
+                failed.append("commit and push should not create an empty commit")
+            upstream = git(
+                "-C", str(worktree), "rev-parse", "--abbrev-ref",
+                "--symbolic-full-name", "@{upstream}",
+            )
+            if upstream != f"origin/{workspace.components[0].task_branch}":
+                failed.append(f"workspace push should set upstream, got {upstream!r}")
+
+            pushed_file = worktree / "PUSHED.txt"
+            pushed_file.write_text("backup\n", encoding="utf-8")
+            committed_push = service.commit_and_push_development_workspace(
+                workspace, "backup workspace",
+            )
+            if not committed_push.ok or not committed_push.components[0].committed:
+                failed.append(
+                    "workspace commit and push should commit dirty files: "
+                    f"{committed_push.error}"
+                )
+            elif git("-C", str(worktree), "log", "-1", "--format=%s") != "backup workspace":
+                failed.append("workspace commit and push should use the requested message")
+            remote_head = git(
+                "--git-dir", str(bare_remote), "rev-parse",
+                f"refs/heads/{workspace.components[0].task_branch}",
+            )
+            if remote_head != git("-C", str(worktree), "rev-parse", "HEAD"):
+                failed.append("workspace remote branch should match the local task branch")
             reviewed_workspace = load_development_workspace(
                 workspace.root_path, aggregate_project=project,
             )
@@ -931,7 +1026,7 @@ def aggregate_runtime_ui_check() -> list[str]:
     from types import SimpleNamespace
 
     from PySide6.QtCore import Qt
-    from PySide6.QtWidgets import QApplication, QTableWidgetItem
+    from PySide6.QtWidgets import QApplication, QFrame, QScrollArea
 
     from src.core.aggregate_workspace import AggregateProject
     from src.core.cli_server import _find_project_tab
@@ -1006,17 +1101,13 @@ def aggregate_runtime_ui_check() -> list[str]:
         ):
             failed.append("stale project discovery must not append rows after switching environments")
         webapp_node = tab._project_nodes.get("webapp")
-        if webapp_node is None or webapp_node.childCount() != 2:
-            failed.append("aggregate project tree must keep runtime units under their project")
+        if webapp_node is None or webapp_node.childCount() != 0:
+            failed.append("aggregate project navigation must stay flat and omit duplicate runtime rows")
         else:
-            if tab.project_tree.itemWidget(webapp_node, 2) is None:
-                failed.append("project rows must expose fixed start/stop actions")
-            if tab.project_tree.itemWidget(webapp_node.child(0), 2) is None:
-                failed.append("runtime rows must expose fixed start/stop actions")
             tab.project_tree.setCurrentItem(webapp_node)
             app.processEvents()
-            if not webapp_node.isExpanded():
-                failed.append("selecting a multi-runtime project must expand its runtime units")
+            if tab.detail_stack.currentWidget() is not configured_webapp:
+                failed.append("selecting a project must show its internal runtime controls")
         if tab.project_splitter.orientation() != Qt.Orientation.Horizontal:
             failed.append("aggregate projects must use a horizontal sidebar/detail layout")
         if tab.view_tabs.count() != 2 or tab.view_tabs.tabText(1) != "需求工作区":
@@ -1026,35 +1117,33 @@ def aggregate_runtime_ui_check() -> list[str]:
         if (
             tab.project_codex_button.text() != "codex"
             or tab.project_cc_button.text() != "cc"
-            or tab.codex_button.text() != "codex"
-            or tab.cc_button.text() != "cc"
         ):
-            failed.append("codex and cc entries must keep their labels short and lowercase")
+            failed.append("project codex and cc entries must keep their labels short")
         if not all(
             button.toolTip()
             for button in (
                 tab.project_codex_button, tab.project_cc_button,
-                tab.codex_button, tab.cc_button,
             )
         ):
-            failed.append("short codex and cc labels must keep an explanatory tooltip")
+            failed.append("project codex and cc labels must keep an explanatory tooltip")
         if tab._current_environment_root() != Path(project.root_path):
             failed.append("project tools must open the aggregate root in source mode")
         if hasattr(tab, "enter_workspace_button") or hasattr(tab, "review_button"):
             failed.append("workspace toolbar must rely on double-click and omit Review")
-        if tab.merge_button.text() != "合并代码" or tab.delete_button.text() != "删除":
-            failed.append("workspace toolbar must expose concise merge and delete actions")
-        if tab.sync_button.text() != "同步源分支":
-            failed.append("workspace toolbar must expose syncing the base branch")
-        if tab.workspace_table.columnCount() != 7 or tab.workspace_table.horizontalHeaderItem(
-            4
-        ).text() != "落后":
-            failed.append("workspace table must show how far each task branch is behind")
+        if not isinstance(tab.workspace_scroll, QScrollArea):
+            failed.append("workspace panel must use a scrollable card layout")
+        if hasattr(tab, "workspace_table"):
+            failed.append("workspace panel must no longer use the old table")
+        if tab.workspace_cards_layout.count() < 1:
+            failed.append("workspace card container must preserve its trailing stretch")
         double_clicks: list[bool] = []
         tab._activate_selected_workspace = lambda: double_clicks.append(True)
-        tab.workspace_table.itemDoubleClicked.emit(QTableWidgetItem("workspace"))
+        fake_summary = SimpleNamespace(
+            root_path="workspace", workspace=SimpleNamespace(root_path="workspace"),
+        )
+        tab._activate_workspace_summary(fake_summary)
         if double_clicks != [True]:
-            failed.append("double-clicking a workspace row must enter that workspace")
+            failed.append("activating a workspace card must enter that workspace")
         if not tab.exit_workspace_button.isHidden():
             failed.append("exit workspace action must stay hidden in aggregate source mode")
         workspace_root = root / "workspace" / "certificate"
@@ -1993,6 +2082,47 @@ def aggregate_scan_isolation_check() -> list[str]:
     return failed
 
 
+def theme_switch_check() -> list[str]:
+    """验证 GitHub Light / Dark 可在同一进程即时切换，且不写真实配置。"""
+    from PySide6.QtWidgets import QApplication
+
+    from src.core.config import AppConfig
+    from src.ui.main_window import MainWindow
+    from src.ui.theme import (
+        BG_L1, FG_PRIMARY, THEME_GITHUB_DARK, THEME_GITHUB_LIGHT,
+        apply_theme, current_theme,
+    )
+
+    failed: list[str] = []
+    app = QApplication.instance() or QApplication([])
+    config = AppConfig(theme=THEME_GITHUB_DARK, restore_tabs_on_startup=False)
+    config.save = lambda: None
+    apply_theme(app, config.theme)
+    window = MainWindow(config)
+    window._switch_theme(THEME_GITHUB_LIGHT)
+    if (
+        current_theme() != THEME_GITHUB_LIGHT
+        or str(BG_L1) != "#F6F8FA"
+        or str(FG_PRIMARY) != "#1F2328"
+        or not window.theme_actions[THEME_GITHUB_LIGHT].isChecked()
+    ):
+        failed.append("GitHub Light must apply immediately and update the checked menu action")
+    window._switch_theme(THEME_GITHUB_DARK)
+    if (
+        current_theme() != THEME_GITHUB_DARK
+        or str(BG_L1) != "#161B22"
+        or not window.theme_actions[THEME_GITHUB_DARK].isChecked()
+    ):
+        failed.append("GitHub Dark must restore immediately in the same window")
+    window._mem_timer.stop()
+    if failed:
+        for message in failed:
+            print(f"[FAIL] theme_switch: {message}", flush=True)
+    else:
+        print("[OK]   GitHub Light / Dark live theme switching", flush=True)
+    return failed
+
+
 def runtime_stop_execution_check() -> list[str]:
     """验证显式 stop 会执行，并且失败时只兜底托管 runner。"""
     from PySide6.QtWidgets import QApplication
@@ -2472,6 +2602,7 @@ def hex_scan() -> list[tuple[str, int, str]]:
 
 if __name__ == "__main__":
     failed = import_check()
+    theme_failed = theme_switch_check()
     model_failed = service_state_check()
     runtime_unit_failed = runtime_unit_check()
     cli_failed = cli_parse_check()
@@ -2512,7 +2643,7 @@ if __name__ == "__main__":
             print(f"[HEX]  {rel}:{ln}: {safe}")
 
     total_fail = (
-        len(failed) + len(model_failed) + len(runtime_unit_failed)
+        len(failed) + len(theme_failed) + len(model_failed) + len(runtime_unit_failed)
         + len(cli_failed) + len(preflight_failed)
         + len(cli_encoding_failed) + len(launcher_failed)
         + len(git_executable_failed)

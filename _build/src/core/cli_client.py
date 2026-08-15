@@ -177,6 +177,7 @@ def _parse_args(argv: list[str]) -> dict | None:
         "open-aggregate": "open-aggregate",
         "create-development-workspace": "create-development-workspace",
         "workspace-review": "workspace-review",
+        "workspace-commit-push": "workspace-commit-push",
         "workspace-sync": "workspace-sync",
         "workspace-delete-check": "workspace-delete-check",
         "start": "start",
@@ -240,6 +241,22 @@ def _parse_args(argv: list[str]) -> dict | None:
             return None
         result["target"] = rest[0]
         return result if len(rest) == 1 else None
+
+    if cmd_name == "workspace-commit-push":
+        if not rest:
+            return None
+        result["target"] = rest[0]
+        index = 1
+        while index < len(rest):
+            if rest[index] == "--message" and index + 1 < len(rest):
+                message = rest[index + 1].strip()
+                if not message:
+                    return None
+                result["message"] = message
+                index += 2
+            else:
+                return None
+        return result
 
     if cmd_name == "workspace-sync":
         if not rest:
@@ -450,10 +467,11 @@ def _response_timeout_ms(cmd: dict) -> int:
     if action in (
         "health", "compile", "ensure-running",
         "create-development-workspace", "workspace-review", "workspace-delete-check",
-        "workspace-sync",
+        "workspace-commit-push", "workspace-sync",
     ) or (action in ("start", "restart") and cmd.get("wait")):
         defaults = {
             "create-development-workspace": 600,
+            "workspace-commit-push": 600,
             "workspace-sync": 600,
         }
         timeout = int(cmd.get("timeout", defaults.get(action, 120)))
@@ -585,6 +603,8 @@ def _print_usage():
         "  --open-aggregate <target>    Open one aggregate project tab\n"
         "  --create-development-workspace <aggregate> <name> --projects a,b [--description text]\n"
         "  --workspace-review <target>\n"
+        "  --workspace-commit-push <target> [--message text]\n"
+        "                               Commit changes and push task branches to origin\n"
         "  --workspace-sync <target> [--fetch] [--keep-conflicts]\n"
         "                               Merge the source base branch into task branches\n"
         "  --workspace-delete-check <target>\n"

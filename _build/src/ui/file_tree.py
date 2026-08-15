@@ -44,7 +44,8 @@ _ALWAYS_HIDDEN = {
 # 注意：不要在 QTreeWidget::item 里写 color——QSS 的 ::item color 会覆盖
 # QTreeWidgetItem.setForeground()，导致 git 染色无效。默认色由外层
 # QTreeWidget { color } 兜底（theme.py 全局已设）。
-_TREE_STYLE = f"""
+def _tree_style() -> str:
+    return f"""
 QTreeWidget {{
     background:{BG_L2};
     border:none;
@@ -301,6 +302,7 @@ class FileTree(QWidget):
 
         # 顶部过滤
         top = QFrame()
+        top.setObjectName("compact_toolbar")
         tl = QHBoxLayout(top)
         tl.setContentsMargins(6, 4, 6, 4)
         tl.setSpacing(4)
@@ -342,7 +344,7 @@ class FileTree(QWidget):
         self.tree.setExpandsOnDoubleClick(False)
         # Ctrl/Shift 多选：批量删除/复制路径等
         self.tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        self.tree.setStyleSheet(_TREE_STYLE)
+        self.tree.setStyleSheet(_tree_style())
         self.tree.itemExpanded.connect(self._on_item_expanded)
         # 单击目录就展开/折叠，比点小箭头友好
         self.tree.itemClicked.connect(self._on_item_clicked)
@@ -384,6 +386,22 @@ class FileTree(QWidget):
         self.stack.addWidget(self.search_list)
 
         root.addWidget(self.stack, 1)
+
+    def refresh_theme(self) -> None:
+        self.tree.setStyleSheet(_tree_style())
+        self._render_loaded_git_nodes()
+
+    def _render_loaded_git_nodes(self) -> None:
+        def walk(parent: QTreeWidgetItem) -> None:
+            for index in range(parent.childCount()):
+                node = parent.child(index)
+                path = node.data(0, Qt.ItemDataRole.UserRole)
+                kind = node.data(0, Qt.ItemDataRole.UserRole + 1)
+                if path and kind in ("dir", "file"):
+                    node.setData(0, _RENDER_CACHE_ROLE, None)
+                    self._apply_git_color_to_node(node, Path(path))
+                walk(node)
+        walk(self.tree.invisibleRootItem())
 
     # ---- 加载 ----
 
@@ -477,7 +495,7 @@ class FileTree(QWidget):
             virtual_path = (parent_path / name)
             node.setData(0, Qt.ItemDataRole.UserRole, str(virtual_path))
             node.setData(0, Qt.ItemDataRole.UserRole + 1, "deleted")
-            node.setForeground(0, QColor(GIT_DEL))
+            node.setForeground(0, QColor(str(GIT_DEL)))
             self._set_strikethrough(node, True)
             node.setToolTip(0, self._STATUS_TOOLTIPS[GIT_STATUS_DELETED])
             # 占位节点不可拖、不可改
@@ -556,7 +574,7 @@ class FileTree(QWidget):
         if cache == target:
             return
         node.setData(0, _RENDER_CACHE_ROLE, target)
-        node.setForeground(0, QColor(color))
+        node.setForeground(0, QColor(str(color)))
         self._set_strikethrough(node, strike)
         node.setToolTip(0, tip)
 
@@ -1059,7 +1077,7 @@ class FileTree(QWidget):
             self._apply_filter(self.filter_input.text())
 
     def _open_codex(self, target_dir: Path) -> None:
-        """在 AgentDesk 中为 Codex 入口打开当前目录。"""
+        """在 AgentDesk 中为 codex 入口打开当前目录。"""
         command = open_in_codex_args(target_dir)
         if not command:
             QMessageBox.warning(

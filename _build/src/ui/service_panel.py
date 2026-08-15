@@ -18,14 +18,13 @@ from __future__ import annotations
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
-    QFrame, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget,
+    QFrame, QHBoxLayout, QLabel, QPushButton, QScrollArea, QStyle, QToolButton,
+    QVBoxLayout, QWidget,
 )
 
 from src.ui.theme import (
-    ACCENT, BG_BTN, BG_BTN_HOVER, BG_BTN_DANGER, BG_BTN_DANGER_HOVER, BG_BTN_PRIMARY,
-    BG_BTN_PRIMARY_HOVER, BG_L0, BG_L1, BG_L2, BG_L4, BORDER_SUBTLE,
-    COLOR_SUCCESS, COLOR_WARN, FG_BRIGHT, FG_DIM, FG_PRIMARY,
-    FG_SECONDARY, FONT_PT_UI, FONT_PT_UI_SM, H_BTN_SM, RADIUS_SM,
+    ACCENT, BG_L0, BG_L1, BG_L4, BORDER_SUBTLE, COLOR_SUCCESS, COLOR_WARN,
+    FG_DIM, FG_PRIMARY, FG_SECONDARY, FONT_PT_UI, FONT_PT_UI_SM,
 )
 
 
@@ -201,41 +200,31 @@ class ServicePanel(QWidget):
         h_lay.addWidget(title_label)
         h_lay.addStretch(1)
 
-        self.btn_clear_logs = QPushButton("清空日志")
-        self.btn_clear_logs.setFixedHeight(H_BTN_SM)
+        self.btn_clear_logs = QToolButton()
+        self.btn_clear_logs.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_DialogResetButton)
+        )
+        self.btn_clear_logs.setAccessibleName("清空日志")
         self.btn_clear_logs.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_clear_logs.setToolTip("清空当前项目所有服务控制台日志")
-        self.btn_clear_logs.setStyleSheet(
-            f"QPushButton {{ background:{BG_BTN}; color:{FG_PRIMARY};"
-            f" border:1px solid {BORDER_SUBTLE}; border-radius:{RADIUS_SM}px;"
-            f" font-size:{FONT_PT_UI_SM}pt; padding:2px 8px; }}"
-            f"QPushButton:hover {{ background:{BG_BTN_HOVER}; }}"
-        )
         self.btn_clear_logs.clicked.connect(self.clearLogsRequested.emit)
         h_lay.addWidget(self.btn_clear_logs)
 
-        self.btn_start_all = QPushButton("▶ 全部启动")
-        self.btn_start_all.setFixedHeight(22)
+        self.btn_start_all = QToolButton()
+        self.btn_start_all.setProperty("role", "primary")
+        self.btn_start_all.setText("▶")
+        self.btn_start_all.setAccessibleName("全部启动")
+        self.btn_start_all.setToolTip("全部启动")
         self.btn_start_all.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_start_all.setStyleSheet(
-            f"QPushButton {{ background:{BG_BTN_PRIMARY}; color:{FG_BRIGHT};"
-            f" border:none; border-radius:{RADIUS_SM}px;"
-            f" font-size:{FONT_PT_UI_SM}pt; padding:2px 10px; }}"
-            f"QPushButton:hover {{ background:{BG_BTN_PRIMARY_HOVER}; }}"
-        )
         self.btn_start_all.clicked.connect(self.startAllRequested.emit)
         h_lay.addWidget(self.btn_start_all)
 
-        self.btn_stop_all = QPushButton("⏹ 全部停止")
-        self.btn_stop_all.setFixedHeight(22)
+        self.btn_stop_all = QToolButton()
+        self.btn_stop_all.setProperty("role", "danger")
+        self.btn_stop_all.setText("■")
+        self.btn_stop_all.setAccessibleName("全部停止")
+        self.btn_stop_all.setToolTip("全部停止")
         self.btn_stop_all.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_stop_all.setStyleSheet(
-            f"QPushButton {{ background:{BG_BTN_DANGER}; color:{FG_BRIGHT};"
-            f" border:none; border-radius:{RADIUS_SM}px;"
-            f" font-size:{FONT_PT_UI_SM}pt; padding:2px 10px; }}"
-            f"QPushButton:hover {{ background:{BG_BTN_DANGER_HOVER}; }}"
-            f"QPushButton:disabled {{ background:{BG_L2}; color:{FG_DIM}; }}"
-        )
         self.btn_stop_all.clicked.connect(self.stopAllRequested.emit)
         self.btn_stop_all.setEnabled(False)
         h_lay.addWidget(self.btn_stop_all)
@@ -265,7 +254,15 @@ class ServicePanel(QWidget):
             rlay.addWidget(row)
         rlay.addStretch(1)
 
-        root.addWidget(rows_wrap, 1)
+        self.rows_scroll = QScrollArea()
+        self.rows_scroll.setObjectName("service_rows_scroll")
+        self.rows_scroll.setWidgetResizable(True)
+        self.rows_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.rows_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.rows_scroll.setWidget(rows_wrap)
+        root.addWidget(self.rows_scroll, 1)
 
     def update_state(
         self, module: str, state: str,

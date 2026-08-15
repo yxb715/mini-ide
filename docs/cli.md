@@ -32,6 +32,7 @@
 --close-workspace
 --create-development-workspace <aggregate> <name> --projects a,b [--description text]
 --workspace-review <target>
+--workspace-commit-push <target> [--message text]
 --workspace-delete-check <target>
 --workspace-sync <target> [--fetch] [--keep-conflicts]
 
@@ -63,6 +64,7 @@
 - `--open-workspace` 在所属聚合 Tab 内切换，不创建新的顶层 Tab。
 - `--close-workspace` 停止当前工作区环境中的服务并返回聚合源目录。
 - `--workspace-delete-check` 只做删除预检，不删除文件、Worktree 或分支；真正删除由 GUI 操作执行。
+- `--workspace-commit-push` 在任务 Worktree 提交改动并推送到 `origin`；没有新改动但已有未推送提交时也会推送，不执行强制推送。默认提交信息为工作区名称；某项目失败后停止后续项目。
 - `--workspace-sync` 默认只使用本地基准分支；`--fetch` 才拉取上游；冲突默认回滚，`--keep-conflicts` 才保留冲突。
 
 ## 编译与退出检查
