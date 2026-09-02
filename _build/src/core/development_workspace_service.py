@@ -90,6 +90,7 @@ class WorkspaceMergeComponent:
     task_branch: str
     merged: bool
     error: str = ""
+    pushed: bool = False
 
 
 @dataclass(frozen=True)
@@ -684,6 +685,18 @@ def _merge_preflight_error(
     if source_status:
         return "源目录有未提交或未跟踪文件"
 
+    code, upstream, err = _run_git(
+        item.source_repository_path,
+        [
+            "rev-parse", "--abbrev-ref", "--symbolic-full-name",
+            f"{item.base_branch}@{{upstream}}",
+        ],
+        10,
+    )
+    if code != 0 or not upstream:
+        detail = f"：{err}" if err else ""
+        return f"基准分支 {item.base_branch} 未配置上游远程仓库{detail}"
+
     code, _out, err = _run_git(
         item.source_repository_path,
         ["merge-base", "--is-ancestor", item.base_branch, item.task_branch],
@@ -908,12 +921,34 @@ def merge_development_workspace(
             if code != 0:
                 message = err or out or "快进合并失败"
                 merged.append(WorkspaceMergeComponent(
-                    item.id, item.base_branch, item.task_branch, False, message,
+                    item.id, item.base_branch, item.task_branch,
+                    False, message, False,
                 ))
                 merged.extend(
                     WorkspaceMergeComponent(
                         pending.id, pending.base_branch, pending.task_branch,
-                        False, "前序项目合并失败，未执行",
+                        False, "前序项目合并失败，未执行", False,
+                    )
+                    for pending in editable[index + 1:]
+                )
+                return WorkspaceMergeResult(
+                    False, workspace, tuple(merged), f"{item.id}：{message}",
+                )
+
+            code, out, err = _run_git(
+                item.source_repository_path, ["push"], 300,
+            )
+            if code != 0:
+                detail = err or out or "未知错误"
+                message = f"推送基准分支失败：{detail}"
+                merged.append(WorkspaceMergeComponent(
+                    item.id, item.base_branch, item.task_branch,
+                    True, message, False,
+                ))
+                merged.extend(
+                    WorkspaceMergeComponent(
+                        pending.id, pending.base_branch, pending.task_branch,
+                        False, "前序项目推送失败，未执行", False,
                     )
                     for pending in editable[index + 1:]
                 )
@@ -921,7 +956,7 @@ def merge_development_workspace(
                     False, workspace, tuple(merged), f"{item.id}：{message}",
                 )
             merged.append(WorkspaceMergeComponent(
-                item.id, item.base_branch, item.task_branch, True,
+                item.id, item.base_branch, item.task_branch, True, "", True,
             ))
 
         merged_workspace = replace(workspace, status="merged")

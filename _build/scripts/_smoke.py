@@ -1010,6 +1010,19 @@ def development_workspace_lifecycle_check() -> list[str]:
                 failed.append("source preflight failure must not commit task changes")
             (repo_one / "LOCAL_ONLY.txt").unlink()
 
+            git("-C", str(repo_one), "branch", "--unset-upstream", "main")
+            missing_upstream = service.merge_development_workspace(workspace)
+            if missing_upstream.ok or "未配置上游" not in missing_upstream.error:
+                failed.append("workspace merge must require a base branch upstream")
+            if git("-C", str(repo_one), "rev-parse", "HEAD") != base_head:
+                failed.append("missing upstream must not move the base branch")
+            if git("-C", str(worktree), "rev-parse", "HEAD") != task_head:
+                failed.append("missing upstream must not commit task changes")
+            git(
+                "-C", str(repo_one), "branch", "--set-upstream-to",
+                "origin/main", "main",
+            )
+
             original_run_git = service._run_git
 
             def fail_auto_commit(cwd, args, timeout=30):
@@ -1027,6 +1040,25 @@ def development_workspace_lifecycle_check() -> list[str]:
             if git("-C", str(repo_one), "rev-parse", "HEAD") != base_head:
                 failed.append("auto-commit failure must not move the base branch")
 
+            original_run_git = service._run_git
+
+            def fail_merge_push(cwd, args, timeout=30):
+                if args and args[0] == "push":
+                    return 1, "", "injected base push failure"
+                return original_run_git(cwd, args, timeout)
+
+            service._run_git = fail_merge_push
+            try:
+                merge_push_failed = service.merge_development_workspace(workspace)
+            finally:
+                service._run_git = original_run_git
+            if merge_push_failed.ok or "推送" not in merge_push_failed.error:
+                failed.append("base push failure must make workspace merge incomplete")
+            elif not merge_push_failed.components[0].merged or merge_push_failed.components[0].pushed:
+                failed.append("base push failure should retain local merge without marking pushed")
+            if git("-C", str(repo_one), "rev-parse", "HEAD") == base_head:
+                failed.append("base push failure should retain the local base merge")
+
             merge_result = service.merge_development_workspace(workspace)
             if not merge_result.ok or not all(item.merged for item in merge_result.components):
                 failed.append(f"dirty workspace should auto-commit and merge: {merge_result.error}")
@@ -1039,10 +1071,16 @@ def development_workspace_lifecycle_check() -> list[str]:
             )
             if merged_workspace.status != "merged":
                 failed.append("successful workspace merge should mark the workspace merged")
+            if not merge_result.components or not all(
+                item.merged and item.pushed for item in merge_result.components
+            ):
+                failed.append("successful workspace merge should push every base branch")
             delete_plan = service.inspect_workspace_delete(workspace)
-            if delete_plan.can_delete or not any("尚未确认已推送" in item for item in delete_plan.blockers):
-                failed.append("unpushed base branch must block workspace deletion")
-            git("-C", str(repo_one), "push", "origin", "main")
+            if not delete_plan.can_delete:
+                failed.append(
+                    "merged and pushed workspace should pass deletion preflight: "
+                    f"{delete_plan.blockers}"
+                )
 
             unknown = Path(workspace.root_path) / ".mine-dev-flow" / "reviews"
             unknown.mkdir(parents=True)

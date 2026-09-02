@@ -1123,7 +1123,7 @@ class AggregateProjectTab(QWidget):
         editable = [
             item for item in summary.workspace.components if item.mode == "worktree"
         ]
-        lines = ["将把以下任务分支快进合并到基准分支："]
+        lines = ["将把以下任务分支快进合并到基准分支，并推送基准分支上游："]
         lines.extend(
             f"- {item.id}: {item.task_branch} -> {item.base_branch}"
             for item in editable
@@ -1131,7 +1131,9 @@ class AggregateProjectTab(QWidget):
         commit_message = summary.workspace.name.strip() or summary.workspace.id
         lines.append(
             f"\n将先自动提交各工作区的全部改动，提交信息为“{commit_message}”，"
-            "再合并到基准分支。源目录必须无未提交改动，分支分叉时不会自动合并。确认继续？"
+            "再合并到基准分支并推送。源目录必须无未提交改动，"
+            "分支分叉时不会自动合并；基准分支上已有的未推送提交也会一并推送。"
+            "确认继续？"
         )
         answer = QMessageBox.question(
             self,
@@ -1142,7 +1144,7 @@ class AggregateProjectTab(QWidget):
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
-        self.workspace_status.setText("正在提交并合并代码...")
+        self.workspace_status.setText("正在提交、合并并推送代码...")
         worker = _MergeWorkspaceWorker(summary.workspace, QApplication.instance())
         self._merge_worker = worker
         self._update_workspace_buttons()
@@ -1157,12 +1159,25 @@ class AggregateProjectTab(QWidget):
         self._update_workspace_buttons()
         if error or result is None or not result.ok:
             message = error or (result.error if result is not None else "未知错误")
+            if result is not None and result.components:
+                details = [
+                    f"- {item.id}: {item.error}"
+                    for item in result.components if item.error
+                ]
+                pushed = [item.id for item in result.components if item.pushed]
+                if pushed:
+                    details.insert(0, "已推送基准分支：" + "、".join(pushed))
+                if details:
+                    message = message + "\n\n" + "\n".join(details)
             action_log.warning("[GUI] 合并工作区失败 error=%s", message)
-            QMessageBox.warning(self, "合并失败", message)
+            QMessageBox.warning(self, "合并并推送失败", message)
         else:
             projects = "、".join(item.id for item in result.components if item.merged)
-            action_log.info("[GUI] 合并工作区成功 projects=%s", projects)
-            QMessageBox.information(self, "合并完成", f"已合并：{projects}")
+            action_log.info("[GUI] 合并并推送工作区成功 projects=%s", projects)
+            QMessageBox.information(
+                self, "合并并推送完成",
+                f"已合并并推送基准分支：{projects}",
+            )
         self.refresh_workspaces()
 
     def _running_project_paths(self) -> tuple[str, ...]:
