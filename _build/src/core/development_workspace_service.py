@@ -1,9 +1,10 @@
-"""临时开发工作区的创建、检查、合并和保守删除。"""
+"""临时开发工作区的创建、检查、合并和收尾删除。"""
 from __future__ import annotations
 
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import threading
@@ -157,10 +158,11 @@ class WorkspaceCommitPushResult:
 @dataclass(frozen=True)
 class WorkspaceDeleteComponent:
     id: str
-    dirty: bool
-    pushed: bool
+    base_branch: str
+    task_branch: str
     merged: bool
-    branch_will_be_kept: bool
+    base_pushed: bool
+    base_remote_ref: str = ""
     error: str = ""
 
 
@@ -178,7 +180,7 @@ class WorkspaceDeletePlan:
 
     @property
     def needs_unmerged_confirmation(self) -> bool:
-        return any(item.pushed and not item.merged for item in self.components)
+        return False
 
 
 def _run_git(cwd: str | Path, args: list[str], timeout: int = 30) -> tuple[int, str, str]:
@@ -1112,67 +1114,148 @@ def inspect_workspace_delete(
     workspace: DevelopmentWorkspace,
     running_paths: tuple[str, ...] | list[str] = (),
 ) -> WorkspaceDeletePlan:
-    root = canonical_path(workspace.root_path)
-    running_keys = {normalized_path_key(path) for path in running_paths}
-    expected = {"workspace.json", "AGENTS.md", "context.md"}
-    expected.update(
-        Path(item.worktree_path).name
-        for item in workspace.components if item.mode == "worktree"
-    )
-    try:
-        unknown = tuple(sorted(
-            str(path) for path in root.iterdir() if path.name not in expected
-        ))
-    except OSError as exc:
-        unknown = (f"无法读取任务目录：{exc}",)
+    # 删除工作区代表需求已经收尾。目录内容、Worktree 脏状态和运行状态不再作为
+    # 删除限制；这里只确认任务分支已经进入基准分支，且基准分支已同步到远端。
+    _ = running_paths
     blockers: list[str] = []
-    warnings: list[str] = []
-    if unknown:
-        blockers.append("任务目录包含不受 mini-ide 管理的文件")
-
+    fetched: set[tuple[str, str]] = set()
     components: list[WorkspaceDeleteComponent] = []
     for item in workspace.components:
-        runtime_path = item.worktree_path or item.source_repository_path
-        if normalized_path_key(runtime_path) in running_keys:
-            blockers.append(f"{item.id} 仍有服务或任务在运行")
         if item.mode != "worktree":
             continue
-        code, status, err = _run_git(item.worktree_path, ["status", "--porcelain"], 15)
-        dirty = code != 0 or bool(_unexpected_worktree_status(
-            status, item.workspace_copy_files,
-        ))
-        pushed_code, pushed_out, _ = _run_git(
-            item.source_repository_path,
-            ["branch", "-r", "--contains", item.task_branch], 15,
-        )
-        merged_code, _out, _ = _run_git(
+        merged_code, _out, merged_err = _run_git(
             item.source_repository_path,
             ["merge-base", "--is-ancestor", item.task_branch, item.base_branch], 15,
         )
-        pushed = pushed_code == 0 and bool(pushed_out)
         merged = merged_code == 0
-        error = err if code != 0 else ""
-        if dirty:
-            blockers.append(f"{item.id} 有未提交或未跟踪文件")
-        if not merged and not pushed:
-            blockers.append(f"{item.id} 未合并且没有远端备份")
-        elif not merged and pushed:
-            warnings.append(f"{item.id} 未合并，将保留任务分支")
+        base_remote_ref, base_error = _workspace_base_remote_ref(item, fetched)
+        base_pushed = bool(base_remote_ref) and not base_error
+        errors = [value for value in (merged_err if not merged else "", base_error) if value]
+        if not merged:
+            blockers.append(
+                f"{item.id} 任务分支 {item.task_branch} 尚未合并到 {item.base_branch}"
+            )
+        if not base_pushed:
+            blockers.append(
+                f"{item.id} 基准分支 {item.base_branch} 尚未确认已推送到远程仓库"
+            )
         components.append(WorkspaceDeleteComponent(
             id=item.id,
-            dirty=dirty,
-            pushed=pushed,
+            base_branch=item.base_branch,
+            task_branch=item.task_branch,
             merged=merged,
-            branch_will_be_kept=not merged,
-            error=error,
+            base_pushed=base_pushed,
+            base_remote_ref=base_remote_ref,
+            error="；".join(dict.fromkeys(errors)),
         ))
     return WorkspaceDeletePlan(
         workspace=workspace,
         components=tuple(components),
         blockers=tuple(dict.fromkeys(blockers)),
-        warnings=tuple(dict.fromkeys(warnings)),
-        unknown_paths=unknown,
+        warnings=(),
+        unknown_paths=(),
     )
+
+
+def _workspace_base_remote_ref(
+    item: WorkspaceComponent,
+    fetched: set[tuple[str, str]],
+) -> tuple[str, str]:
+    repo = item.source_repository_path
+    code, _out, err = _run_git(
+        repo, ["show-ref", "--verify", "--quiet", f"refs/heads/{item.base_branch}"], 10,
+    )
+    if code != 0:
+        return "", err or f"本地缺少基准分支 {item.base_branch}"
+
+    code, upstream, _err = _run_git(
+        repo,
+        [
+            "rev-parse", "--abbrev-ref", "--symbolic-full-name",
+            f"{item.base_branch}@{{upstream}}",
+        ],
+        10,
+    )
+    if code != 0 or not upstream:
+        code, _out, _err = _run_git(repo, ["remote", "get-url", "origin"], 10)
+        if code != 0:
+            return "", f"基准分支 {item.base_branch} 未配置上游，且仓库没有 origin"
+        upstream = f"origin/{item.base_branch}"
+
+    remote = upstream.split("/", 1)[0]
+    fetch_key = (normalized_path_key(repo), remote.casefold())
+    if fetch_key not in fetched:
+        code, out, err = _run_git(repo, ["fetch", "--prune", remote], 300)
+        if code != 0:
+            return "", err or out or f"拉取远程仓库失败：{remote}"
+        fetched.add(fetch_key)
+
+    code, _out, err = _run_git(
+        repo, ["show-ref", "--verify", "--quiet", f"refs/remotes/{upstream}"], 10,
+    )
+    if code != 0:
+        return "", err or f"远程缺少基准分支 {upstream}"
+    code, _out, err = _run_git(
+        repo, ["merge-base", "--is-ancestor", item.base_branch, upstream], 15,
+    )
+    if code != 0:
+        return "", err or f"本地 {item.base_branch} 还有未推送到 {upstream} 的提交"
+    return upstream, ""
+
+
+def _remove_readonly_path(function, path: str, _error_info) -> None:
+    os.chmod(path, stat.S_IWRITE)
+    function(path)
+
+
+def _workspace_delete_root_error(workspace: DevelopmentWorkspace) -> str:
+    root = canonical_path(workspace.root_path)
+    aggregate_root = canonical_path(workspace.aggregate_project_path)
+    if not is_path_within(root, aggregate_root, allow_equal=False):
+        return "工作区目录不在聚合目录内，拒绝递归删除"
+    if root.name.casefold() != workspace.id.casefold():
+        return "工作区目录名与工作区 ID 不一致，拒绝递归删除"
+    for item in workspace.components:
+        if item.mode == "worktree" and not is_path_within(
+            item.worktree_path, root, allow_equal=False,
+        ):
+            return f"{item.id} Worktree 不在工作区目录内，拒绝递归删除"
+    return ""
+
+
+def _delete_remote_task_branches(
+    item: WorkspaceComponent,
+    base_remote_ref: str,
+) -> tuple[list[str], list[str]]:
+    repo = item.source_repository_path
+    remotes: list[str] = []
+    code, _out, _err = _run_git(repo, ["remote", "get-url", "origin"], 10)
+    if code == 0:
+        remotes.append("origin")
+    if base_remote_ref and "/" in base_remote_ref:
+        remotes.append(base_remote_ref.split("/", 1)[0])
+
+    remaining: list[str] = []
+    errors: list[str] = []
+    for remote in dict.fromkeys(remotes):
+        code, out, err = _run_git(
+            repo,
+            ["ls-remote", "--heads", remote, f"refs/heads/{item.task_branch}"],
+            60,
+        )
+        if code != 0:
+            remaining.append(f"{remote}/{item.task_branch}")
+            errors.append(err or out or f"无法检查远程分支 {remote}/{item.task_branch}")
+            continue
+        if not out:
+            continue
+        code, out, err = _run_git(
+            repo, ["push", remote, "--delete", item.task_branch], 120,
+        )
+        if code != 0:
+            remaining.append(f"{remote}/{item.task_branch}")
+            errors.append(err or out or f"删除远程分支失败：{remote}/{item.task_branch}")
+    return remaining, errors
 
 
 def delete_development_workspace(
@@ -1180,62 +1263,71 @@ def delete_development_workspace(
     *,
     confirm_unmerged_backed_up: bool = False,
 ) -> tuple[bool, tuple[str, ...], str]:
-    if not plan.can_delete:
-        return False, (), "；".join(plan.blockers)
-    if plan.needs_unmerged_confirmation and not confirm_unmerged_backed_up:
-        return False, (), "存在未合并但已有远端备份的分支，需要明确确认保留分支"
+    _ = confirm_unmerged_backed_up
+    fresh_plan = inspect_workspace_delete(plan.workspace)
+    if not fresh_plan.can_delete:
+        return False, (), "；".join(fresh_plan.blockers)
+    safety_error = _workspace_delete_root_error(fresh_plan.workspace)
+    if safety_error:
+        return False, (), safety_error
     operation_key = normalized_path_key(plan.workspace.root_path)
     with _OPERATION_LOCK:
         if operation_key in _ACTIVE_OPERATIONS:
             return False, (), "同名工作区正在创建或删除"
         _ACTIVE_OPERATIONS.add(operation_key)
-    kept_branches: list[str] = []
+    remaining_branches: list[str] = []
     try:
-        by_id = {item.id: item for item in plan.components}
-        for item in plan.workspace.components:
+        root = canonical_path(fresh_plan.workspace.root_path)
+        try:
+            if root.exists():
+                shutil.rmtree(root, onerror=_remove_readonly_path)
+        except OSError as exc:
+            return False, (), f"删除工作区目录失败：{exc}"
+
+        statuses = {item.id: item for item in fresh_plan.components}
+        errors: list[str] = []
+        pruned_repositories: set[str] = set()
+        for item in fresh_plan.workspace.components:
             if item.mode != "worktree":
                 continue
-            for relative in item.workspace_copy_files:
-                try:
-                    target = resolve_path_within(
-                        item.worktree_path, relative,
-                        label=f"{item.id} workspaceCopyFiles target",
-                    )
-                    target.unlink(missing_ok=True)
-                except (OSError, ValueError) as exc:
-                    return (
-                        False, tuple(kept_branches),
-                        f"删除 {item.id} 白名单文件失败：{exc}",
-                    )
-            code, out, err = _run_git(
+            repo_key = normalized_path_key(item.source_repository_path)
+            if repo_key not in pruned_repositories:
+                code, out, err = _run_git(
+                    item.source_repository_path,
+                    ["worktree", "prune", "--expire", "now"],
+                    30,
+                )
+                if code != 0:
+                    errors.append(err or out or f"清理 {item.id} Worktree 记录失败")
+                pruned_repositories.add(repo_key)
+
+            code, _out, _err = _run_git(
                 item.source_repository_path,
-                ["worktree", "remove", item.worktree_path],
-                60,
+                ["show-ref", "--verify", "--quiet", f"refs/heads/{item.task_branch}"],
+                10,
             )
-            if code != 0:
-                return False, tuple(kept_branches), err or out or f"移除 {item.id} 失败"
-            _run_git(item.source_repository_path, ["worktree", "prune"], 30)
-            status = by_id.get(item.id)
-            if status and status.merged:
-                delete_code, _out, _err = _run_git(
-                    item.source_repository_path, ["branch", "-d", item.task_branch], 30,
+            if code == 0:
+                delete_code, out, err = _run_git(
+                    item.source_repository_path, ["branch", "-D", item.task_branch], 30,
                 )
                 if delete_code != 0:
-                    kept_branches.append(item.task_branch)
-            else:
-                kept_branches.append(item.task_branch)
+                    remaining_branches.append(item.task_branch)
+                    errors.append(err or out or f"删除本地分支失败：{item.task_branch}")
 
-        root = Path(plan.workspace.root_path)
-        for name in ("workspace.json", "AGENTS.md", "context.md"):
-            try:
-                (root / name).unlink(missing_ok=True)
-            except OSError as exc:
-                return False, tuple(kept_branches), f"删除元数据失败：{exc}"
-        try:
-            root.rmdir()
-        except OSError as exc:
-            return False, tuple(kept_branches), f"任务目录非空，已保留：{exc}"
-        return True, tuple(kept_branches), ""
+            status = statuses[item.id]
+            remote_remaining, remote_errors = _delete_remote_task_branches(
+                item, status.base_remote_ref,
+            )
+            remaining_branches.extend(remote_remaining)
+            errors.extend(remote_errors)
+
+        if errors:
+            return (
+                False,
+                tuple(dict.fromkeys(remaining_branches)),
+                "工作区目录已删除，但分支清理未完成：" + "；".join(dict.fromkeys(errors)),
+            )
+        return True, (), ""
     finally:
         with _OPERATION_LOCK:
             _ACTIVE_OPERATIONS.discard(operation_key)

@@ -612,7 +612,7 @@ def aggregate_workspace_model_check() -> list[str]:
 
 
 def development_workspace_lifecycle_check() -> list[str]:
-    """用真实临时 Git 仓库验证创建、失败回滚、Review 和保守删除。"""
+    """用真实临时 Git 仓库验证创建、失败回滚、Review 和收尾删除。"""
     from dataclasses import replace
     import subprocess
     import tempfile
@@ -655,6 +655,7 @@ def development_workspace_lifecycle_check() -> list[str]:
         git("-C", str(repo_one), "commit", "-m", "ignore local env")
         git("init", "--bare", str(bare_remote))
         git("-C", str(repo_one), "remote", "add", "origin", str(bare_remote))
+        git("-C", str(repo_one), "push", "--set-upstream", "origin", "main")
         shared.mkdir(parents=True)
         project = AggregateProject.from_dict(root, {
             "schemaVersion": 1,
@@ -777,8 +778,11 @@ def development_workspace_lifecycle_check() -> list[str]:
             untracked = Path(workspace.root_path) / "server" / "UNTRACKED.txt"
             untracked.write_text("block delete\n", encoding="utf-8")
             delete_plan = service.inspect_workspace_delete(workspace)
-            if delete_plan.can_delete or not any("未提交" in item for item in delete_plan.blockers):
-                failed.append("dirty Worktree must block the whole deletion")
+            if not delete_plan.can_delete:
+                failed.append(
+                    "dirty Worktree must not block deletion after merge/push checks: "
+                    f"{delete_plan.blockers!r}"
+                )
             untracked.unlink()
 
             worktree = Path(workspace.root_path) / "server"
@@ -975,12 +979,14 @@ def development_workspace_lifecycle_check() -> list[str]:
             )
             if merged_workspace.status != "merged":
                 failed.append("successful workspace merge should mark the workspace merged")
-            unknown = Path(workspace.root_path) / "unknown.txt"
-            unknown.write_text("keep\n", encoding="utf-8")
             delete_plan = service.inspect_workspace_delete(workspace)
-            if delete_plan.can_delete or not delete_plan.unknown_paths:
-                failed.append("unknown task-root files must block deletion")
-            unknown.unlink()
+            if delete_plan.can_delete or not any("尚未确认已推送" in item for item in delete_plan.blockers):
+                failed.append("unpushed base branch must block workspace deletion")
+            git("-C", str(repo_one), "push", "origin", "main")
+
+            unknown = Path(workspace.root_path) / ".mine-dev-flow" / "reviews"
+            unknown.mkdir(parents=True)
+            (unknown / "report.md").write_text("keep no more\n", encoding="utf-8")
             delete_plan = service.inspect_workspace_delete(workspace)
             if not delete_plan.can_delete:
                 failed.append(f"merged clean workspace should be deletable: {delete_plan.blockers!r}")
@@ -990,6 +996,18 @@ def development_workspace_lifecycle_check() -> list[str]:
                     failed.append(f"safe workspace deletion failed: {error}; kept={kept!r}")
                 elif copied_env.exists():
                     failed.append("workspace deletion should remove managed copied files with the Worktree")
+                elif service._run_git(
+                    repo_one,
+                    ["show-ref", "--verify", "--quiet", f"refs/heads/{workspace.components[0].task_branch}"],
+                    10,
+                )[0] == 0:
+                    failed.append("workspace deletion should remove the local task branch")
+                elif service._run_git(
+                    repo_one,
+                    ["ls-remote", "--heads", "origin", f"refs/heads/{workspace.components[0].task_branch}"],
+                    30,
+                )[1]:
+                    failed.append("workspace deletion should remove the remote task branch")
         # 第二个仓库创建失败时，只回滚本次已创建且仍干净的 Worktree。
         partial_plan = service.build_workspace_creation_plan(
             project, "partial", "失败回滚", ["server", "webapp"],

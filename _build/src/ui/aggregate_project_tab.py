@@ -1238,19 +1238,24 @@ class AggregateProjectTab(QWidget):
             return
         if plan.blockers:
             details = "\n".join(f"- {item}" for item in plan.blockers)
-            if plan.unknown_paths:
-                details += "\n\n未知路径：\n" + "\n".join(plan.unknown_paths)
             QMessageBox.warning(self, "当前不能删除", details)
             self.refresh_workspaces()
             return
-        lines = ["将移除以下 Worktree："]
-        for item in plan.workspace.components:
-            if item.mode == "worktree":
-                lines.append(f"- {item.id}: {item.worktree_path}")
-        if plan.warnings:
-            lines.append("\n任务分支将保留：")
-            lines.extend(f"- {item}" for item in plan.warnings)
-        lines.append("\n不会强删分支，也不会递归删除未知目录。确认继续？")
+        lines = ["已确认以下项目的任务分支已合并，基准分支已推送远程："]
+        for item in plan.components:
+            lines.append(
+                f"- {item.id}: {item.task_branch} → {item.base_branch} "
+                f"→ {item.base_remote_ref}"
+            )
+        lines.extend([
+            "",
+            "继续后将按以下顺序执行：",
+            f"1. 递归删除整个工作区目录：{plan.workspace.root_path}",
+            "2. 删除为该工作区创建的本地任务分支",
+            "3. 删除远程仓库中的同名任务分支",
+            "",
+            "目录内所有文件都会删除且无法恢复。确认继续？",
+        ])
         answer = QMessageBox.question(
             self,
             "确认删除需求工作区",
@@ -1272,7 +1277,7 @@ class AggregateProjectTab(QWidget):
         )
         self._delete_worker = worker
         self._update_workspace_buttons()
-        self.workspace_status.setText("正在移除 Worktree...")
+        self.workspace_status.setText("正在删除工作区目录和任务分支...")
         worker.done.connect(self._workspace_deleted)
         worker.finished.connect(worker.deleteLater)
         worker.start()
@@ -1287,9 +1292,7 @@ class AggregateProjectTab(QWidget):
             QMessageBox.warning(self, "删除未完成", error)
         else:
             action_log.info("[GUI] 删除工作区成功 kept_branches=%s", kept_branches)
-            message = "需求工作区已删除。"
-            if kept_branches:
-                message += "\n\n保留分支：" + ", ".join(kept_branches)
+            message = "需求工作区目录、本地任务分支和远程任务分支均已删除。"
             QMessageBox.information(self, "删除完成", message)
         self.refresh_workspaces()
 

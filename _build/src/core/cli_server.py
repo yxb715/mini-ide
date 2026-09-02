@@ -528,9 +528,15 @@ class _WorkspaceCommandWorker(QObject):
                     "unknown_paths": list(plan.unknown_paths),
                     "projects": [
                         {
-                            "id": item.id, "dirty": item.dirty,
-                            "pushed": item.pushed, "merged": item.merged,
-                            "branch_will_be_kept": item.branch_will_be_kept,
+                            "id": item.id,
+                            "base_branch": item.base_branch,
+                            "task_branch": item.task_branch,
+                            "merged": item.merged,
+                            "pushed": item.base_pushed,
+                            "base_pushed": item.base_pushed,
+                            "base_remote_ref": item.base_remote_ref,
+                            "dirty": False,
+                            "branch_will_be_kept": False,
                             "error": item.error,
                         }
                         for item in plan.components
