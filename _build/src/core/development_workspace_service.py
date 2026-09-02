@@ -156,6 +156,35 @@ class WorkspaceCommitPushResult:
 
 
 @dataclass(frozen=True)
+class WorkspaceSyncPushComponent:
+    id: str
+    base_branch: str
+    task_branch: str
+    committed: bool = False
+    commit_id: str = ""
+    merge_ref: str = ""
+    synced: bool = False
+    already_current: bool = False
+    conflicted: bool = False
+    conflict_files: tuple[str, ...] = ()
+    rolled_back: bool = False
+    pushed: bool = False
+    error: str = ""
+
+
+@dataclass(frozen=True)
+class WorkspaceSyncPushResult:
+    ok: bool
+    workspace: DevelopmentWorkspace
+    components: tuple[WorkspaceSyncPushComponent, ...]
+    error: str = ""
+
+    @property
+    def needs_conflict_confirmation(self) -> bool:
+        return any(item.conflicted and item.rolled_back for item in self.components)
+
+
+@dataclass(frozen=True)
 class WorkspaceDeleteComponent:
     id: str
     base_branch: str
@@ -1328,6 +1357,173 @@ def delete_development_workspace(
                 "工作区目录已删除，但分支清理未完成：" + "；".join(dict.fromkeys(errors)),
             )
         return True, (), ""
+    finally:
+        with _OPERATION_LOCK:
+            _ACTIVE_OPERATIONS.discard(operation_key)
+
+
+def sync_commit_and_push_development_workspace(
+    workspace: DevelopmentWorkspace,
+    message: str = "",
+    *,
+    fetch_remote: bool = False,
+    keep_conflicts: bool = False,
+) -> WorkspaceSyncPushResult:
+    """先保存任务改动，再同步基准分支，最后把任务分支推送到 origin。"""
+    operation_key = normalized_path_key(workspace.root_path)
+    with _OPERATION_LOCK:
+        if operation_key in _ACTIVE_OPERATIONS:
+            return WorkspaceSyncPushResult(
+                False, workspace, (), "工作区正在执行其它操作",
+            )
+        _ACTIVE_OPERATIONS.add(operation_key)
+    try:
+        editable = [item for item in workspace.components if item.mode == "worktree"]
+        if not editable:
+            return WorkspaceSyncPushResult(
+                False, workspace, (), "工作区没有可同步并推送的项目",
+            )
+
+        states = {
+            item.id: WorkspaceSyncPushComponent(
+                item.id, item.base_branch, item.task_branch,
+            )
+            for item in editable
+        }
+
+        # 在产生任何本地提交前统一校验任务分支和远程，避免明显错误造成部分改动。
+        preflight_errors: list[str] = []
+        for item in editable:
+            code, branch, err = _run_git(
+                item.worktree_path, ["branch", "--show-current"], 10,
+            )
+            error = ""
+            if code != 0:
+                error = err or "无法读取任务分支"
+            elif branch != item.task_branch:
+                error = f"工作区当前分支不是 {item.task_branch}"
+            if not error:
+                code, conflicts, err = _run_git(
+                    item.worktree_path,
+                    ["diff", "--name-only", "--diff-filter=U"],
+                    15,
+                )
+                if code != 0:
+                    error = err or "无法检查工作区冲突状态"
+                elif conflicts:
+                    error = "工作区仍有未解决冲突，请解决并暂存后重试"
+            if not error:
+                code, remote, err = _run_git(
+                    item.worktree_path, ["remote", "get-url", "origin"], 10,
+                )
+                if code != 0 or not remote:
+                    error = err or "未配置 origin 远程仓库"
+            if error:
+                states[item.id] = replace(states[item.id], error=error)
+                preflight_errors.append(f"{item.id}：{error}")
+        if preflight_errors:
+            for item in editable:
+                if not states[item.id].error:
+                    states[item.id] = replace(
+                        states[item.id], error="其它项目预检失败，未执行",
+                    )
+            return WorkspaceSyncPushResult(
+                False, workspace, tuple(states[item.id] for item in editable),
+                "；".join(preflight_errors),
+            )
+
+        commit_message = str(message or "").strip() or workspace.name.strip() or workspace.id
+        for index, item in enumerate(editable):
+            before_code, before_head, _before_err = _run_git(
+                item.worktree_path, ["rev-parse", "HEAD"], 10,
+            )
+            commit_error = _commit_worktree_changes(item, commit_message)
+            if commit_error:
+                error = f"提交失败：{commit_error}"
+                states[item.id] = replace(states[item.id], error=error)
+                for pending in editable[index + 1:]:
+                    states[pending.id] = replace(
+                        states[pending.id], error="前序项目提交失败，未执行",
+                    )
+                return WorkspaceSyncPushResult(
+                    False, workspace, tuple(states[value.id] for value in editable),
+                    f"{item.id}：{error}",
+                )
+            code, commit_id, _err = _run_git(
+                item.worktree_path, ["rev-parse", "HEAD"], 10,
+            )
+            if code != 0:
+                commit_id = ""
+            states[item.id] = replace(
+                states[item.id],
+                committed=bool(
+                    before_code == 0 and code == 0 and commit_id != before_head
+                ),
+                commit_id=commit_id,
+            )
+
+        fetched: set[tuple[str, str]] = set()
+        sync_results: list[WorkspaceSyncComponent] = []
+        new_commits: dict[str, str] = {}
+        for item in editable:
+            sync_item = _sync_one_component(
+                item, fetch_remote, keep_conflicts, fetched, new_commits,
+            )
+            sync_results.append(sync_item)
+            states[item.id] = replace(
+                states[item.id],
+                merge_ref=sync_item.merge_ref,
+                synced=sync_item.synced,
+                already_current=sync_item.already_current,
+                conflicted=sync_item.conflicted,
+                conflict_files=sync_item.conflict_files,
+                rolled_back=sync_item.rolled_back,
+                error=sync_item.error,
+            )
+
+        updated = workspace
+        if new_commits:
+            updated = replace(updated, components=tuple(
+                replace(component, base_commit=new_commits[component.id])
+                if component.id in new_commits else component
+                for component in workspace.components
+            ))
+        if any(item.synced for item in sync_results) and updated.status == "merged":
+            updated = replace(updated, status="active")
+        if updated is not workspace:
+            save_development_workspace(updated)
+
+        sync_failures = [
+            f"{item.id}：{item.error}" for item in sync_results if item.error
+        ]
+        if sync_failures:
+            return WorkspaceSyncPushResult(
+                False, updated, tuple(states[item.id] for item in editable),
+                "；".join(sync_failures),
+            )
+
+        for index, item in enumerate(editable):
+            code, out, err = _run_git(
+                item.worktree_path,
+                ["push", "--set-upstream", "origin", item.task_branch],
+                300,
+            )
+            if code != 0:
+                error = err or out or "推送失败"
+                states[item.id] = replace(states[item.id], error=error)
+                for pending in editable[index + 1:]:
+                    states[pending.id] = replace(
+                        states[pending.id], error="前序项目推送失败，未执行",
+                    )
+                return WorkspaceSyncPushResult(
+                    False, updated, tuple(states[value.id] for value in editable),
+                    f"{item.id}：{error}",
+                )
+            states[item.id] = replace(states[item.id], pushed=True)
+
+        return WorkspaceSyncPushResult(
+            True, updated, tuple(states[item.id] for item in editable),
+        )
     finally:
         with _OPERATION_LOCK:
             _ACTIVE_OPERATIONS.discard(operation_key)

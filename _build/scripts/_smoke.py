@@ -896,10 +896,59 @@ def development_workspace_lifecycle_check() -> list[str]:
             if service.workspace_behind_counts(synced_workspace).get("server") != 0:
                 failed.append("synced task branch should not stay behind")
 
+            # GUI 组合按钮应先保留本地改动，再同步基准分支，最后统一推送。
+            combined_local = worktree / "COMBINED_LOCAL.txt"
+            combined_local.write_text("local change\n", encoding="utf-8")
+            combined_base = repo_one / "COMBINED_BASE.txt"
+            combined_base.write_text("base change\n", encoding="utf-8")
+            git("-C", str(repo_one), "add", "COMBINED_BASE.txt")
+            git("-C", str(repo_one), "commit", "-m", "combined base update")
+            combined = service.sync_commit_and_push_development_workspace(
+                synced_workspace, "combined workspace",
+            )
+            if not combined.ok:
+                failed.append(f"combined sync and push should succeed: {combined.error}")
+            elif not (
+                combined.components[0].committed
+                and combined.components[0].synced
+                and combined.components[0].pushed
+            ):
+                failed.append(
+                    "combined sync and push should commit, sync and push the component"
+                )
+            if not combined_local.is_file() or not (worktree / "COMBINED_BASE.txt").is_file():
+                failed.append("combined sync and push should keep local and base changes")
+            combined_remote_head = git(
+                "--git-dir", str(bare_remote), "rev-parse",
+                f"refs/heads/{workspace.components[0].task_branch}",
+            )
+            if combined_remote_head != git("-C", str(worktree), "rev-parse", "HEAD"):
+                failed.append("combined sync and push should update the remote task branch")
+            synced_workspace = load_development_workspace(
+                workspace.root_path, aggregate_project=project,
+            )
+
             # 冲突默认回滚；用户确认后才保留冲突。
             (repo_one / "README.md").write_text("server v2\n", encoding="utf-8")
             git("-C", str(repo_one), "add", "README.md")
             git("-C", str(repo_one), "commit", "-m", "base conflict")
+            remote_before_conflict = git(
+                "--git-dir", str(bare_remote), "rev-parse",
+                f"refs/heads/{workspace.components[0].task_branch}",
+            )
+            combined_conflict = service.sync_commit_and_push_development_workspace(
+                synced_workspace,
+            )
+            if combined_conflict.ok or not combined_conflict.needs_conflict_confirmation:
+                failed.append("combined sync conflict must ask before keeping conflicts")
+            if any(item.pushed for item in combined_conflict.components):
+                failed.append("combined sync conflict must stop all pushes")
+            remote_after_conflict = git(
+                "--git-dir", str(bare_remote), "rev-parse",
+                f"refs/heads/{workspace.components[0].task_branch}",
+            )
+            if remote_after_conflict != remote_before_conflict:
+                failed.append("combined sync conflict must not move the remote task branch")
             declined = service.sync_development_workspace(synced_workspace)
             if declined.ok or not declined.needs_conflict_confirmation:
                 failed.append("conflicting sync must ask before keeping conflicts")
@@ -916,6 +965,17 @@ def development_workspace_lifecycle_check() -> list[str]:
                 str(worktree), ["rev-parse", "--verify", "MERGE_HEAD"], 10,
             )[0] != 0:
                 failed.append("kept conflicts should leave the merge in progress")
+            blocked_conflict_push = (
+                service.sync_commit_and_push_development_workspace(synced_workspace)
+            )
+            if (
+                blocked_conflict_push.ok
+                or "未解决冲突" not in blocked_conflict_push.error
+                or any(item.pushed for item in blocked_conflict_push.components)
+            ):
+                failed.append(
+                    "combined sync and push must block unresolved kept conflicts"
+                )
             (worktree / "README.md").write_text("resolved\n", encoding="utf-8")
             git("-C", str(worktree), "add", "README.md")
             git("-C", str(worktree), "commit", "--no-edit")
@@ -1044,14 +1104,14 @@ def aggregate_runtime_ui_check() -> list[str]:
     from types import SimpleNamespace
 
     from PySide6.QtCore import Qt
-    from PySide6.QtWidgets import QApplication, QFrame, QScrollArea
+    from PySide6.QtWidgets import QApplication, QFrame, QPushButton, QScrollArea
 
     from src.core.aggregate_workspace import AggregateProject
     from src.core.cli_server import _find_project_tab
     from src.core.config import AppConfig, ProjectEntry
     from src.core.path_utils import normalized_path_key
     from src.core.project_detector import detect_project
-    from src.ui.aggregate_project_tab import AggregateProjectTab
+    from src.ui.aggregate_project_tab import AggregateProjectTab, _WorkspaceCard
     from src.ui.project_tab import ProjectTab
 
     failed: list[str] = []
@@ -1154,6 +1214,21 @@ def aggregate_runtime_ui_check() -> list[str]:
             failed.append("workspace panel must no longer use the old table")
         if tab.workspace_cards_layout.count() < 1:
             failed.append("workspace card container must preserve its trailing stretch")
+        card_summary = SimpleNamespace(
+            name="certificate",
+            error="",
+            git_change_count=0,
+            component_ids=("server",),
+            task_branches=("feature/certificate-server",),
+            created_at="2026-09-02",
+        )
+        card = _WorkspaceCard(card_summary, False)
+        card_buttons = [button.text() for button in card.findChildren(QPushButton)]
+        if "同步并推送" not in card_buttons:
+            failed.append("workspace card must expose the combined sync and push action")
+        if "提交并推送" in card_buttons or "同步源分支" in card_buttons:
+            failed.append("workspace card must remove the two separate legacy actions")
+        card.deleteLater()
         double_clicks: list[bool] = []
         tab._activate_selected_workspace = lambda: double_clicks.append(True)
         fake_summary = SimpleNamespace(
