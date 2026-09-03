@@ -1401,10 +1401,9 @@ def sync_commit_and_push_development_workspace(
     workspace: DevelopmentWorkspace,
     message: str = "",
     *,
-    fetch_remote: bool = False,
     keep_conflicts: bool = False,
 ) -> WorkspaceSyncPushResult:
-    """先保存任务改动，再同步基准分支，最后把任务分支推送到 origin。"""
+    """先保存任务改动、获取并同步远端基准分支，再推送任务分支。"""
     operation_key = normalized_path_key(workspace.root_path)
     with _OPERATION_LOCK:
         if operation_key in _ACTIVE_OPERATIONS:
@@ -1502,7 +1501,7 @@ def sync_commit_and_push_development_workspace(
         new_commits: dict[str, str] = {}
         for item in editable:
             sync_item = _sync_one_component(
-                item, fetch_remote, keep_conflicts, fetched, new_commits,
+                item, True, keep_conflicts, fetched, new_commits,
             )
             sync_results.append(sync_item)
             states[item.id] = replace(

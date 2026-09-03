@@ -896,13 +896,27 @@ def development_workspace_lifecycle_check() -> list[str]:
             if service.workspace_behind_counts(synced_workspace).get("server") != 0:
                 failed.append("synced task branch should not stay behind")
 
-            # GUI 组合按钮应先保留本地改动，再同步基准分支，最后统一推送。
+            # GUI 组合按钮应先保留本地改动、固定获取远端基准分支，再统一推送。
             combined_local = worktree / "COMBINED_LOCAL.txt"
             combined_local.write_text("local change\n", encoding="utf-8")
             combined_base = repo_one / "COMBINED_BASE.txt"
             combined_base.write_text("base change\n", encoding="utf-8")
             git("-C", str(repo_one), "add", "COMBINED_BASE.txt")
             git("-C", str(repo_one), "commit", "-m", "combined base update")
+            git("-C", str(repo_one), "push", "origin", "main")
+            remote_writer = Path(tmp) / "server-upstream"
+            git("clone", "--branch", "main", str(bare_remote), str(remote_writer))
+            git("-C", str(remote_writer), "config", "user.name", "mini-ide smoke")
+            git(
+                "-C", str(remote_writer), "config", "user.email",
+                "smoke@mini-ide.local",
+            )
+            (remote_writer / "REMOTE_BASE.txt").write_text(
+                "remote base update\n", encoding="utf-8",
+            )
+            git("-C", str(remote_writer), "add", "REMOTE_BASE.txt")
+            git("-C", str(remote_writer), "commit", "-m", "remote base update")
+            git("-C", str(remote_writer), "push", "origin", "main")
             combined = service.sync_commit_and_push_development_workspace(
                 synced_workspace, "combined workspace",
             )
@@ -916,8 +930,14 @@ def development_workspace_lifecycle_check() -> list[str]:
                 failed.append(
                     "combined sync and push should commit, sync and push the component"
                 )
-            if not combined_local.is_file() or not (worktree / "COMBINED_BASE.txt").is_file():
-                failed.append("combined sync and push should keep local and base changes")
+            if not all((
+                combined_local.is_file(),
+                (worktree / "COMBINED_BASE.txt").is_file(),
+                (worktree / "REMOTE_BASE.txt").is_file(),
+            )):
+                failed.append(
+                    "combined sync and push should keep local changes and fetch remote base"
+                )
             combined_remote_head = git(
                 "--git-dir", str(bare_remote), "rev-parse",
                 f"refs/heads/{workspace.components[0].task_branch}",
@@ -927,6 +947,7 @@ def development_workspace_lifecycle_check() -> list[str]:
             synced_workspace = load_development_workspace(
                 workspace.root_path, aggregate_project=project,
             )
+            git("-C", str(repo_one), "merge", "--ff-only", "origin/main")
 
             # 冲突默认回滚；用户确认后才保留冲突。
             (repo_one / "README.md").write_text("server v2\n", encoding="utf-8")

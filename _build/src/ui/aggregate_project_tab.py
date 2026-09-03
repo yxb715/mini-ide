@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from PySide6.QtCore import QThread, QTimer, Qt, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QCheckBox, QDialog, QHBoxLayout,
+    QAbstractItemView, QApplication, QDialog, QHBoxLayout,
     QHeaderView, QLabel, QMessageBox, QPushButton, QSplitter, QStackedWidget,
     QStyle, QTabWidget, QToolButton, QTreeWidget, QTreeWidgetItem,
     QVBoxLayout, QWidget, QFrame, QScrollArea, QSizePolicy,
@@ -132,14 +132,12 @@ class _SyncPushWorkspaceWorker(QThread):
         workspace: DevelopmentWorkspace,
         message: str,
         *,
-        fetch_remote: bool,
         keep_conflicts: bool,
         parent=None,
     ):
         super().__init__(parent)
         self.workspace = workspace
         self.message = message
-        self.fetch_remote = fetch_remote
         self.keep_conflicts = keep_conflicts
 
     def run(self) -> None:
@@ -148,7 +146,6 @@ class _SyncPushWorkspaceWorker(QThread):
                 sync_commit_and_push_development_workspace(
                     self.workspace,
                     self.message,
-                    fetch_remote=self.fetch_remote,
                     keep_conflicts=self.keep_conflicts,
                 ),
                 "",
@@ -362,7 +359,6 @@ class AggregateProjectTab(QWidget):
         self._create_worker: _CreateWorkspaceWorker | None = None
         self._merge_worker: _MergeWorkspaceWorker | None = None
         self._sync_push_worker: _SyncPushWorkspaceWorker | None = None
-        self._pending_sync_push_fetch = False
         self._delete_preflight_worker: _DeletePreflightWorker | None = None
         self._delete_worker: _DeleteWorkspaceWorker | None = None
 
@@ -947,7 +943,8 @@ class AggregateProjectTab(QWidget):
         )
         lines.append(
             f"\n将先用“{commit_message}”提交工作区本地改动（暂不推送），"
-            "再把源分支合并进任务分支；全部同步成功后才推送到 origin。"
+            "再从远端获取源分支更新并合并进任务分支；"
+            "全部同步成功后才推送到 origin。"
             "同步冲突会回滚合并并停止推送，本地提交会保留。确认继续？"
         )
         box = QMessageBox(self)
@@ -958,16 +955,12 @@ class AggregateProjectTab(QWidget):
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
         box.setDefaultButton(QMessageBox.StandardButton.No)
-        fetch_box = QCheckBox("先从远端拉取源分支更新")
-        fetch_box.setToolTip("对配置了上游的项目先 git fetch，再用较新的一端同步")
-        box.setCheckBox(fetch_box)
         box.exec()
         if box.standardButton(box.clickedButton()) != QMessageBox.StandardButton.Yes:
             return
         self._start_workspace_sync_push(
             summary.workspace,
             commit_message,
-            fetch_remote=fetch_box.isChecked(),
             keep_conflicts=False,
         )
 
@@ -976,20 +969,17 @@ class AggregateProjectTab(QWidget):
         workspace: DevelopmentWorkspace,
         commit_message: str,
         *,
-        fetch_remote: bool,
         keep_conflicts: bool,
     ) -> None:
         action_log.info(
             "[GUI] 同步并推送工作区 aggregate=%s workspace=%s "
-            "fetch_remote=%s keep_conflicts=%s",
-            self.aggregate_project.name, workspace.name, fetch_remote, keep_conflicts,
+            "fetch_remote=true keep_conflicts=%s",
+            self.aggregate_project.name, workspace.name, keep_conflicts,
         )
         self.workspace_status.setText("正在提交本地改动、同步源分支并推送...")
-        self._pending_sync_push_fetch = fetch_remote
         worker = _SyncPushWorkspaceWorker(
             workspace,
             commit_message,
-            fetch_remote=fetch_remote,
             keep_conflicts=keep_conflicts,
             parent=QApplication.instance(),
         )
@@ -1059,7 +1049,6 @@ class AggregateProjectTab(QWidget):
                 self._start_workspace_sync_push(
                     result.workspace,
                     commit_message,
-                    fetch_remote=self._pending_sync_push_fetch,
                     keep_conflicts=True,
                 )
                 return
