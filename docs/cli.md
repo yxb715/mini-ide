@@ -10,6 +10,7 @@
 --list-modules <project>
 --list-runtimes <project>
 --open <path>
+--resolve-target <path>
 --close <project>
 
 --start <project> [module] [--wait] [--timeout N]
@@ -55,7 +56,11 @@
 
 `--list-runtimes <project>` 返回运行单元 ID、显示名、分类、工作目录、启动档位、端口、健康地址、依赖、配置来源和当前状态。`--list-modules` 保留旧响应格式，已有自动化不需要立即迁移。
 
-`--open <path>` 使用 GUI 相同的目录识别逻辑。已有聚合配置或全局登记的目录直接按聚合打开；最近打开和 CLI 不会重复询问目录类型。未登记、无配置目录通过 GUI“添加目录”或拖拽打开时，需要选择普通项目或聚合目录。
+`--resolve-target <path>` 只解析目录归属并返回 JSON，不打开目录。`kind` 可能是 `normal_project`、`aggregate`、`aggregate_component`、`workspace` 或 `workspace_component`，同时返回所属聚合、工作区、组件、`open_command` 和 `open_target`。
+
+`--open <path>` 使用 GUI 相同的目录识别逻辑，并自动向上查找所属聚合目录或需求工作区：打开聚合根或其任意组件/子目录只创建一个聚合 Tab，打开工作区根或其任意组件/子目录只进入所属工作区并在内部选中组件；普通项目才创建普通项目 Tab。组件路径不会再被拆成独立顶层 Tab。已有聚合配置或全局登记的目录直接按聚合打开；最近打开和 CLI 不会重复询问目录类型。未登记、无配置且不属于已知环境的目录通过 GUI“添加目录”或拖拽打开时，仍需要选择普通项目或聚合目录。
+
+历史会话恢复也使用同一解析规则：旧的 `project:<组件路径>` 会归并为对应的 `aggregate:<聚合根>` 或 `development:<工作区根>`，同一环境只保留一个顶层 Tab。
 
 ## 聚合与工作区命令
 

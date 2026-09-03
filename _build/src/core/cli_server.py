@@ -27,6 +27,9 @@ from src.core.development_workspace_service import (
     sync_development_workspace,
 )
 from src.core.path_utils import normalized_path_key
+from src.core.target_resolver import (
+    TargetResolutionError, resolve_target_path,
+)
 from src.util import app_log
 
 log = app_log.get_logger("cli_server")
@@ -714,6 +717,9 @@ def _dispatch(cmd: dict, window: "MainWindow") -> dict:
     if action == "open":
         return _cmd_open(window, cmd.get("path", ""))
 
+    if action == "resolve-target":
+        return _cmd_resolve_target(window, cmd.get("path", ""))
+
     if action in ("list-workspaces", "open-workspace"):
         return {"ok": False, "error": f"{action} command uses async handler"}
 
@@ -1000,15 +1006,29 @@ def _cmd_status(window: "MainWindow") -> dict:
 def _cmd_open(window: "MainWindow", path: str) -> dict:
     if not path:
         return {"ok": False, "error": "missing 'path' argument"}
-    p = Path(path)
-    if not p.is_dir():
-        return {"ok": False, "error": f"path is not a directory: {path}"}
-    tab = window.open_project(str(p), quiet=True)
+    try:
+        resolved = resolve_target_path(path, window.config.aggregate_project_paths)
+    except TargetResolutionError as exc:
+        return {"ok": False, "error": str(exc)}
+    tab = window.open_project(resolved.path, quiet=True)
     if tab is None:
         return {"ok": False, "error": f"open project failed: {path}"}
     if tab in _all_environment_tabs(window):
-        return {"ok": True, "environment": _environment_snapshot(tab)}
-    return {"ok": True, "project": _project_snapshot(tab)}
+        result = {"ok": True, "environment": _environment_snapshot(tab)}
+        result["target"] = resolved.to_dict()
+        return result
+    return {"ok": True, "project": _project_snapshot(tab), "target": resolved.to_dict()}
+
+
+def _cmd_resolve_target(window: "MainWindow", path: str) -> dict:
+    if not path:
+        return {"ok": False, "error": "missing 'path' argument"}
+    try:
+        return resolve_target_path(
+            path, window.config.aggregate_project_paths,
+        ).to_dict()
+    except TargetResolutionError as exc:
+        return {"ok": False, "error": str(exc)}
 
 
 def _cmd_close_project(window: "MainWindow", tab) -> dict:

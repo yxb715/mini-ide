@@ -25,6 +25,9 @@ from src.core.aggregate_workspace_manager import (
 )
 from src.core.project_detector import detect_project
 from src.core.path_utils import normalized_path_key
+from src.core.target_resolver import (
+    TargetResolutionError, resolve_target_path,
+)
 from src.core.service_state import (
     STATE_RUNNING_EXTERNAL, STATE_RUNNING_MANAGED,
 )
@@ -47,6 +50,54 @@ def _restored_tab_index(entries: list[str], saved_index: int) -> int:
 def _is_aggregate_directory(config: AppConfig, path: str | Path) -> bool:
     """目录定义本身优先；注册表只负责兼容没有定义的历史入口。"""
     return config.is_aggregate_project(str(path)) or aggregate_config_path(path).is_file()
+
+
+def _normalized_tab_session(
+    entries: list[str],
+    saved_index: int,
+    registered_aggregate_paths: list[str] | tuple[str, ...] = (),
+) -> tuple[list[str], int]:
+    """把历史组件 Tab 归并到所属聚合环境，并保留活动环境。"""
+    groups: list[str] = []
+    chosen: dict[str, str] = {}
+    selected_group = ""
+
+    for original_index, token in enumerate(entries):
+        kind, _, raw_path = token.partition(":")
+        if token == "workspace:management" or not raw_path:
+            continue
+        if kind not in {"project", "aggregate", "development"}:
+            continue
+
+        try:
+            resolved = resolve_target_path(raw_path, registered_aggregate_paths)
+            if resolved.kind in {"workspace", "workspace_component"}:
+                canonical_token = f"development:{resolved.open_target}"
+                aggregate_path = resolved.aggregate_project.root_path
+                group = f"aggregate:{normalized_path_key(aggregate_path)}"
+            elif resolved.kind in {"aggregate", "aggregate_component"}:
+                canonical_token = f"aggregate:{resolved.open_target}"
+                group = f"aggregate:{normalized_path_key(resolved.open_target)}"
+            else:
+                canonical_token = f"project:{resolved.open_target}"
+                group = f"project:{normalized_path_key(resolved.open_target)}"
+        except Exception:
+            canonical_token = token
+            group = f"{kind}:{normalized_path_key(raw_path)}"
+
+        if group not in chosen:
+            groups.append(group)
+            chosen[group] = canonical_token
+        if original_index == saved_index:
+            chosen[group] = canonical_token
+            selected_group = group
+
+    normalized = [chosen[group] for group in groups]
+    if selected_group in groups:
+        target_index = groups.index(selected_group)
+    else:
+        target_index = min(_restored_tab_index(entries, saved_index), max(0, len(normalized) - 1))
+    return normalized, target_index
 
 
 class _CreateAggregateProjectWorker(QThread):
@@ -357,7 +408,16 @@ class MainWindow(QMainWindow):
             self._add_aggregate_directory(path)
 
     def _open_or_classify_directory(self, path: str) -> None:
-        if self.config.find_project(path) or _is_aggregate_directory(self.config, path):
+        try:
+            resolved = resolve_target_path(path, self.config.aggregate_project_paths)
+        except TargetResolutionError:
+            self.open_project(path)
+            return
+        if (
+            resolved.kind != "normal_project"
+            or self.config.find_project(path)
+            or _is_aggregate_directory(self.config, path)
+        ):
             self.open_project(path)
         else:
             self._choose_directory_type(path)
@@ -401,22 +461,26 @@ class MainWindow(QMainWindow):
     def open_project(
         self, path: str, quiet: bool = False,
     ) -> ProjectTab | AggregateProjectTab | None:
-        p = Path(path)
-        if not p.is_dir():
-            log.warning("尝试打开无效路径: %s", path)
+        try:
+            resolved = resolve_target_path(path, self.config.aggregate_project_paths)
+        except TargetResolutionError as exc:
+            log.warning("打开目录解析失败: %s | %s", path, exc)
             if not quiet:
-                QMessageBox.warning(self, "路径无效", f"{path} 不是有效目录")
+                QMessageBox.warning(self, "打开目录失败", str(exc))
             return None
 
-        if _is_aggregate_directory(self.config, p):
-            return self.open_aggregate_project(str(p), quiet=quiet)
-        if (p / "workspace.json").is_file():
-            try:
-                workspace = load_development_workspace(p)
-            except Exception:
-                workspace = None
-            if workspace is not None:
-                return self.open_development_workspace(str(p), quiet=quiet)
+        if resolved.kind in {"workspace", "workspace_component"}:
+            tab = self.open_development_workspace(resolved.open_target, quiet=quiet)
+            if tab is not None and resolved.component_id:
+                tab.select_component(resolved.component_id)
+            return tab
+        if resolved.kind in {"aggregate", "aggregate_component"}:
+            tab = self.open_aggregate_project(resolved.open_target, quiet=quiet)
+            if tab is not None and resolved.component_id:
+                tab.select_component(resolved.component_id)
+            return tab
+
+        p = Path(resolved.path)
 
         existing = self.find_tab_by_path(str(p))
         if existing:
@@ -524,7 +588,12 @@ class MainWindow(QMainWindow):
             if not quiet:
                 QMessageBox.warning(self, "打开开发工作区失败", str(exc))
             return None
-        tab = self.open_aggregate_project(project.root_path, quiet=quiet)
+        existing = self.find_tab_by_path(project.root_path)
+        if isinstance(existing, AggregateProjectTab):
+            tab = existing
+            self.focus_tab(tab)
+        else:
+            tab = self.open_aggregate_project(project.root_path, quiet=quiet)
         if tab is None:
             return None
         if not tab.activate_workspace(workspace, interactive=not quiet):
@@ -816,11 +885,14 @@ class MainWindow(QMainWindow):
         self.activateWindow()
 
     def _restore_tabs(self) -> None:
-        entries = list(self.config.active_tabs)
+        entries, target_index = _normalized_tab_session(
+            list(self.config.active_tabs),
+            self.config.active_tab_index,
+            self.config.aggregate_project_paths,
+        )
         if not entries:
             return
         log.info("恢复 Tab 会话: %d 个", len(entries))
-        target_index = _restored_tab_index(entries, self.config.active_tab_index)
         opened = 0
         for token in entries:
             kind, _, key = token.partition(":")
@@ -829,12 +901,13 @@ class MainWindow(QMainWindow):
             try:
                 if Path(key).is_dir():
                     if kind == "aggregate":
-                        self.open_aggregate_project(key)
+                        tab = self.open_aggregate_project(key)
                     elif kind == "development":
-                        self.open_development_workspace(key)
+                        tab = self.open_development_workspace(key)
                     else:
-                        self.open_project(key)
-                    opened += 1
+                        tab = self.open_project(key)
+                    if tab is not None:
+                        opened += 1
                 else:
                     log.warning("跳过不存在的项目: %s", key)
             except Exception:

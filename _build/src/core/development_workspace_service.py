@@ -422,6 +422,16 @@ def _task_agents_text(plan: WorkspaceCreationPlan) -> str:
         "- 服务启动、停止、健康检查、日志、诊断和编译必须走 mini-ide CLI 或 GUI。\n"
         "- 工作区创建、Review 和删除必须走 mini-ide；不要手工移动或递归删除 Worktree。\n"
         "- codex 和 cc 的工作目录必须保持为当前任务根目录。\n"
+        "\n"
+        "## 标准开发流程：mine-dev-flow\n\n"
+        "本工作区以 `mine-dev-flow` Skill 作为需求开发的标准流程入口。进入当前任务根目录并开启新的 AI 会话后，"
+        "AI 必须自动读取并主持该流程；用户只需提供需求和信息、判断理解是否正确、确认关键决策和执行人工验收，"
+        "不需要主动输入 Skill 名称或阶段命令。\n\n"
+        "该流程负责需求整理与对齐、全工作区影响分析及确认、独立影响复审、context 交接、开发计划、"
+        "基线、实现、代码 Review、API 测试、人工验收和完成证据。缺少需求或需要确认时，AI 应主动向用户提问；"
+        "用户确认后自动进入下一阶段。首次运行会在工作区根目录初始化或读取 `"
+        ".mine-dev-flow/state.json`；流程状态和证据只写入 `.mine-dev-flow/`，不要修改 `workspace.json` 或写入组件仓库。\n\n"
+        "提交、推送、同步、合并和删除仍需用户单独明确授权；服务、日志、诊断和编译继续遵守上面的 mini-ide 约束。\n"
     )
 
 

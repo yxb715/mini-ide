@@ -169,6 +169,7 @@ def _parse_args(argv: list[str]) -> dict | None:
         "list-modules": "list-modules",
         "list-runtimes": "list-runtimes",
         "open": "open",
+        "resolve-target": "resolve-target",
         "close": "close",
         "list-workspaces": "list-workspaces",
         "open-workspace": "open-workspace",
@@ -256,6 +257,12 @@ def _parse_args(argv: list[str]) -> dict | None:
                 index += 2
             else:
                 return None
+        return result
+
+    if cmd_name == "resolve-target":
+        if len(rest) != 1:
+            return None
+        result["path"] = rest[0]
         return result
 
     if cmd_name == "workspace-sync":
@@ -595,6 +602,7 @@ def _print_usage():
         "  --list-modules <project>     List modules of a project\n"
         "  --list-runtimes <project>    List runtime units of a project\n"
         "  --open <path>                Open a project path in the running IDE\n"
+        "  --resolve-target <path>      Resolve a path to its owning environment/component\n"
         "  --close <project>            Stop services and close a project tab\n"
         "  --list-workspaces            List aggregate development workspaces\n"
         "  --open-workspace <target>    Open one workspace inside its aggregate tab\n"

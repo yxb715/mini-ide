@@ -352,6 +352,7 @@ class AggregateProjectTab(QWidget):
         self._workspace_cards: dict[str, _WorkspaceCard] = {}
         self._selected_workspace = None
         self._pending_workspace_path = ""
+        self._pending_component_id = ""
         self._prepare_worker: _PrepareProjectsWorker | None = None
         self._prepare_generation = 0
         self._save_worker: _SaveProjectWorker | None = None
@@ -626,7 +627,15 @@ class AggregateProjectTab(QWidget):
             text += f"，{errors} 个错误"
         self.project_progress.setText(text)
         self.project_tree_label.setText(f"项目 {self.project_tree.topLevelItemCount()}")
-        if self.project_tree.topLevelItemCount() and not self.project_tree.selectedItems():
+        pending_key = self._pending_component_id.casefold()
+        pending_node = next((
+            node for project_id, node in self._project_nodes.items()
+            if project_id.casefold() == pending_key
+        ), None) if pending_key else None
+        if pending_node is not None:
+            self.project_tree.setCurrentItem(pending_node)
+            self._pending_component_id = ""
+        elif self.project_tree.topLevelItemCount() and not self.project_tree.selectedItems():
             self.project_tree.setCurrentItem(self.project_tree.topLevelItem(0))
         self.refresh_project_states()
 
@@ -685,6 +694,26 @@ class AggregateProjectTab(QWidget):
 
     def show_projects(self) -> None:
         self.view_tabs.setCurrentWidget(self.projects_page)
+
+    def select_component(self, component_id: str) -> bool:
+        """选中聚合内部项目；识别尚未完成时延迟到本轮结果安装后执行。"""
+        key = str(component_id or "").strip().casefold()
+        if not key:
+            return False
+        actual_id = next((
+            item["id"] for item in self._project_items()
+            if item["id"].casefold() == key
+        ), "")
+        if not actual_id:
+            return False
+        self.show_projects()
+        node = self._project_nodes.get(actual_id)
+        if node is not None:
+            self.project_tree.setCurrentItem(node)
+            self._pending_component_id = ""
+        else:
+            self._pending_component_id = actual_id
+        return True
 
     def show_workspaces(self) -> None:
         self.view_tabs.setCurrentWidget(self.workspaces_page)

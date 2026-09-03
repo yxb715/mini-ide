@@ -23,6 +23,7 @@ modules = [
     "src.core.file_preview_model",
     "src.core.git_context",
     "src.core.path_utils",
+    "src.core.target_resolver",
     "src.core.aggregate_workspace",
     "src.core.aggregate_workspace_manager",
     "src.core.development_workspace_service",
@@ -151,6 +152,8 @@ def cli_parse_check() -> list[str]:
     cases = [
         (["mini-ide.exe", "--status"], {"cmd": "status"}),
         (["mini-ide.exe", "--open", r"E:\demo"], {"cmd": "open", "path": r"E:\demo"}),
+        (["mini-ide.exe", "--resolve-target", r"E:\demo"],
+         {"cmd": "resolve-target", "path": r"E:\demo"}),
         (["mini-ide.exe", "--close", "server"], {"cmd": "close", "project": "server"}),
         (["mini-ide.exe", "--list-workspaces"], {"cmd": "list-workspaces"}),
         (["mini-ide.exe", "--list-runtimes", "webapp-lerna"],
@@ -212,6 +215,10 @@ def cli_parse_check() -> list[str]:
         failed.append("workspace-commit-push must reject an empty message")
     if _parse_args(["mini-ide.exe", "--preflight-build", "server", "extra"]) is not None:
         failed.append("preflight-build must accept at most one project target")
+    if _parse_args(["mini-ide.exe", "--resolve-target"]) is not None:
+        failed.append("resolve-target must require a path")
+    if _parse_args(["mini-ide.exe", "--resolve-target", "one", "two"]) is not None:
+        failed.append("resolve-target must accept exactly one path")
     for action in (
         "create-development-workspace", "workspace-commit-push", "workspace-sync",
     ):
@@ -767,6 +774,8 @@ def development_workspace_lifecycle_check() -> list[str]:
                 plan.components[0].base_branch,
                 plan.components[0].base_commit, plan.components[0].task_branch,
                 plan.components[0].target_path, "webapp", "nginx", "AGENTS.md", "mini-ide",
+                "mine-dev-flow", "AI 必须自动读取并主持", "不需要主动输入 Skill 名称",
+                ".mine-dev-flow/state.json",
             )
             if any(text not in agents for text in required_agents_text):
                 failed.append(
@@ -1573,7 +1582,7 @@ def aggregate_definition_management_check() -> list[str]:
 
 def workspace_tab_session_check() -> list[str]:
     """验证移除固定管理页后兼容旧活动 Tab 索引。"""
-    from src.ui.main_window import _restored_tab_index
+    from src.ui.main_window import _normalized_tab_session, _restored_tab_index
 
     failed: list[str] = []
     old_entries = [r"project:E:\whaty\project\race\server"]
@@ -1582,6 +1591,24 @@ def workspace_tab_session_check() -> list[str]:
         failed.append("project-only session index must stay unchanged")
     if _restored_tab_index(new_entries, 1) != 0:
         failed.append("old fixed workspace tab must be removed from the saved index")
+
+    import tempfile
+    from src.core.aggregate_workspace import AggregateProject, save_aggregate_project
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "suite"
+        (root / "server").mkdir(parents=True)
+        project = AggregateProject.from_dict(root, {
+            "schemaVersion": 1, "id": "suite", "name": "suite",
+            "kind": "aggregate", "workspaceDirectory": "workspace",
+            "components": [{"id": "server", "path": "server", "type": "java"}],
+            "profiles": [],
+        })
+        save_aggregate_project(project)
+        normalized, index = _normalized_tab_session([
+            f"project:{root / 'server'}", f"aggregate:{root}",
+        ], 0, [str(root)])
+        if normalized != [f"aggregate:{root.resolve()}"] or index != 0:
+            failed.append("legacy aggregate component tabs must restore as one aggregate tab")
 
     if failed:
         for msg in failed:
@@ -2234,6 +2261,81 @@ def aggregate_scan_isolation_check() -> list[str]:
     return failed
 
 
+def target_resolution_check() -> list[str]:
+    """任意目录路径都应归入唯一的聚合/需求工作区环境。"""
+    import tempfile
+
+    from src.core.aggregate_workspace import (
+        AggregateProject, DevelopmentWorkspace, load_aggregate_project,
+        save_aggregate_project, save_development_workspace,
+    )
+    from src.core.target_resolver import resolve_target_path
+
+    failed: list[str] = []
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "paike"
+        server = root / "server"
+        webapp = root / "webapp"
+        workspace_root = root / "workspace" / "task"
+        (server / "src").mkdir(parents=True)
+        webapp.mkdir(parents=True)
+        (workspace_root / "server" / "src").mkdir(parents=True)
+        project_data = {
+            "schemaVersion": 1, "id": "paike", "name": "paike",
+            "kind": "aggregate", "workspaceDirectory": "workspace",
+            "components": [
+                {"id": "server", "path": "server", "type": "java"},
+                {"id": "webapp", "path": "webapp", "type": "frontend", "shared": True},
+            ], "profiles": [],
+        }
+        save_aggregate_project(AggregateProject.from_dict(root, project_data))
+        aggregate = load_aggregate_project(root)
+        workspace_data = {
+            "schemaVersion": 1, "id": "task", "name": "task",
+            "createdAt": "2026-09-03T00:00:00Z",
+            "aggregateProjectPath": str(root), "status": "active",
+            "components": [
+                {"id": "server", "sourceRepositoryPath": str(server),
+                 "mode": "worktree", "worktreePath": str(workspace_root / "server"),
+                 "baseBranch": "main", "baseCommit": "abc", "taskBranch": "feature/task-server"},
+                {"id": "webapp", "sourceRepositoryPath": str(webapp),
+                 "mode": "shared"},
+            ],
+        }
+        save_development_workspace(
+            DevelopmentWorkspace.from_dict(
+                workspace_root, workspace_data, aggregate_project=aggregate,
+            ), aggregate_project=aggregate,
+        )
+        cases = [
+            (root, "aggregate"),
+            (server, "aggregate_component"),
+            (server / "src", "aggregate_component"),
+            (workspace_root, "workspace"),
+            (workspace_root / "server", "workspace_component"),
+            (workspace_root / "server" / "src", "workspace_component"),
+            (root / "unrelated", "normal_project"),
+        ]
+        (root / "unrelated").mkdir()
+        for path, expected in cases:
+            result = resolve_target_path(path, [str(root)])
+            if result.kind != expected:
+                failed.append(f"{path} resolved as {result.kind}, expected {expected}")
+        result = resolve_target_path(workspace_root / "server", [str(root)])
+        if result.open_command != "open-workspace" or result.component_id != "server":
+            failed.append("workspace component should route to its workspace and component")
+        result = resolve_target_path(webapp, [str(root)])
+        if result.open_command != "open-aggregate" or result.component_id != "webapp":
+            failed.append("aggregate component should route to aggregate and component")
+
+    if failed:
+        for msg in failed:
+            print(f"[FAIL] target_resolution: {msg}", flush=True)
+    else:
+        print("[OK]   target path resolution", flush=True)
+    return failed
+
+
 def theme_switch_check() -> list[str]:
     """验证 GitHub Light / Dark 可在同一进程即时切换，且不写真实配置。"""
     from PySide6.QtWidgets import QApplication
@@ -2780,6 +2882,7 @@ if __name__ == "__main__":
     legacy_migration_failed = legacy_workspace_migration_check()
     aggregate_definition_failed = aggregate_definition_management_check()
     workspace_session_failed = workspace_tab_session_check()
+    target_resolution_failed = target_resolution_check()
 
     print()
     print("Hex hardcode scan (CLAUDE.md hard rule 15):")
@@ -2810,6 +2913,7 @@ if __name__ == "__main__":
         + len(aggregate_runtime_failed) + len(aggregate_dashboard_failed)
         + len(legacy_migration_failed) + len(aggregate_definition_failed)
         + len(workspace_session_failed) + len(hex_hits)
+        + len(target_resolution_failed)
     )
     print()
     print(f"Result: imports {len(modules) - len(failed)}/{len(modules)}, "

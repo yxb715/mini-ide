@@ -18,6 +18,8 @@
 - 共享项目只引用源目录，不创建 Worktree。
 - 新工作区 ID 由任务名称生成无声调拼音，例如“直播系统对接”生成 `zhiboxitongduijie`；不再附加时间戳。
 - 默认目录为 `workspace/<拼音任务 ID>/`，任务分支为 `feature/<拼音任务 ID>-<项目 ID>`，并写入 `workspace.json`、`AGENTS.md` 和 `context.md`。
+- 生成的 `AGENTS.md` 会声明 `mine-dev-flow` 是需求开发的标准流程；进入工作区后，新 AI 会话由 AI 自动主持该流程，用户不需要主动输入 Skill 名称。
+- 进入工作区根目录、工作区组件目录或其下级目录时，mini-ide/CLI 会沿路径向上识别所属工作区；这些路径都在同一个聚合 Tab 内打开，不会生成独立的组件 Tab。需要确认归属时使用 `mini-ide-cli.exe --resolve-target <path>`。
 - 目录、同远端任务分支或本地任务分支重名时拒绝创建，由用户调整任务名称；已有 `task-<时间戳>` 工作区保持兼容，不自动改名。
 - 组件可在聚合配置中通过 `workspaceCopyFiles` 声明需要从源项目复制到 Worktree 的本地文件，例如 `.env`；只接受项目内相对路径和普通文件。
 - 创建前检查 Git 仓库、源目录非 detached HEAD、基准分支和提交可读、任务分支及远端同名分支不存在、Worktree 不重复。
